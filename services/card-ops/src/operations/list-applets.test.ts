@@ -16,6 +16,9 @@ vi.mock('@palisade/db', () => ({
     cardOpSession: {
       update: vi.fn().mockResolvedValue({}),
     },
+    card: {
+      findUnique: vi.fn().mockResolvedValue(null),
+    },
   },
 }));
 
@@ -27,6 +30,9 @@ vi.mock('../env.js', () => ({
       dek: '404142434445464748494A4B4C4D4E4F',
     }),
     CAP_FILES_DIR: '',
+    // Force the test-keys fast path — this test exercises SCP03, not
+    // the IssuerProfile ARN fetch.
+    CARD_OPS_USE_TEST_KEYS: '1',
   }),
 }));
 

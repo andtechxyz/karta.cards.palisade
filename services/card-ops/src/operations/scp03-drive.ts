@@ -21,6 +21,7 @@ import {
 } from '../gp/scp03.js';
 import { buildSelectByAid } from '../gp/apdu-builder.js';
 import type { WSMessage } from '../ws/messages.js';
+import type { ApduAuditLogger } from '../ws/apdu-audit.js';
 
 // ISD (Issuer Security Domain) AID — standard GP value for JCOP cards.
 // A0000001510000 = 1-2-3-4-5 prefix? Actually A000000151 00 00 is the
@@ -40,6 +41,13 @@ export interface DriveResult {
 export interface DriveIO {
   send: (msg: WSMessage) => void;
   next: () => Promise<WSMessage>;
+  /**
+   * Optional PCI-audit sink.  When present, every APDU command we emit
+   * and every response we receive is appended to the logger.  Operation
+   * handlers don't need to care about the logger's internals — the
+   * drive helpers below own the instrumentation.
+   */
+  audit?: ApduAuditLogger;
 }
 
 /**
@@ -53,12 +61,15 @@ export async function sendAndRecv(
   phase?: string,
   progress?: number,
 ): Promise<Buffer> {
+  const apduHex = apdu.toString('hex').toUpperCase();
   io.send({
     type: 'apdu',
-    hex: apdu.toString('hex').toUpperCase(),
+    hex: apduHex,
     ...(phase ? { phase } : {}),
     ...(progress !== undefined ? { progress } : {}),
   });
+  io.audit?.recordCommand(apduHex, phase);
+
   const msg = await io.next();
   if (msg.type === 'error') {
     throw new Error(`client_error:${msg.code ?? 'unknown'}:${msg.message ?? ''}`);
@@ -71,14 +82,23 @@ export async function sendAndRecv(
   const hex = (msg.hex ?? '').toLowerCase();
   const sw = (msg.sw ?? '').toLowerCase();
 
+  let full: Buffer;
   if (hex.length >= 4 && hex.endsWith(sw) && sw.length === 4) {
-    return Buffer.from(hex, 'hex');
+    full = Buffer.from(hex, 'hex');
+  } else if (sw.length === 4) {
+    full = Buffer.concat([Buffer.from(hex, 'hex'), Buffer.from(sw, 'hex')]);
+  } else {
+    // Last-ditch: assume hex already carries SW.
+    full = Buffer.from(hex, 'hex');
   }
-  if (sw.length === 4) {
-    return Buffer.concat([Buffer.from(hex, 'hex'), Buffer.from(sw, 'hex')]);
-  }
-  // Last-ditch: assume hex already carries SW.
-  return Buffer.from(hex, 'hex');
+
+  const fullHex = full.toString('hex').toUpperCase();
+  const swHex = full.length >= 2
+    ? full.subarray(full.length - 2).toString('hex').toUpperCase()
+    : undefined;
+  io.audit?.recordResponse(fullHex, swHex, phase);
+
+  return full;
 }
 
 /**

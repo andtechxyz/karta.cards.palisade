@@ -357,7 +357,19 @@ export interface WrapInput {
 }
 
 export interface WrapResult {
+  /** Wrapped APDU ready for the wire: header(with C-MAC bit) || Lc || [enc-data] || cmac || [Le]. */
   apdu: Buffer;
+  /**
+   * Reconstructed plaintext APDU for audit.
+   *
+   * The original WrapInput fields minus SCP03 framing — useful for PCI
+   * audit where the reviewer wants to see what the *operation* asked
+   * for, not the wire bytes.  Shape:
+   *   plaintext_cla || ins || p1 || p2 || Lc_plain || data_plain [|| Le]
+   * where plaintext_cla is the caller-supplied CLA (without the 0x04
+   * C-MAC indicator bit forced on).
+   */
+  plaintextApdu: Buffer;
   session: Scp03Session; // updated (macChain / counter bumped)
 }
 
@@ -415,8 +427,23 @@ export function wrapCommand(session: Scp03Session, input: WrapInput): WrapResult
   if (input.le !== undefined) parts.push(Buffer.from([input.le]));
   const apdu = Buffer.concat(parts);
 
+  // Plaintext form for audit — rebuild from the caller's inputs so we
+  // log "what the op wanted" rather than "what went on the wire".  At
+  // C-MAC-only security levels these are almost identical (differ only
+  // in CLA and trailing CMAC), but at C-DECRYPTION the wire form has
+  // encrypted data while this form keeps the original clear bytes.
+  const plaintextParts: Buffer[] = [
+    Buffer.from([input.cla, input.ins, input.p1, input.p2]),
+  ];
+  if (input.data.length > 0) {
+    plaintextParts.push(Buffer.from([input.data.length]), input.data);
+  }
+  if (input.le !== undefined) plaintextParts.push(Buffer.from([input.le]));
+  const plaintextApdu = Buffer.concat(plaintextParts);
+
   return {
     apdu,
+    plaintextApdu,
     session: {
       ...session,
       macChain,
@@ -438,6 +465,17 @@ export interface UnwrapResult {
   /** Cleartext response data (padding removed if decrypted). */
   data: Buffer;
   sw: number;
+  /**
+   * The wire-form response, as handed to unwrapResponse.  Echoed back
+   * so callers that audit APDU pairs don't need to keep a sidecar copy
+   * of the raw bytes alongside the unwrap return value.
+   */
+  wireResponse: Buffer;
+  /**
+   * Plaintext response for audit: data || sw, post-decrypt + unpad.
+   * Equivalent to `Buffer.concat([data, sw_bytes])`.
+   */
+  plaintextResponse: Buffer;
 }
 
 /**
@@ -480,7 +518,17 @@ export function unwrapResponse(session: Scp03Session, input: UnwrapInput): Unwra
     data = unpadIso7816(padded);
   }
 
-  return { data, sw };
+  const plaintextResponse = Buffer.concat([
+    data,
+    Buffer.from([(sw >> 8) & 0xff, sw & 0xff]),
+  ]);
+
+  return {
+    data,
+    sw,
+    wireResponse: input.response,
+    plaintextResponse,
+  };
 }
 
 // ---------------------------------------------------------------------------

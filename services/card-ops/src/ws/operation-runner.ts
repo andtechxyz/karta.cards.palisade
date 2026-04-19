@@ -1,9 +1,21 @@
 /**
  * Operation runner — dispatches to the per-op handler.
  *
- * Each handler drives APDUs via {send, next} and returns a terminal
- * WSMessage (complete or error).  The runner forwards that to the WS
- * and finalizes the CardOpSession row.
+ * Each handler drives APDUs via {send, next, audit} and returns a
+ * terminal WSMessage (complete or error).  The runner forwards that
+ * to the WS and finalizes the CardOpSession row.
+ *
+ * APDU audit ownership:
+ *   - The runner owns the lifecycle of an ApduAuditLogger for the
+ *     session.  It creates the logger, threads it into DriveIO for
+ *     the handler, and flushes the buffer at every phase transition
+ *     so a WS disconnect mid-op still leaves a partial transcript.
+ *   - Phase transitions we flush at:
+ *       runner entry (READY → RUNNING, marked by relay-handler)
+ *       terminal transition (RUNNING → COMPLETE | FAILED)
+ *     Non-terminal progress mileposts inside a handler are not flushed
+ *     individually — the handler calls audit.flush() explicitly if it
+ *     wants tighter granularity.
  */
 
 import { prisma } from '@palisade/db';
@@ -13,6 +25,7 @@ import { isOperation, notImplemented, type Operation } from '../operations/index
 import { runListApplets } from '../operations/list-applets.js';
 import { runInstallPa } from '../operations/install-pa.js';
 import { runResetPaState } from '../operations/reset-pa-state.js';
+import { ApduAuditLogger } from './apdu-audit.js';
 
 type CardOpSessionWithCard = Prisma.CardOpSessionGetPayload<{ include: { card: true } }>;
 
@@ -20,13 +33,26 @@ export interface OperationContext {
   session: CardOpSessionWithCard;
   send: (msg: WSMessage) => void;
   next: () => Promise<WSMessage>;
+  /**
+   * Optional logger override — tests can inject a pre-built logger to
+   * observe entries directly.  Production always builds one from
+   * session.id.
+   */
+  audit?: ApduAuditLogger;
 }
 
 export async function runOperation(ctx: OperationContext): Promise<void> {
   const { session, send, next } = ctx;
+  const audit = ctx.audit ?? new ApduAuditLogger(session.id);
+
+  // Flush an empty log immediately on entry — makes the RUNNING
+  // transition visible in the DB row even before any APDU flows.
+  // Best-effort; logger swallows DB errors internally.
+  await audit.flush();
 
   if (!isOperation(session.operation)) {
     send({ type: 'error', code: 'UNKNOWN_OP', message: session.operation });
+    await audit.flush();
     await markFailed(session.id, `unknown_op:${session.operation}`);
     return;
   }
@@ -35,15 +61,16 @@ export async function runOperation(ctx: OperationContext): Promise<void> {
 
   let terminal: WSMessage;
   try {
+    const io = { send, next, audit };
     switch (op) {
       case 'list_applets':
-        terminal = await runListApplets(session, { send, next });
+        terminal = await runListApplets(session, io);
         break;
       case 'install_pa':
-        terminal = await runInstallPa(session, { send, next });
+        terminal = await runInstallPa(session, io);
         break;
       case 'reset_pa_state':
-        terminal = await runResetPaState(session, { send, next });
+        terminal = await runResetPaState(session, io);
         break;
       // Phase 3 stubs — wired up so the plumbing is exercised.
       //
@@ -72,6 +99,12 @@ export async function runOperation(ctx: OperationContext): Promise<void> {
   }
 
   send(terminal);
+
+  // Flush the audit trail BEFORE the terminal update so apduLog is in
+  // place if somebody queries the row right as phase flips.  The
+  // terminal update itself clears scpState (Prisma.DbNull) and sets
+  // completedAt / failedAt.
+  await audit.flush();
 
   if (terminal.type === 'complete') {
     // Handlers that fully completed already marked the row COMPLETE;

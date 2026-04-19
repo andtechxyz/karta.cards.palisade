@@ -26,7 +26,7 @@ export async function runListApplets(
   session: CardOpSessionWithCard,
   io: DriveIO,
 ): Promise<WSMessage> {
-  const keys = getGpStaticKeys(session.cardId);
+  const keys = await getGpStaticKeys(session.cardId);
   const { send } = await establishScp03(io, keys, { phasePrefix: 'SCP03' });
 
   const applets: AppEntry[] = [];

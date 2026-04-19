@@ -55,7 +55,7 @@ export async function runInstallPa(
     throw err;
   }
 
-  const keys = getGpStaticKeys(session.cardId);
+  const keys = await getGpStaticKeys(session.cardId);
   // INSTALL [load] and LOAD blocks benefit from C-DECRYPTION because the
   // load file bytes shouldn't leak to the WS relay layer.  Keep R-MAC
   // off (SL_CMAC | C_DECRYPTION = 0x03) — R-MAC adds verify cost without

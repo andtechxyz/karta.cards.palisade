@@ -574,6 +574,20 @@ model IssuerProfile {
   imkIdnKeyArn   String @default("") // Optional: ICC Dynamic Number
   issuerPkKeyArn String @default("") // Signs ICC PK Certificates (RSA)
 
+  // GlobalPlatform SCP03 static key ARNs — the AES-128 ENC / MAC / DEK
+  // triplet used by the card-ops service to authenticate admin GP
+  // operations (applet install/uninstall, wipe, etc.) against cards
+  // issued under this program.  Each ARN may point at either a KMS key
+  // (with the 16-byte key material stored as a wrapped CiphertextBlob
+  // in Secrets Manager) or directly at a Secrets Manager secret whose
+  // value IS the 16-byte key material.  Nullable — programs without
+  // their own set fall back to the env-wide GP test key in dev
+  // (CARD_OPS_USE_TEST_KEYS=1).  Any null in production triggers a
+  // warning; card-ops refuses to use test keys unless the env flag is set.
+  gpEncKeyArn String?
+  gpMacKeyArn String?
+  gpDekKeyArn String?
+
   // Pre-computed certificates from CA enrollment
   caPkIndex           String @default("")
   issuerPkCertificate String @default("") // Hex, Tag 90

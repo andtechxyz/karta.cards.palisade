@@ -8,6 +8,7 @@
     "build": "tsc -b"
   },
   "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.750.0",
     "@palisade/core": "*",
     "@palisade/db": "*",
     "@palisade/service-auth": "*",

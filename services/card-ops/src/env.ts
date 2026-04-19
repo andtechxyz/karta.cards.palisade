@@ -27,6 +27,11 @@ const { get: getCardOpsConfig, reset: _resetCardOpsConfig } = defineEnv({
   //   {"enc":"404142...","mac":"404142...","dek":"404142..."}
   // Defaults to the GP test key (40..4F) so local dev works against a
   // virgin JCOP sample card without config.
+  //
+  // This is the **test-keys fallback** — used when
+  // CARD_OPS_USE_TEST_KEYS is set OR the card's IssuerProfile has no
+  // gp{Enc,Mac,Dek}KeyArn populated.  Production must set
+  // CARD_OPS_USE_TEST_KEYS='' and populate the ARNs per IssuerProfile.
   GP_MASTER_KEY: z.string().default(
     JSON.stringify({
       enc: '404142434445464748494A4B4C4D4E4F',
@@ -34,6 +39,13 @@ const { get: getCardOpsConfig, reset: _resetCardOpsConfig } = defineEnv({
       dek: '404142434445464748494A4B4C4D4E4F',
     }),
   ),
+
+  // Bypass the per-card IssuerProfile ARN lookup and return the
+  // GP_MASTER_KEY (default: GP test keys) for every card.  Set to '1'
+  // in dev to use sample-card-friendly keys; leave unset in
+  // staging/production so a missing ARN is a loud warning rather than
+  // silent key reuse.
+  CARD_OPS_USE_TEST_KEYS: z.string().optional(),
 });
 
 export { getCardOpsConfig, _resetCardOpsConfig };
