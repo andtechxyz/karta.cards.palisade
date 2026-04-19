@@ -12,6 +12,7 @@
     { "path": "./packages/provisioning-client" },
     { "path": "./packages/vault-client" },
     { "path": "./packages/handoff" },
+    { "path": "./packages/sdm-keys" },
     { "path": "./services/tap" },
     { "path": "./services/activation" },
     { "path": "./services/data-prep" },
