@@ -16,13 +16,14 @@ import { prisma } from '@palisade/db';
 import { APDUBuilder } from '@palisade/emv';
 
 import { getRcaConfig } from '../env.js';
+import { buildProvisioningPlan, type Plan, type PlanStep } from './plan-builder.js';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 export interface WSMessage {
-  type: 'apdu' | 'response' | 'complete' | 'error' | 'pa_fci';
+  type: 'apdu' | 'response' | 'complete' | 'error' | 'pa_fci' | 'plan';
   hex?: string;
   sw?: string;
   phase?: string;
@@ -30,6 +31,22 @@ export interface WSMessage {
   code?: string;
   message?: string;
   proxyCardId?: string;
+
+  // Plan-mode fields -------------------------------------------------------
+  /**
+   * Step index.
+   *   - Outbound (server→app) on a 'plan' message: unused (steps carry their
+   *     own `i` on each PlanStep).
+   *   - Inbound (app→server) on a 'response' message: which plan step this
+   *     response belongs to.  Presence of `i` is how handleMessage
+   *     distinguishes plan-mode responses from classical-mode phase-driven
+   *     responses.
+   */
+  i?: number;
+  /** On a 'plan' message: the ordered list of APDU steps to execute. */
+  steps?: PlanStep[];
+  /** On a 'plan' message: plan schema version (1 today). */
+  version?: number;
 }
 
 interface SessionState {
@@ -80,7 +97,23 @@ export class SessionManager {
 
   /**
    * Process an incoming WebSocket message and return response messages.
-   * This drives the provisioning state machine.
+   *
+   * Two protocols coexist:
+   *
+   *   - **Classical** (phase-driven): server sends one APDU per round-trip,
+   *     tracked via `ProvisioningSession.phase`.  Entered when the mobile
+   *     app connects without `?mode=plan` and emits a `pa_fci` message
+   *     after running SELECT PA locally.
+   *   - **Plan** (pre-computed): server ships all 5 APDUs up front on WS
+   *     open and the phone streams responses back indexed by step number.
+   *     Entered when `?mode=plan` is on the WS URL; the initial message
+   *     sent to the phone is `{type:'plan', steps: [...]}`.  Inbound
+   *     responses carry the step `i` — handleMessage routes those through
+   *     {@link handlePlanResponse} instead of the classical phase machine.
+   *
+   * Plan mode trims 2 s off the tap on 500 ms-RTT connections by removing
+   * the 4 server-waits embedded in classical mode.  See plan-builder.ts
+   * for the protocol rationale.
    */
   async handleMessage(sessionId: string, message: WSMessage): Promise<WSMessage[]> {
     if (message.type === 'pa_fci') {
@@ -88,6 +121,11 @@ export class SessionManager {
     }
 
     if (message.type === 'response') {
+      // Plan-mode responses carry `i` (the step index).  Classical-mode
+      // responses don't — they're phase-driven and read only hex/sw.
+      if (typeof message.i === 'number') {
+        return this.handlePlanResponse(sessionId, message);
+      }
       return this.handleCardResponse(sessionId, message);
     }
 
@@ -97,6 +135,42 @@ export class SessionManager {
     }
 
     return [];
+  }
+
+  /**
+   * Plan-mode entry point: load the session's chip-profile inputs and
+   * assemble the full APDU plan.
+   *
+   * Called from the WebSocket relay handler on connection open when the
+   * client requested `?mode=plan`.  The relay sends the returned plan
+   * over the wire and transitions the session's phase to PLAN_SENT.
+   *
+   * Falls back to the M/Chip-CVN18 defaults when the chipProfile isn't
+   * wired on the session's card — matches the classical-path tolerance in
+   * handleKeygenResponse where unset values read as 0x8001/0x9F48.
+   */
+  async buildPlanForSession(sessionId: string): Promise<Plan> {
+    const session = await prisma.provisioningSession.findUnique({
+      where: { id: sessionId },
+      include: {
+        card: {
+          include: {
+            program: {
+              include: { issuerProfile: { include: { chipProfile: true } } },
+            },
+          },
+        },
+      },
+    });
+    if (!session) {
+      throw new Error(`Unknown session: ${sessionId}`);
+    }
+
+    const chipProfile = session.card?.program?.issuerProfile?.chipProfile;
+    return buildProvisioningPlan({
+      iccPrivateKeyDgi: chipProfile?.iccPrivateKeyDgi ?? 0x8001,
+      iccPrivateKeyTag: chipProfile?.iccPrivateKeyTag ?? 0x9F48,
+    });
   }
 
   // -----------------------------------------------------------------------
@@ -389,6 +463,209 @@ export class SessionManager {
       { type: 'apdu', hex: APDUBuilder.confirm(), phase: 'confirming', progress: 0.95 },
       { type: 'complete', proxyCardId: session.sadRecord.proxyCardId },
     ];
+  }
+
+  // -----------------------------------------------------------------------
+  // Plan-mode response handlers
+  //
+  // The 5 plan steps correspond to the classical phases 1:1 (SELECT PA,
+  // GENERATE_KEYS, TRANSFER_SAD, FINAL_STATUS, CONFIRM) but execute
+  // without a server round-trip between them.  We still run the same
+  // artefact-capture and DB-commit logic, just keyed off the response
+  // `i` index rather than the session `phase`.
+  // -----------------------------------------------------------------------
+
+  /**
+   * Route an indexed plan-mode response to the per-step handler.
+   *
+   * SW decoding matches the classical {@link handleCardResponse} exactly:
+   * prefer `sw` when well-formed (4 hex chars), fall back to
+   * last-4-hex-chars of `hex`, and synthesize 6F00 only if both are empty
+   * (mobile-side NFC failure, not a chip error).  The critical difference
+   * from classical mode: any non-9000 SW at ANY step is fatal, because
+   * the phone has already committed to executing the subsequent steps.
+   * We mark the session FAILED with a step-specific reason and rely on
+   * the phone to abort remaining steps when it receives the {type:'error'}
+   * reply.
+   */
+  private async handlePlanResponse(sessionId: string, msg: WSMessage): Promise<WSMessage[]> {
+    const rawHex = msg.hex ?? '';
+    const rawSw = msg.sw ?? '';
+    const i = msg.i ?? -1;
+    const appErrored = rawSw.length !== 4 && rawHex.length < 4;
+
+    let sw: number;
+    if (rawSw.length === 4) {
+      sw = parseInt(rawSw, 16);
+    } else if (rawHex.length >= 4) {
+      sw = parseInt(rawHex.slice(-4), 16);
+    } else {
+      sw = 0x6f00;
+    }
+
+    const dataHex =
+      rawHex.length >= 4 && rawHex.slice(-4).toLowerCase() === rawSw.toLowerCase()
+        ? rawHex.slice(0, -4)
+        : rawHex;
+    const data = Buffer.from(dataHex, 'hex');
+
+    if (sw !== 0x9000) {
+      const swStr = sw.toString(16).padStart(4, '0').toUpperCase();
+      if (appErrored) {
+        console.warn(
+          `[rca] plan-mode mobile NFC failure at step ${i} in session ${sessionId}: ` +
+          `empty hex + empty sw.  Synthesizing 6F00.`,
+        );
+      } else {
+        console.warn(
+          `[rca] plan-mode chip error SW=${swStr} at step ${i} in session ${sessionId}`,
+        );
+      }
+      await prisma.provisioningSession.update({
+        where: { id: sessionId },
+        data: {
+          phase: 'FAILED',
+          failedAt: new Date(),
+          failureReason: appErrored ? `NFC_ERROR_step_${i}` : `CARD_ERROR_${swStr}_step_${i}`,
+        },
+      });
+      return [{
+        type: 'error',
+        code: appErrored ? 'NFC_ERROR' : 'CARD_ERROR',
+        message: appErrored
+          ? `Mobile NFC transceive failed at plan step ${i}`
+          : `Card returned error SW=${swStr} at plan step ${i}`,
+      }];
+    }
+
+    switch (i) {
+      case 0: return []; // SELECT PA — phone parsed FCI locally; nothing to do server-side
+      case 1: return this.handlePlanKeygen(sessionId, data);
+      case 2: return []; // TRANSFER_SAD — PA returns STATUS bytes; no server action
+      case 3: return this.handlePlanFinalStatus(sessionId, data);
+      case 4: return this.handlePlanConfirm(sessionId);
+      default:
+        console.warn(`[rca] unexpected plan step index ${i} in session ${sessionId}`);
+        return [];
+    }
+  }
+
+  /**
+   * Step 1: GENERATE_KEYS response — capture the chip's ECC P-256 public
+   * key.  In the classical path this is handleKeygenResponse; plan mode
+   * skips the state-machine transitions (no phase updates) because the
+   * phone is already executing subsequent steps.
+   *
+   * Response body: ICC_PubKey(65) || Attest_Sig(~72) || CPLC(42).  We
+   * store the first 65 bytes (uncompressed SEC1 pubkey 0x04 || X || Y)
+   * for audit and future attestation verification.
+   */
+  private async handlePlanKeygen(sessionId: string, data: Buffer): Promise<WSMessage[]> {
+    const iccPubkey = data.subarray(0, Math.min(65, data.length));
+    await prisma.provisioningSession.update({
+      where: { id: sessionId },
+      data: { iccPublicKey: iccPubkey },
+    });
+    return [];
+  }
+
+  /**
+   * Step 3: FINAL_STATUS response — the PA's success/fail verdict.
+   *
+   * Response byte layout:
+   *   [0]           status — 0x01 = success, anything else = failure
+   *   [1..33]       provenance hash (32 bytes)
+   *   [65]          FIDO credId length
+   *   [66..66+len]  FIDO credId
+   *
+   * SW=9000 only tells us the APDU was well-formed; the semantic success
+   * signal is data[0] == 0x01.  On failure we mark the session FAILED
+   * and emit {type:'error'} so the phone aborts before step 4 (CONFIRM).
+   * On success we extract provenance + FIDO data and transition to
+   * AWAITING_CONFIRM — the actual card/SAD commit happens in step 4
+   * once CONFIRM lands 9000 (matches classical semantics: step 4 is
+   * what latches the chip to COMMITTED state).
+   */
+  private async handlePlanFinalStatus(sessionId: string, data: Buffer): Promise<WSMessage[]> {
+    const statusByte = data.length > 0 ? data[0] : 0;
+
+    if (statusByte !== 0x01) {
+      await prisma.provisioningSession.update({
+        where: { id: sessionId },
+        data: { phase: 'FAILED', failedAt: new Date(), failureReason: 'PA_FAILED' },
+      });
+      return [{
+        type: 'error',
+        code: 'PA_FAILED',
+        message: 'Provisioning failed on card',
+      }];
+    }
+
+    const provHash = data.length > 33 ? data.subarray(1, 33).toString('hex') : '';
+    let fidoCredData = '';
+    if (data.length > 66) {
+      const credIdLen = data[65];
+      const credId = data.subarray(66, 66 + credIdLen);
+      fidoCredData = credId.toString('base64url');
+    }
+
+    await prisma.provisioningSession.update({
+      where: { id: sessionId },
+      data: {
+        phase: 'AWAITING_CONFIRM',
+        provenance: provHash,
+        fidoCredData,
+      },
+    });
+
+    // No outbound message — phone is already executing step 4 locally.
+    return [];
+  }
+
+  /**
+   * Step 4: CONFIRM response — the chip has latched to COMMITTED.
+   *
+   * This is where we actually finalize the session: mark it COMPLETE,
+   * flip Card.status to PROVISIONED, consume the SAD record, and fire
+   * the async callback to the activation service.  The `complete`
+   * response tells the phone the session ended successfully.
+   *
+   * Matches handleFinalStatus in the classical path, minus the CONFIRM
+   * APDU send (phone already executed it before we got here).
+   */
+  private async handlePlanConfirm(sessionId: string): Promise<WSMessage[]> {
+    const session = await prisma.provisioningSession.update({
+      where: { id: sessionId },
+      data: {
+        phase: 'COMPLETE',
+        completedAt: new Date(),
+      },
+      include: { card: true, sadRecord: true },
+    });
+
+    await prisma.card.update({
+      where: { id: session.cardId },
+      data: { status: 'PROVISIONED', provisionedAt: new Date() },
+    });
+
+    await prisma.sadRecord.update({
+      where: { id: session.sadRecordId },
+      data: { status: 'CONSUMED' },
+    });
+
+    console.log(
+      `[rca] plan-mode provisioning complete: session=${sessionId}, card=${session.cardId}`,
+    );
+
+    // Fire callback to activation service (async, non-blocking).
+    this.fireCallback(session.card.cardRef, session.card.chipSerial ?? '').catch((err) =>
+      console.error('[rca] callback failed:', err),
+    );
+
+    return [{
+      type: 'complete',
+      proxyCardId: session.sadRecord.proxyCardId,
+    }];
   }
 
   /**

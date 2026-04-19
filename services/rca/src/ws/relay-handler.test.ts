@@ -5,14 +5,25 @@ import { EventEmitter } from 'node:events';
 // Mock SessionManager before importing the handler
 // ---------------------------------------------------------------------------
 
-const { mockHandleMessage } = vi.hoisted(() => ({
+const { mockHandleMessage, mockBuildPlanForSession, mockPrismaUpdate } = vi.hoisted(() => ({
   mockHandleMessage: vi.fn(),
+  mockBuildPlanForSession: vi.fn(),
+  mockPrismaUpdate: vi.fn(),
 }));
 
 vi.mock('../services/session-manager.js', () => ({
   SessionManager: vi.fn().mockImplementation(() => ({
     handleMessage: mockHandleMessage,
+    buildPlanForSession: mockBuildPlanForSession,
   })),
+}));
+
+vi.mock('@palisade/db', () => ({
+  prisma: {
+    provisioningSession: {
+      update: mockPrismaUpdate,
+    },
+  },
 }));
 
 // ---------------------------------------------------------------------------
@@ -151,5 +162,95 @@ describe('handleRelayConnection', () => {
     expect(errorMsg.type).toBe('error');
     expect(errorMsg.code).toBe('SERVER_ERROR');
     expect(ws.closeCode).toBe(1011);
+  });
+
+  // -------------------------------------------------------------------------
+  // Plan mode
+  //
+  // With planMode: true, the handler must call buildPlanForSession and send
+  // the plan JSON on connect instead of the SELECT PA APDU, and transition
+  // the session's phase to PLAN_SENT.
+  // -------------------------------------------------------------------------
+
+  describe('plan mode', () => {
+    it('ships a full plan on connect and marks phase PLAN_SENT', async () => {
+      const fakePlan = {
+        type: 'plan',
+        version: 1,
+        steps: [
+          { i: 0, apdu: '00A4040008A00000006250414C', phase: 'select_pa', progress: 0.05, expectSw: '9000' },
+          { i: 1, apdu: '80E000000101', phase: 'key_generation', progress: 0.25, expectSw: '9000' },
+        ],
+      };
+      mockBuildPlanForSession.mockResolvedValue(fakePlan);
+      mockPrismaUpdate.mockResolvedValue({ id: 'session_01', phase: 'PLAN_SENT' });
+
+      await handleRelayConnection(ws as any, 'session_01', { planMode: true });
+
+      expect(mockBuildPlanForSession).toHaveBeenCalledWith('session_01');
+      expect(mockPrismaUpdate).toHaveBeenCalledWith({
+        where: { id: 'session_01' },
+        data: { phase: 'PLAN_SENT' },
+      });
+
+      expect(ws.sent).toHaveLength(1);
+      const sent = JSON.parse(ws.sent[0]);
+      expect(sent.type).toBe('plan');
+      expect(sent.version).toBe(1);
+      expect(sent.steps).toHaveLength(2);
+    });
+
+    it('does NOT send the classical SELECT PA APDU when planMode=true', async () => {
+      mockBuildPlanForSession.mockResolvedValue({ type: 'plan', version: 1, steps: [] });
+      mockPrismaUpdate.mockResolvedValue({ id: 'session_01' });
+
+      await handleRelayConnection(ws as any, 'session_01', { planMode: true });
+
+      // Only the plan message — no separate APDU.
+      expect(ws.sent).toHaveLength(1);
+      const sent = JSON.parse(ws.sent[0]);
+      expect(sent.type).toBe('plan');
+    });
+
+    it('sends PLAN_BUILD_FAILED and closes 1011 if buildPlanForSession throws', async () => {
+      mockBuildPlanForSession.mockRejectedValue(new Error('chip profile missing'));
+
+      await handleRelayConnection(ws as any, 'session_01', { planMode: true });
+
+      expect(ws.sent).toHaveLength(1);
+      const sent = JSON.parse(ws.sent[0]);
+      expect(sent.type).toBe('error');
+      expect(sent.code).toBe('PLAN_BUILD_FAILED');
+      expect(ws.closeCode).toBe(1011);
+      // Phase update should not have happened.
+      expect(mockPrismaUpdate).not.toHaveBeenCalled();
+    });
+
+    it('routes plan-mode responses back through handleMessage and closes on terminal', async () => {
+      mockBuildPlanForSession.mockResolvedValue({ type: 'plan', version: 1, steps: [] });
+      mockPrismaUpdate.mockResolvedValue({ id: 'session_01' });
+      mockHandleMessage.mockResolvedValue([
+        { type: 'complete', proxyCardId: 'pxy_abc' },
+      ]);
+
+      await handleRelayConnection(ws as any, 'session_01', { planMode: true });
+      ws.sent = []; // clear the initial plan message
+
+      const incoming = JSON.stringify({ type: 'response', i: 4, hex: '', sw: '9000' });
+      ws.emit('message', Buffer.from(incoming));
+
+      await vi.waitFor(() => {
+        expect(ws.closeCode).toBe(1000);
+      });
+
+      expect(mockHandleMessage).toHaveBeenCalledWith(
+        'session_01',
+        { type: 'response', i: 4, hex: '', sw: '9000' },
+      );
+      // Plan mode still uses the same complete-message channel.
+      const completeMsg = JSON.parse(ws.sent[0]);
+      expect(completeMsg.type).toBe('complete');
+      expect(completeMsg.proxyCardId).toBe('pxy_abc');
+    });
   });
 });
