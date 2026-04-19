@@ -324,8 +324,10 @@ necessary card data *before* triggering the destructive migration.
   Dockerfile does so before `tsc -b`.
 - **ALB WS support**: card-ops + RCA use WebSocket.  Confirm the target
   group's "stickiness" + load-balancer upgrade support are on.
-- **Card-ops port conflict** with admin (both default 3009): explicit
-  `PORT=` override on one of them in task def env.
+- **Card-ops port pinning**: code default is 3009 which collides with
+  admin's 3009.  Prod task def (aws-setup.sh) pins card-ops to
+  **PORT=3010** via env var + target-group + ALB listener.  Local dev
+  picks up the same via `scripts/dev-stack.sh`.
 - **`docker compose up` locally doesn't match prod**: local uses
   docker-compose Postgres on 5433 (Palisade) / 5432 (Vera).  Prod uses
   RDS.  Don't rely on local behaviour for prod assumptions.
