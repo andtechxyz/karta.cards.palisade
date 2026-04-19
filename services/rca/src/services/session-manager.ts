@@ -213,20 +213,44 @@ export class SessionManager {
 
   /**
    * Route card responses based on the current phase.
+   *
+   * The mobile app's WS message shape for a card response is:
+   *   { type:'response', hex:'<full response including SW>', sw:'<last 4 hex chars>' }
+   *
+   * `hex` already contains the full response bytes *including* the trailing
+   * SW, so `sw` is a duplicate of the last 2 bytes of `hex`.  We read SW
+   * from `sw` directly (authoritative, always 4 hex chars when well-formed)
+   * and slice the data portion off `hex`.  An older version of this handler
+   * concatenated `hex + sw` and parsed last-2-bytes-of-that as SW, which
+   * worked but left phase-handler callers with a buffer that still had SW
+   * bytes glued on the end.
+   *
+   * Empty/missing fields: the app sometimes emits `{hex:'', sw:''}` after a
+   * native NFC transceive failure.  Distinguish that from a real chip error
+   * so the logs point at the right layer.
    */
   private async handleCardResponse(sessionId: string, msg: WSMessage): Promise<WSMessage[]> {
-    // The mobile app sends `{type:"response", hex:"<data hex>", sw:"<4 hex>"}`.
-    // If it can't reach the chip — NFC field drop, ISO-DEP timeout,
-    // transceive exception — it tends to send either no fields at all or
-    // empty strings, which parseResponse collapses to a synthetic 6F00.
-    // We want to tell those apart in logs so we can diagnose mobile-side
-    // vs chip-side errors without guessing.
     const rawHex = msg.hex ?? '';
     const rawSw = msg.sw ?? '';
-    const concat = rawHex + rawSw;
-    const appErrored = concat.length < 4; // chip SW is always 2 bytes / 4 hex chars
+    const appErrored = rawSw.length !== 4 && rawHex.length < 4;
 
-    const [, sw] = APDUBuilder.parseResponse(concat);
+    let sw: number;
+    if (rawSw.length === 4) {
+      sw = parseInt(rawSw, 16);
+    } else if (rawHex.length >= 4) {
+      // Fallback — sw field wasn't populated but full response landed in hex.
+      sw = parseInt(rawHex.slice(-4), 16);
+    } else {
+      sw = 0x6f00;
+    }
+
+    // Strip trailing SW from data so phase handlers get clean bytes.
+    // If hex already ended in the SW (expected shape), drop those 4 chars.
+    const dataHex =
+      rawHex.length >= 4 && rawHex.slice(-4).toLowerCase() === rawSw.toLowerCase()
+        ? rawHex.slice(0, -4)
+        : rawHex;
+    const normalizedMsg: WSMessage = { ...msg, hex: dataHex, sw: rawSw };
 
     // Check for card error
     if (sw !== 0x9000) {
@@ -240,7 +264,7 @@ export class SessionManager {
       } else {
         console.warn(
           `[rca] chip card error SW=${swStr} in session ${sessionId} ` +
-          `(response was hex.len=${rawHex.length}, sw="${rawSw}")`,
+          `(response was data.len=${dataHex.length / 2}B, sw="${rawSw}")`,
         );
       }
       return [{
@@ -259,11 +283,11 @@ export class SessionManager {
 
     switch (session.phase) {
       case 'KEYGEN':
-        return this.handleKeygenResponse(sessionId, msg);
+        return this.handleKeygenResponse(sessionId, normalizedMsg);
       case 'SAD_TRANSFER':
         return this.handleSadResponse(sessionId);
       case 'AWAITING_FINAL':
-        return this.handleFinalStatus(sessionId, msg);
+        return this.handleFinalStatus(sessionId, normalizedMsg);
       default:
         return [];
     }
