@@ -13,7 +13,7 @@
  * PANs never live outside the vault after processing completes.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { prisma } from '@palisade/db';
 import { decrypt, EnvKeyProvider } from '@palisade/core';
@@ -170,15 +170,14 @@ async function registerCard(record: EmbossingRecord, programId: string): Promise
   // so the activation service accepts the row.  Production batches from
   // Episode Six / pers bureaus always include these; the placeholders are
   // a safety net for test data that lacks them.
-  const randomHex = (n: number): string =>
-    [...Array(n)].map(() => Math.floor(Math.random() * 16).toString(16)).join('');
+  const randomHex = (bytes: number): string => randomBytes(bytes).toString('hex');
 
   const body = JSON.stringify({
-    cardRef: record.cardRef ?? `card_${Date.now()}_${randomHex(6)}`,
-    uid: record.uid ?? randomHex(14),
+    cardRef: record.cardRef ?? `card_${Date.now()}_${randomHex(3)}`,
+    uid: record.uid ?? randomHex(7),
     chipSerial: record.chipSerial,
-    sdmMetaReadKey: record.sdmMetaReadKey ?? randomHex(32),
-    sdmFileReadKey: record.sdmFileReadKey ?? randomHex(32),
+    sdmMetaReadKey: record.sdmMetaReadKey ?? randomHex(16),
+    sdmFileReadKey: record.sdmFileReadKey ?? randomHex(16),
     programId,
     batchId: undefined,
     card: {
