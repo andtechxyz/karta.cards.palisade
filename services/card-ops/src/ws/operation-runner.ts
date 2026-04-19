@@ -24,6 +24,8 @@ import type { WSMessage } from './messages.js';
 import { isOperation, notImplemented, type Operation } from '../operations/index.js';
 import { runListApplets } from '../operations/list-applets.js';
 import { runInstallPa } from '../operations/install-pa.js';
+import { runInstallPaymentApplet } from '../operations/install-payment-applet.js';
+import { runPersonalisePaymentApplet } from '../operations/personalise-payment-applet.js';
 import { runResetPaState } from '../operations/reset-pa-state.js';
 import { ApduAuditLogger } from './apdu-audit.js';
 
@@ -68,6 +70,12 @@ export async function runOperation(ctx: OperationContext): Promise<void> {
         break;
       case 'install_pa':
         terminal = await runInstallPa(session, io);
+        break;
+      case 'install_payment_applet':
+        terminal = await runInstallPaymentApplet(session, io);
+        break;
+      case 'personalise_payment_applet':
+        terminal = await runPersonalisePaymentApplet(session, io);
         break;
       case 'reset_pa_state':
         terminal = await runResetPaState(session, io);
