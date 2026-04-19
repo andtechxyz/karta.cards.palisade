@@ -8,6 +8,7 @@ import { purgeExpiredActivationSessions, startSweeper } from '@palisade/retentio
 import { getActivationConfig } from './env.js';
 import activationRouter from './routes/activation.routes.js';
 import cardsRouter from './routes/cards.routes.js';
+import cardsLookupRouter from './routes/cards-lookup.routes.js';
 import { createProvisioningRouter } from './routes/provisioning.routes.js';
 import { createCardsMineRouter } from './routes/cards-mine.routes.js';
 import { createCardOpRouter } from './routes/card-op.routes.js';
@@ -33,6 +34,18 @@ app.use('/api/cards/mine',
   express.json({ limit: '64kb' }),
   apiRateLimit,
   createCardsMineRouter(),
+);
+
+// --- Cross-repo card lookup (pay-service-authed, HMAC) ---
+// Mounted BEFORE /api/cards so the more-specific /api/cards/lookup prefix
+// catches ahead of the provisioning-authed /api/cards mount.  Keyed off
+// a separate PAY_AUTH_KEYS map so rotating pay's secret doesn't disturb the
+// provisioning-agent / batch-processor callers.
+const payGate = requireSignedRequest({ keys: config.PAY_AUTH_KEYS });
+app.use('/api/cards/lookup',
+  express.json({ limit: '64kb', verify: captureRawBody }),
+  payGate,
+  cardsLookupRouter,
 );
 
 const provisionGate = requireSignedRequest({ keys: config.PROVISION_AUTH_KEYS });

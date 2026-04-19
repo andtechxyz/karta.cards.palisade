@@ -51,6 +51,9 @@ const defaults: Record<string, string> = {
   SERVICE_AUTH_KEYS: JSON.stringify({ pay: HEX32_F, activation: HEX32_G, admin: HEX32_H }),
   // Provisioning-agent HMAC keys (activation inbound).
   PROVISION_AUTH_KEYS: JSON.stringify({ 'provision-agent': HEX32_I }),
+  // Pay-service HMAC keys (activation inbound for /api/cards/lookup).
+  // Separate map so a rotation on pay's secret doesn't disturb provision-agent.
+  PAY_AUTH_KEYS: JSON.stringify({ pay: HEX32_F }),
   // Admin browser-facing auth — must differ from PROVISION_AUTH_KEYS to catch
   // accidental key-swap bugs.
   ADMIN_API_KEY: HEX32_J,

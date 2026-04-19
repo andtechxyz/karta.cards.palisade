@@ -17,6 +17,11 @@ const { get: getActivationConfig, reset: _resetActivationConfig } = defineEnv({
   // Separate from vault's SERVICE_AUTH_KEYS — both services share one .env in
   // dev; different caller sets need different key maps.
   PROVISION_AUTH_KEYS: authKeysJson,
+  // Inbound-from-pay HMAC key map.  Used by /api/cards/lookup/:cardId (the
+  // cross-repo card-state endpoint Vera's pay calls).  Kept separate from
+  // PROVISION_AUTH_KEYS so rotating pay's secret doesn't force redeploys
+  // of the provisioning-agent / batch-processor callers.
+  PAY_AUTH_KEYS: authKeysJson,
   // Activation is the only service that fingerprints UIDs (for collision
   // detection at register time).  Declared inline — no shared fragment.
   CARD_UID_FINGERPRINT_KEY: hexKey(32),
