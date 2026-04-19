@@ -1,25 +1,60 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# Palisade AWS infrastructure setup
+# Palisade AWS infrastructure setup (post-split, Phase 1-5 complete)
 #
-# Scope: tap (3001), activation (3002), admin (3009), data-prep (3006),
-# rca (3007), batch-processor (3008), sftp (22).  Shares the karta.cards
-# AWS account (600743178530) and the `vera` ECS cluster with Vera's
-# pay/vault/admin services.  Every Palisade resource is prefixed
-# `palisade-*` so it coexists with Vera's `vera-*`.
+# Repo scope: card lifecycle + chip provisioning.  Palisade owns tap, the
+# activation surface, the admin service (card / program / issuer / chip-
+# profile / embossing), data-prep, rca, batch-processor, sftp, and the new
+# card-ops (admin-operated GlobalPlatform APDU relay).  Vault + pay +
+# transactions live on the Vera repo and are provisioned by Vera's
+# aws-setup.sh against the same AWS account.
 #
-# Idempotent: safe to re-run.  Creates or updates secrets, task
-# definitions, target groups, ALB listener rules, and ECS services.
+# Services managed here:
+#   - palisade-tap              (3001)  public  — SUN / post-activation tap
+#   - palisade-activation       (3002)  public  — NFC activation + mobile
+#                                                 API, inbound from pay for
+#                                                 cross-repo card lookup
+#   - palisade-data-prep        (3006)  internal (HMAC) — SAD generation
+#   - palisade-rca              (3007)  public  — mobile provisioning WS
+#   - palisade-batch-processor  (3008)  worker  — polls DB + S3
+#   - palisade-admin            (3009)  public  — admin SPA backend
+#   - palisade-card-ops         (3010)  public  — admin-operated GP relay
+#                                                 (WebSocket + HMAC-gated
+#                                                 /register)
+#   - palisade-sftp             (22)    public (NLB) — partner file drop
+#
+# Cross-repo wiring (managed here):
+#   - activation hosts PAY_AUTH_KEYS keyed 'pay' — secret MUST match Vera
+#     pay's SERVICE_AUTH_PALISADE_SECRET.  Palisade owns the inbound map;
+#     Vera owns the outbound secret.
+#   - admin/activation call Vera's vault for PAN ops under SERVICE_AUTH_
+#     KEYS keyed 'palisade' (see palisade/PALISADE_VERA_VAULT_SECRET).
+#
+# Shared AWS substrate:
+#   - AWS account: 600743178530 (same as Vera).
+#   - VPC, ECS cluster ('vera'), execution role, and public/internal ALBs
+#     are created by Vera's aws-setup.sh.  This script appends to them.
+#   - Every resource here is prefixed `palisade-*` to coexist with the
+#     `vera-*` side.
+#   - RDS: Palisade uses a SEPARATE Postgres instance from Vera's — the
+#     split doubled up on schemas that couldn't be merged safely.  Local
+#     docker-compose exposes host port 5433 to avoid colliding with
+#     Vera's host 5432.  The managed RDS instance is provisioned in §9.
 #
 # ALB rule strategy on manage.karta.cards:
 #   - Vera's script sets a priority-4 host-header rule → vera-admin
 #   - This script adds a HIGHER-priority (2) rule: host=manage.karta.cards
 #     + path=/palisade-api/* → palisade-admin.  /api/* still falls through
 #     to vera-admin, keeping the SPA's dual-backend proxy intact.
+#   - card-ops (port 3010) gets a separate host-header rule for
+#     card-ops.karta.cards; the mobile / web admin connects the relay
+#     WebSocket directly to that hostname so WS upgrades don't collide
+#     with the admin path-prefix rule above.
 #
 # Prerequisites:
 #   - AWS CLI v2 configured with credentials that can manage ECS, ELB,
-#     Secrets Manager, CloudWatch Logs, and ECR in ap-southeast-2.
+#     Secrets Manager, CloudWatch Logs, ECR, IAM, KMS, S3, RDS, and
+#     Cognito in ap-southeast-2.
 #   - Vera's scripts/aws-setup.sh has already run at least once (creates
 #     the public ALB, internal ALB, ECS cluster, and shared execution
 #     role that this script references).
@@ -42,10 +77,35 @@ ECS_SG="sg-086e7b16e5351f155"
 ECR_BASE="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com"
 INTERNAL_ALB_DNS="internal-vera-internal-886106335.${REGION}.elb.amazonaws.com"
 
+# Palisade-owned task roles — per-service so each gets the minimum grant.
+DATA_PREP_TASK_ROLE="arn:aws:iam::${ACCOUNT}:role/palisade-data-prep-task"
+CARD_OPS_TASK_ROLE="arn:aws:iam::${ACCOUNT}:role/palisade-card-ops-task"
+ADMIN_TASK_ROLE="arn:aws:iam::${ACCOUNT}:role/palisade-admin-task"
+BATCH_PROCESSOR_TASK_ROLE="arn:aws:iam::${ACCOUNT}:role/palisade-batch-processor-task"
+SFTP_TASK_ROLE="arn:aws:iam::${ACCOUNT}:role/palisade-sftp-task"
+
 # Vera admin's target group — we route everything on manage.karta.cards
 # except /palisade-api/* to it.  The ARN is looked up at runtime rather
 # than hard-coded so this script can't drift from Vera's.
 VERA_ADMIN_TG_NAME="vera-admin"
+
+# RDS — separate instance from Vera's.  Host port 5433 is docker-compose
+# only; the managed instance uses 5432 internally.
+RDS_INSTANCE_ID="palisade-prod"
+RDS_SUBNET_GROUP="palisade-rds-subnets"
+RDS_SG_NAME="palisade-rds"
+RDS_DB_NAME="palisade"
+
+# S3 bucket names.
+CHIP_PROFILES_BUCKET="palisade-chip-profiles-${ACCOUNT}"
+EMBOSSING_BUCKET_NAME="palisade-embossing-${ACCOUNT}"
+MICROSITE_BUCKET_NAME="karta-microsites-${ACCOUNT}"
+
+# KMS alias names (aliases are human-readable pointers at rotating key IDs).
+KMS_SAD_ALIAS="alias/palisade-sad"
+
+# Cognito — single user pool for mobile + admin.
+COGNITO_POOL_NAME="palisade-users"
 
 # Tracking arrays for the final summary
 CREATED_SECRETS=()
@@ -57,6 +117,11 @@ CREATED_TGS=()
 CREATED_RULES=()
 CREATED_SERVICES=()
 SKIPPED_SERVICES=()
+CREATED_BUCKETS=()
+CREATED_KMS_KEYS=()
+CREATED_RDS=()
+CREATED_COGNITO=()
+CREATED_ROLES=()
 
 # ===========================================================================
 # Helper functions
@@ -158,6 +223,81 @@ get_secret_arn() {
   echo "$arn"
 }
 
+ensure_ecr_repo() {
+  local name="$1"
+  if aws ecr describe-repositories \
+       --repository-names "$name" \
+       --region "$REGION" \
+       --query 'repositories[0].repositoryName' --output text >/dev/null 2>&1; then
+    echo "  [exists] ECR repository $name"
+  else
+    aws ecr create-repository \
+      --repository-name "$name" \
+      --region "$REGION" \
+      --image-scanning-configuration scanOnPush=true \
+      --query 'repository.repositoryName' --output text >/dev/null
+    echo "  [created] ECR repository $name"
+  fi
+}
+
+ensure_iam_role() {
+  # ensure_iam_role <role-name> <assume-role-policy-json>
+  local name="$1"
+  local assume_doc="$2"
+  if aws iam get-role --role-name "$name" --query 'Role.RoleName' --output text >/dev/null 2>&1; then
+    echo "  [exists] IAM role $name"
+  else
+    aws iam create-role \
+      --role-name "$name" \
+      --assume-role-policy-document "$assume_doc" \
+      --query 'Role.RoleName' --output text >/dev/null
+    CREATED_ROLES+=("$name")
+    echo "  [created] IAM role $name"
+  fi
+}
+
+put_inline_policy() {
+  # put_inline_policy <role-name> <policy-name> <policy-json>
+  aws iam put-role-policy \
+    --role-name "$1" \
+    --policy-name "$2" \
+    --policy-document "$3" >/dev/null
+  echo "  [updated] Inline policy $2 on $1"
+}
+
+ASSUME_ECS_TASK='{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "ecs-tasks.amazonaws.com" },
+    "Action": "sts:AssumeRole"
+  }]
+}'
+
+# ===========================================================================
+echo ""
+echo "============================================================"
+echo " 0. ECR REPOSITORIES"
+echo "============================================================"
+# ===========================================================================
+#
+# Every Palisade service gets its own ECR repo.  Created here so a fresh
+# account bootstrap can succeed before the ECS task-def registrations
+# reference the :latest images.  Image-scan-on-push is enabled to catch
+# known CVEs before rollout.
+
+for repo in \
+    palisade-tap \
+    palisade-activation \
+    palisade-data-prep \
+    palisade-rca \
+    palisade-batch-processor \
+    palisade-sftp \
+    palisade-admin \
+    palisade-card-ops; do
+  ensure_ecr_repo "$repo"
+done
+
 # ===========================================================================
 echo ""
 echo "============================================================"
@@ -196,43 +336,102 @@ migrate_secret "vera/WEBAUTHN_RP_NAME"             "palisade/WEBAUTHN_RP_NAME"
 
 echo ""
 echo "--- Ensuring all required secrets exist ---"
-# Shared.
+
+# -------- Shared --------
+# The Palisade RDS instance's connection string.  Created/rotated in §9
+# (post-RDS-provision); the placeholder here lets the script boot on a
+# fresh account before the DB exists.
 ensure_secret "palisade/DATABASE_URL"              "CHANGEME"
 ensure_secret "palisade/CORS_ORIGINS"              "CHANGEME"
 
+# -------- Cross-repo HMAC --------
 # Palisade ↔ Vera — Palisade calls Vera's vault to register PANs and gets
 # back an opaque vaultToken.  Shares Vera's SERVICE_AUTH_KEYS entry keyed
 # "palisade".  This secret MUST match that entry.
 ensure_secret "palisade/PALISADE_VERA_VAULT_SECRET" "CHANGEME"
 
-# SDM — per-card key derivation for tap.
+# activation's inbound HMAC key map — Vera pay HMAC-signs GET /api/cards/
+# lookup/:cardId with keyId='pay'.  Value shape: {"pay":"<32-byte hex>",...}.
+# The 'pay' entry MUST match Vera's vera/SERVICE_AUTH_PALISADE_SECRET.
+ensure_secret "palisade/PAY_AUTH_KEYS"             "CHANGEME"
+
+# card-ops inbound HMAC key map — activation HMAC-signs POST /api/card-ops
+# /register with keyId='activation'.  Shape: {"activation":"<32-byte hex>"}.
+# The 'activation' entry MUST match palisade/SERVICE_AUTH_CARD_OPS_SECRET.
+ensure_secret "palisade/CARD_OPS_AUTH_KEYS"        "CHANGEME"
+
+# activation → card-ops outbound secret.  Mirrors the CARD_OPS_AUTH_KEYS
+# entry keyed 'activation' — rotate together.
+ensure_secret "palisade/SERVICE_AUTH_CARD_OPS_SECRET" "CHANGEME"
+
+# -------- Activation service URLs --------
+ensure_secret "palisade/ACTIVATION_SERVICE_URL"    "http://internal-vera-internal-886106335.ap-southeast-2.elb.amazonaws.com:3002"
+ensure_secret "palisade/DATA_PREP_SERVICE_URL"     "http://internal-vera-internal-886106335.ap-southeast-2.elb.amazonaws.com:3006"
+ensure_secret "palisade/RCA_SERVICE_URL"           "http://internal-vera-internal-886106335.ap-southeast-2.elb.amazonaws.com:3007"
+ensure_secret "palisade/CARD_OPS_URL"              "http://internal-vera-internal-886106335.ap-southeast-2.elb.amazonaws.com:3010"
+# Public WS base that the admin SPA connects its APDU-relay WebSocket to.
+# Must resolve to the palisade-card-ops target group via the public ALB.
+ensure_secret "palisade/CARD_OPS_PUBLIC_WS_BASE"   "wss://card-ops.karta.cards"
+
+# Vera vault endpoint — activation uses this on card registration.
+ensure_secret "palisade/VERA_VAULT_URL"            "http://internal-vera-internal-886106335.ap-southeast-2.elb.amazonaws.com:3004"
+
+# -------- Admin --------
+ensure_secret "palisade/SERVICE_AUTH_ADMIN_SECRET" "CHANGEME"
+# Microsite CDN + S3 bucket — admin uploads zips, CloudFront serves them.
+ensure_secret "palisade/MICROSITE_BUCKET"          "${MICROSITE_BUCKET_NAME}"
+ensure_secret "palisade/MICROSITE_CDN_URL"         "https://microsite.karta.cards"
+ensure_secret "palisade/EMBOSSING_KMS_KEY_ARN"     "CHANGEME"
+# S3 bucket for uploaded chip-profile JSONs (signed CAP file manifests,
+# AID catalogs, per-FI key metadata).  Admin writes, card-ops reads.
+ensure_secret "palisade/CHIP_PROFILES_BUCKET"      "${CHIP_PROFILES_BUCKET}"
+
+# -------- Mobile app --------
+ensure_secret "palisade/MOBILE_APP_URL"            "https://app.karta.cards"
+
+# -------- data-prep — AWS Payment Cryptography + KMS --------
+# APC key ARNs referenced per-IssuerProfile in the DB; these env-level
+# ARNs are the *fallback* / "root" IMKs used when an IssuerProfile row
+# leaves the UDK / MK KDK fields null.  Rotate by publishing a new
+# IssuerProfile pointing at a new ARN, never by mutating these in place.
+ensure_secret "palisade/APC_UDK_IMK_ARN"           "CHANGEME"
+ensure_secret "palisade/APC_MK_KDK_ARN"            "CHANGEME"
+ensure_secret "palisade/APC_SDM_META_MASTER_KEY_ARN" "CHANGEME"
+ensure_secret "palisade/APC_SDM_FILE_MASTER_KEY_ARN" "CHANGEME"
+# KMS key for at-rest SAD blob encryption (palisade-sad alias).  Created
+# in §10.  Secret value is set there once the alias is resolved.
+ensure_secret "palisade/KMS_SAD_KEY_ARN"           "CHANGEME"
+# UDK derivation backend: "hsm" (APC), "local" (HKDF dev), or "mock".
+ensure_secret "palisade/DATA_PREP_UDK_BACKEND"     "hsm"
+ensure_secret "palisade/DEV_UDK_ROOT_SEED"         ""
+ensure_secret "palisade/SAD_TTL_DAYS"              "30"
+
+# -------- SDM (tap) per-card key derivation --------
 # Backend: "hsm" (AWS Payment Cryptography), "local" (HKDF+CMAC), "mock".
 ensure_secret "palisade/SDM_KEY_BACKEND"           "local"
 ensure_secret "palisade/SDM_META_MASTER_KEY_ARN"   "CHANGEME"
 ensure_secret "palisade/SDM_FILE_MASTER_KEY_ARN"   "CHANGEME"
 ensure_secret "palisade/DEV_SDM_ROOT_SEED"         "CHANGEME"
 
-# Activation service URLs — referenced by admin (for batch CSV import
-# signing) and by batch-processor (for per-row card registration).
-ensure_secret "palisade/ACTIVATION_SERVICE_URL"    "http://internal-vera-internal-886106335.ap-southeast-2.elb.amazonaws.com:3002"
-ensure_secret "palisade/DATA_PREP_SERVICE_URL"     "http://internal-vera-internal-886106335.ap-southeast-2.elb.amazonaws.com:3006"
-ensure_secret "palisade/RCA_SERVICE_URL"           "http://internal-vera-internal-886106335.ap-southeast-2.elb.amazonaws.com:3007"
+# -------- card-ops — GlobalPlatform SCP03 master keys --------
+# The per-FI GP master keys are stored as Secrets Manager entries keyed
+# by IssuerProfile.gp{Enc,Mac,Dek}KeyArn; card-ops' per-session fetcher
+# reads the ARN from the DB row and resolves the live value at WS-connect
+# time.  This env-level secret is the TEST-KEY fallback (GP 40..4F), used
+# when CARD_OPS_USE_TEST_KEYS=1 or the IssuerProfile has null ARN fields.
+# Shape: {"enc":"<32hex>","mac":"<32hex>","dek":"<32hex>"}.
+ensure_secret "palisade/GP_MASTER_KEY" '{"enc":"404142434445464748494A4B4C4D4E4F","mac":"404142434445464748494A4B4C4D4E4F","dek":"404142434445464748494A4B4C4D4E4F"}'
+# Toggle: set to '1' in dev so every card short-circuits to the test keys
+# above without requiring a per-IssuerProfile row.  Empty / unset in
+# staging + prod so missing ARN fields are a loud warning, not silent
+# key reuse.
+ensure_secret "palisade/CARD_OPS_USE_TEST_KEYS"    ""
+ensure_secret "palisade/WS_TIMEOUT_SECONDS"        "60"
 
-# Admin.
-ensure_secret "palisade/SERVICE_AUTH_ADMIN_SECRET" "CHANGEME"
-# Microsite CDN + S3 bucket — admin uploads zips, CloudFront serves them.
-ensure_secret "palisade/MICROSITE_BUCKET"          "karta-microsites-${ACCOUNT}"
-ensure_secret "palisade/MICROSITE_CDN_URL"         "https://microsite.karta.cards"
-ensure_secret "palisade/EMBOSSING_KMS_KEY_ARN"     "CHANGEME"
-
-# Vera vault endpoint — activation uses this on card registration.
-ensure_secret "palisade/VERA_VAULT_URL"            "http://internal-vera-internal-886106335.ap-southeast-2.elb.amazonaws.com:3004"
-
-# Mobile-app deep-link used by activation.
-ensure_secret "palisade/MOBILE_APP_URL"            "https://app.karta.cards"
-
-# SAD retention policy (days).
-ensure_secret "palisade/SAD_TTL_DAYS"              "30"
+# -------- Cognito --------
+# Created in §11.  Secret values set there once the pool + client exist.
+ensure_secret "palisade/COGNITO_USER_POOL_ID"      "CHANGEME"
+ensure_secret "palisade/COGNITO_CLIENT_ID"         "CHANGEME"
 
 # ===========================================================================
 echo ""
@@ -241,7 +440,7 @@ echo " 2. CLOUDWATCH LOG GROUPS"
 echo "============================================================"
 # ===========================================================================
 
-for svc in tap activation admin data-prep rca batch-processor sftp; do
+for svc in tap activation admin data-prep rca batch-processor sftp card-ops; do
   ensure_log_group "/ecs/palisade-${svc}"
 done
 
@@ -261,21 +460,33 @@ ARN_CARD_FIELD_DEK_ACTIVE_VERSION=$(get_secret_arn "palisade/CARD_FIELD_DEK_ACTI
 ARN_CARD_UID_FINGERPRINT_KEY=$(get_secret_arn "palisade/CARD_UID_FINGERPRINT_KEY")
 ARN_TAP_HANDOFF_SECRET=$(get_secret_arn "palisade/TAP_HANDOFF_SECRET")
 ARN_PROVISION_AUTH_KEYS=$(get_secret_arn "palisade/PROVISION_AUTH_KEYS")
+ARN_PAY_AUTH_KEYS=$(get_secret_arn "palisade/PAY_AUTH_KEYS")
+ARN_CARD_OPS_AUTH_KEYS=$(get_secret_arn "palisade/CARD_OPS_AUTH_KEYS")
 ARN_SERVICE_AUTH_ACTIVATION_SECRET=$(get_secret_arn "palisade/SERVICE_AUTH_ACTIVATION_SECRET")
 ARN_SERVICE_AUTH_ADMIN_SECRET=$(get_secret_arn "palisade/SERVICE_AUTH_ADMIN_SECRET")
 ARN_SERVICE_AUTH_PROVISIONING_SECRET=$(get_secret_arn "palisade/SERVICE_AUTH_PROVISIONING_SECRET")
+ARN_SERVICE_AUTH_CARD_OPS_SECRET=$(get_secret_arn "palisade/SERVICE_AUTH_CARD_OPS_SECRET")
 ARN_CALLBACK_HMAC_SECRET=$(get_secret_arn "palisade/CALLBACK_HMAC_SECRET")
 ARN_KMS_SAD_KEY_ARN=$(get_secret_arn "palisade/KMS_SAD_KEY_ARN")
 ARN_DATA_PREP_MOCK_EMV=$(get_secret_arn "palisade/DATA_PREP_MOCK_EMV")
+ARN_DATA_PREP_UDK_BACKEND=$(get_secret_arn "palisade/DATA_PREP_UDK_BACKEND")
+ARN_DEV_UDK_ROOT_SEED=$(get_secret_arn "palisade/DEV_UDK_ROOT_SEED")
+ARN_APC_UDK_IMK_ARN=$(get_secret_arn "palisade/APC_UDK_IMK_ARN")
+ARN_APC_MK_KDK_ARN=$(get_secret_arn "palisade/APC_MK_KDK_ARN")
+ARN_APC_SDM_META_MASTER_KEY_ARN=$(get_secret_arn "palisade/APC_SDM_META_MASTER_KEY_ARN")
+ARN_APC_SDM_FILE_MASTER_KEY_ARN=$(get_secret_arn "palisade/APC_SDM_FILE_MASTER_KEY_ARN")
 ARN_EMBOSSING_KEY_V1=$(get_secret_arn "palisade/EMBOSSING_KEY_V1")
 ARN_EMBOSSING_KEY_ACTIVE_VERSION=$(get_secret_arn "palisade/EMBOSSING_KEY_ACTIVE_VERSION")
 ARN_EMBOSSING_BUCKET=$(get_secret_arn "palisade/EMBOSSING_BUCKET")
 ARN_EMBOSSING_KMS_KEY_ARN=$(get_secret_arn "palisade/EMBOSSING_KMS_KEY_ARN")
+ARN_CHIP_PROFILES_BUCKET=$(get_secret_arn "palisade/CHIP_PROFILES_BUCKET")
 ARN_SERVICE_AUTH_BATCH_PROCESSOR_SECRET=$(get_secret_arn "palisade/SERVICE_AUTH_BATCH_PROCESSOR_SECRET")
 ARN_POLL_INTERVAL_MS=$(get_secret_arn "palisade/POLL_INTERVAL_MS")
 ARN_ACTIVATION_SERVICE_URL=$(get_secret_arn "palisade/ACTIVATION_SERVICE_URL")
 ARN_DATA_PREP_SERVICE_URL=$(get_secret_arn "palisade/DATA_PREP_SERVICE_URL")
 ARN_RCA_SERVICE_URL=$(get_secret_arn "palisade/RCA_SERVICE_URL")
+ARN_CARD_OPS_URL=$(get_secret_arn "palisade/CARD_OPS_URL")
+ARN_CARD_OPS_PUBLIC_WS_BASE=$(get_secret_arn "palisade/CARD_OPS_PUBLIC_WS_BASE")
 ARN_SFTP_USERS=$(get_secret_arn "palisade/SFTP_USERS")
 ARN_SFTP_POLL_INTERVAL_MS=$(get_secret_arn "palisade/SFTP_POLL_INTERVAL_MS")
 ARN_SFTP_STABILITY_MS=$(get_secret_arn "palisade/SFTP_STABILITY_MS")
@@ -292,6 +503,11 @@ ARN_SDM_KEY_BACKEND=$(get_secret_arn "palisade/SDM_KEY_BACKEND")
 ARN_SDM_META_MASTER_KEY_ARN=$(get_secret_arn "palisade/SDM_META_MASTER_KEY_ARN")
 ARN_SDM_FILE_MASTER_KEY_ARN=$(get_secret_arn "palisade/SDM_FILE_MASTER_KEY_ARN")
 ARN_DEV_SDM_ROOT_SEED=$(get_secret_arn "palisade/DEV_SDM_ROOT_SEED")
+ARN_GP_MASTER_KEY=$(get_secret_arn "palisade/GP_MASTER_KEY")
+ARN_CARD_OPS_USE_TEST_KEYS=$(get_secret_arn "palisade/CARD_OPS_USE_TEST_KEYS")
+ARN_WS_TIMEOUT_SECONDS=$(get_secret_arn "palisade/WS_TIMEOUT_SECONDS")
+ARN_COGNITO_USER_POOL_ID=$(get_secret_arn "palisade/COGNITO_USER_POOL_ID")
+ARN_COGNITO_CLIENT_ID=$(get_secret_arn "palisade/COGNITO_CLIENT_ID")
 echo "  All secret ARNs resolved."
 
 # ---- tap (port 3001) ----
@@ -374,15 +590,21 @@ aws ecs register-task-definition \
         { "name": "CARD_FIELD_DEK_ACTIVE_VERSION",  "valueFrom": "${ARN_CARD_FIELD_DEK_ACTIVE_VERSION}" },
         { "name": "CARD_UID_FINGERPRINT_KEY",       "valueFrom": "${ARN_CARD_UID_FINGERPRINT_KEY}" },
         { "name": "PROVISION_AUTH_KEYS",            "valueFrom": "${ARN_PROVISION_AUTH_KEYS}" },
+        { "name": "PAY_AUTH_KEYS",                  "valueFrom": "${ARN_PAY_AUTH_KEYS}" },
         { "name": "TAP_HANDOFF_SECRET",             "valueFrom": "${ARN_TAP_HANDOFF_SECRET}" },
         { "name": "SERVICE_AUTH_ACTIVATION_SECRET", "valueFrom": "${ARN_SERVICE_AUTH_ACTIVATION_SECRET}" },
+        { "name": "SERVICE_AUTH_CARD_OPS_SECRET",   "valueFrom": "${ARN_SERVICE_AUTH_CARD_OPS_SECRET}" },
+        { "name": "CARD_OPS_URL",                   "valueFrom": "${ARN_CARD_OPS_URL}" },
+        { "name": "CARD_OPS_PUBLIC_WS_BASE",        "valueFrom": "${ARN_CARD_OPS_PUBLIC_WS_BASE}" },
         { "name": "WEBAUTHN_RP_ID",                 "valueFrom": "${ARN_WEBAUTHN_RP_ID}" },
         { "name": "WEBAUTHN_ORIGINS",               "valueFrom": "${ARN_WEBAUTHN_ORIGINS}" },
         { "name": "WEBAUTHN_RP_NAME",               "valueFrom": "${ARN_WEBAUTHN_RP_NAME}" },
         { "name": "VERA_VAULT_URL",                 "valueFrom": "${ARN_VERA_VAULT_URL}" },
         { "name": "PALISADE_VERA_VAULT_SECRET",     "valueFrom": "${ARN_PALISADE_VERA_VAULT_SECRET}" },
         { "name": "MOBILE_APP_URL",                 "valueFrom": "${ARN_MOBILE_APP_URL}" },
-        { "name": "PALISADE_RCA_URL",               "valueFrom": "${ARN_RCA_SERVICE_URL}" }
+        { "name": "PALISADE_RCA_URL",               "valueFrom": "${ARN_RCA_SERVICE_URL}" },
+        { "name": "COGNITO_USER_POOL_ID",           "valueFrom": "${ARN_COGNITO_USER_POOL_ID}" },
+        { "name": "COGNITO_CLIENT_ID",              "valueFrom": "${ARN_COGNITO_CLIENT_ID}" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
@@ -400,8 +622,8 @@ TASKJSON
 REGISTERED_TASK_DEFS+=("palisade-activation")
 
 # ---- admin (port 3009) ----
-# Cognito config is baked into env defaults (see services/admin/src/env.ts);
-# only override with secrets if the pool IDs change.
+# taskRoleArn added in §8 for S3 write (chip-profiles, embossing,
+# microsites) + KMS encrypt (embossing payloads).
 echo ""
 echo "--- Registering task definition: palisade-admin ---"
 aws ecs register-task-definition \
@@ -414,6 +636,7 @@ aws ecs register-task-definition \
   "cpu": "256",
   "memory": "512",
   "executionRoleArn": "${EXEC_ROLE}",
+  "taskRoleArn": "${ADMIN_TASK_ROLE}",
   "containerDefinitions": [
     {
       "name": "palisade-admin",
@@ -436,7 +659,10 @@ aws ecs register-task-definition \
         { "name": "EMBOSSING_KEY_V1",           "valueFrom": "${ARN_EMBOSSING_KEY_V1}" },
         { "name": "EMBOSSING_KEY_ACTIVE_VERSION","valueFrom": "${ARN_EMBOSSING_KEY_ACTIVE_VERSION}" },
         { "name": "MICROSITE_BUCKET",           "valueFrom": "${ARN_MICROSITE_BUCKET}" },
-        { "name": "MICROSITE_CDN_URL",          "valueFrom": "${ARN_MICROSITE_CDN_URL}" }
+        { "name": "MICROSITE_CDN_URL",          "valueFrom": "${ARN_MICROSITE_CDN_URL}" },
+        { "name": "CHIP_PROFILES_BUCKET",       "valueFrom": "${ARN_CHIP_PROFILES_BUCKET}" },
+        { "name": "COGNITO_USER_POOL_ID",       "valueFrom": "${ARN_COGNITO_USER_POOL_ID}" },
+        { "name": "COGNITO_CLIENT_ID",          "valueFrom": "${ARN_COGNITO_CLIENT_ID}" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
@@ -454,9 +680,11 @@ TASKJSON
 REGISTERED_TASK_DEFS+=("palisade-admin")
 
 # --- data-prep (port 3006, internal, HMAC-gated) ---
+# taskRoleArn added in §8 for payment-cryptography:* on APC IMK ARNs and
+# KMS encrypt/decrypt on the SAD key.
 echo ""
 echo "--- Registering task definition: palisade-data-prep ---"
-aws ecs register-task-definition --cli-input-json "$(cat <<TASKJSON
+aws ecs register-task-definition --region "$REGION" --cli-input-json "$(cat <<TASKJSON
 {
   "family": "palisade-data-prep",
   "networkMode": "awsvpc",
@@ -464,6 +692,7 @@ aws ecs register-task-definition --cli-input-json "$(cat <<TASKJSON
   "cpu": "512",
   "memory": "1024",
   "executionRoleArn": "${EXEC_ROLE}",
+  "taskRoleArn": "${DATA_PREP_TASK_ROLE}",
   "containerDefinitions": [
     {
       "name": "palisade-data-prep",
@@ -474,11 +703,17 @@ aws ecs register-task-definition --cli-input-json "$(cat <<TASKJSON
       ],
       "environment": [],
       "secrets": [
-        { "name": "DATABASE_URL",         "valueFrom": "${ARN_DATABASE_URL}" },
-        { "name": "PROVISION_AUTH_KEYS",  "valueFrom": "${ARN_PROVISION_AUTH_KEYS}" },
-        { "name": "KMS_SAD_KEY_ARN",      "valueFrom": "${ARN_KMS_SAD_KEY_ARN}" },
-        { "name": "DATA_PREP_MOCK_EMV",   "valueFrom": "${ARN_DATA_PREP_MOCK_EMV}" },
-        { "name": "SAD_TTL_DAYS",         "valueFrom": "${ARN_SAD_TTL_DAYS}" }
+        { "name": "DATABASE_URL",              "valueFrom": "${ARN_DATABASE_URL}" },
+        { "name": "PROVISION_AUTH_KEYS",       "valueFrom": "${ARN_PROVISION_AUTH_KEYS}" },
+        { "name": "KMS_SAD_KEY_ARN",           "valueFrom": "${ARN_KMS_SAD_KEY_ARN}" },
+        { "name": "DATA_PREP_MOCK_EMV",        "valueFrom": "${ARN_DATA_PREP_MOCK_EMV}" },
+        { "name": "DATA_PREP_UDK_BACKEND",     "valueFrom": "${ARN_DATA_PREP_UDK_BACKEND}" },
+        { "name": "DEV_UDK_ROOT_SEED",         "valueFrom": "${ARN_DEV_UDK_ROOT_SEED}" },
+        { "name": "APC_UDK_IMK_ARN",           "valueFrom": "${ARN_APC_UDK_IMK_ARN}" },
+        { "name": "APC_MK_KDK_ARN",            "valueFrom": "${ARN_APC_MK_KDK_ARN}" },
+        { "name": "APC_SDM_META_MASTER_KEY_ARN","valueFrom": "${ARN_APC_SDM_META_MASTER_KEY_ARN}" },
+        { "name": "APC_SDM_FILE_MASTER_KEY_ARN","valueFrom": "${ARN_APC_SDM_FILE_MASTER_KEY_ARN}" },
+        { "name": "SAD_TTL_DAYS",              "valueFrom": "${ARN_SAD_TTL_DAYS}" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
@@ -495,10 +730,10 @@ TASKJSON
 )" --query 'taskDefinition.taskDefinitionArn' --output text
 REGISTERED_TASK_DEFS+=("palisade-data-prep")
 
-# --- rca (port 3007, internal, WebSocket + HMAC-gated) ---
+# --- rca (port 3007, public, WebSocket + HMAC-gated) ---
 echo ""
 echo "--- Registering task definition: palisade-rca ---"
-aws ecs register-task-definition --cli-input-json "$(cat <<TASKJSON
+aws ecs register-task-definition --region "$REGION" --cli-input-json "$(cat <<TASKJSON
 {
   "family": "palisade-rca",
   "networkMode": "awsvpc",
@@ -521,7 +756,8 @@ aws ecs register-task-definition --cli-input-json "$(cat <<TASKJSON
       "secrets": [
         { "name": "DATABASE_URL",         "valueFrom": "${ARN_DATABASE_URL}" },
         { "name": "PROVISION_AUTH_KEYS",  "valueFrom": "${ARN_PROVISION_AUTH_KEYS}" },
-        { "name": "CALLBACK_HMAC_SECRET", "valueFrom": "${ARN_CALLBACK_HMAC_SECRET}" }
+        { "name": "CALLBACK_HMAC_SECRET", "valueFrom": "${ARN_CALLBACK_HMAC_SECRET}" },
+        { "name": "KMS_SAD_KEY_ARN",      "valueFrom": "${ARN_KMS_SAD_KEY_ARN}" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
@@ -540,6 +776,7 @@ REGISTERED_TASK_DEFS+=("palisade-rca")
 
 # --- batch-processor (port 3008, pure worker — polls DB + S3) ---
 # No ALB routing — only exposes /api/health for ECS container healthCheck.
+# taskRoleArn added in §8 for S3 read (embossing payloads) + KMS decrypt.
 echo ""
 echo "--- Registering task definition: palisade-batch-processor ---"
 aws ecs register-task-definition \
@@ -552,6 +789,7 @@ aws ecs register-task-definition \
   "cpu": "256",
   "memory": "512",
   "executionRoleArn": "${EXEC_ROLE}",
+  "taskRoleArn": "${BATCH_PROCESSOR_TASK_ROLE}",
   "containerDefinitions": [
     {
       "name": "palisade-batch-processor",
@@ -568,6 +806,7 @@ aws ecs register-task-definition \
         { "name": "EMBOSSING_KEY_V1",                     "valueFrom": "${ARN_EMBOSSING_KEY_V1}" },
         { "name": "EMBOSSING_KEY_ACTIVE_VERSION",         "valueFrom": "${ARN_EMBOSSING_KEY_ACTIVE_VERSION}" },
         { "name": "EMBOSSING_BUCKET",                     "valueFrom": "${ARN_EMBOSSING_BUCKET}" },
+        { "name": "EMBOSSING_KMS_KEY_ARN",                "valueFrom": "${ARN_EMBOSSING_KMS_KEY_ARN}" },
         { "name": "SERVICE_AUTH_BATCH_PROCESSOR_SECRET",  "valueFrom": "${ARN_SERVICE_AUTH_BATCH_PROCESSOR_SECRET}" },
         { "name": "ACTIVATION_SERVICE_URL",               "valueFrom": "${ARN_ACTIVATION_SERVICE_URL}" },
         { "name": "POLL_INTERVAL_MS",                     "valueFrom": "${ARN_POLL_INTERVAL_MS}" }
@@ -594,7 +833,65 @@ TASKJSON
 )" --query 'taskDefinition.taskDefinitionArn' --output text
 REGISTERED_TASK_DEFS+=("palisade-batch-processor")
 
+# --- card-ops (port 3010, public ALB + WebSocket + HMAC-gated) ---------------
+# Port default in code is 3009 — colliding with admin.  We override via env
+# to run both services on the same ECS cluster.  taskRoleArn added in §8
+# grants SecretsManager:GetSecretValue on the per-IssuerProfile GP master
+# keys that card-ops' static-keys fetcher resolves at WS-connect time
+# (see services/card-ops/src/gp/static-keys.ts).  The KMS_SAD_KEY_ARN is
+# also needed so personalise_payment_applet can decrypt SadRecord blobs
+# in the same encryption envelope as data-prep / rca.
+echo ""
+echo "--- Registering task definition: palisade-card-ops ---"
+aws ecs register-task-definition \
+  --region "$REGION" \
+  --cli-input-json "$(cat <<TASKJSON
+{
+  "family": "palisade-card-ops",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "${EXEC_ROLE}",
+  "taskRoleArn": "${CARD_OPS_TASK_ROLE}",
+  "containerDefinitions": [
+    {
+      "name": "palisade-card-ops",
+      "image": "${ECR_BASE}/palisade-card-ops:latest",
+      "essential": true,
+      "portMappings": [
+        { "containerPort": 3010, "protocol": "tcp" }
+      ],
+      "environment": [
+        { "name": "PORT",       "value": "3010" },
+        { "name": "AWS_REGION", "value": "${REGION}" }
+      ],
+      "secrets": [
+        { "name": "DATABASE_URL",              "valueFrom": "${ARN_DATABASE_URL}" },
+        { "name": "CARD_OPS_AUTH_KEYS",        "valueFrom": "${ARN_CARD_OPS_AUTH_KEYS}" },
+        { "name": "CARD_OPS_PUBLIC_WS_BASE",   "valueFrom": "${ARN_CARD_OPS_PUBLIC_WS_BASE}" },
+        { "name": "WS_TIMEOUT_SECONDS",        "valueFrom": "${ARN_WS_TIMEOUT_SECONDS}" },
+        { "name": "GP_MASTER_KEY",             "valueFrom": "${ARN_GP_MASTER_KEY}" },
+        { "name": "CARD_OPS_USE_TEST_KEYS",    "valueFrom": "${ARN_CARD_OPS_USE_TEST_KEYS}" },
+        { "name": "KMS_SAD_KEY_ARN",           "valueFrom": "${ARN_KMS_SAD_KEY_ARN}" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/palisade-card-ops",
+          "awslogs-region": "${REGION}",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}
+TASKJSON
+)" --query 'taskDefinition.taskDefinitionArn' --output text
+REGISTERED_TASK_DEFS+=("palisade-card-ops")
+
 # --- sftp (port 22, public via NLB) -----------------------------------------
+# taskRoleArn added in §8 for S3 read/write on the embossing bucket.
 echo ""
 echo "--- Registering task definition: palisade-sftp ---"
 aws ecs register-task-definition \
@@ -607,6 +904,7 @@ aws ecs register-task-definition \
   "cpu": "256",
   "memory": "512",
   "executionRoleArn": "${EXEC_ROLE}",
+  "taskRoleArn": "${SFTP_TASK_ROLE}",
   "containerDefinitions": [
     {
       "name": "palisade-sftp",
@@ -652,11 +950,11 @@ svc_port() {
   case "$1" in
     tap) echo 3001 ;; activation) echo 3002 ;; admin) echo 3009 ;;
     data-prep) echo 3006 ;; rca) echo 3007 ;;
-    batch-processor) echo 3008 ;; sftp) echo 22 ;;
+    batch-processor) echo 3008 ;; card-ops) echo 3010 ;; sftp) echo 22 ;;
   esac
 }
 
-for svc in tap activation admin data-prep rca batch-processor sftp; do
+for svc in tap activation admin data-prep rca batch-processor card-ops sftp; do
   # batch-processor is a pure worker — container healthCheck gates
   # deployments, no TG needed.
   if [ "$svc" = "batch-processor" ]; then
@@ -782,7 +1080,7 @@ create_host_rule() {
       --actions "Type=forward,TargetGroupArn=$tg_arn" \
       --region "$REGION" \
       --output text --query 'Rules[0].RuleArn' > /dev/null
-    CREATED_RULES+=("$host -> $(echo "$tg_arn" | grep -o 'palisade-[a-z]*')")
+    CREATED_RULES+=("$host -> $(echo "$tg_arn" | grep -o 'palisade-[a-z-]*')")
     echo "  [created] Rule priority=$priority: $host -> target group"
   fi
 }
@@ -816,79 +1114,65 @@ create_host_path_rule() {
       --actions "Type=forward,TargetGroupArn=$tg_arn" \
       --region "$REGION" \
       --output text --query 'Rules[0].RuleArn' > /dev/null
-    CREATED_RULES+=("$host $path -> $(echo "$tg_arn" | grep -o 'palisade-[a-z]*')")
+    CREATED_RULES+=("$host $path -> $(echo "$tg_arn" | grep -o 'palisade-[a-z-]*')")
     echo "  [created] Rule priority=$priority: $host $path -> target group"
   fi
 }
 
 # Palisade host-header rules.  Priorities chosen to leave room (6-10)
-# below Vera's existing 1-4 and above any future catch-alls.
+# below Vera's existing 1-4 and above any future catch-alls.  Public-facing
+# ALB rules: tap, activation (incl. /ws for WebSocket upgrades), rca (WS),
+# card-ops (WS).  Internal ALB rules: data-prep, card-ops internal-only
+# /register (§5b), batch-processor (no ALB).
 create_host_rule "$PUBLIC_LISTENER_ARN" "tap.karta.cards"        "$TG_ARN_tap"        6  "$EXISTING_RULES"
 create_host_rule "$PUBLIC_LISTENER_ARN" "activation.karta.cards" "$TG_ARN_activation" 7  "$EXISTING_RULES"
+create_host_rule "$PUBLIC_LISTENER_ARN" "rca.karta.cards"        "$TG_ARN_rca"        8  "$EXISTING_RULES"
+create_host_rule "$PUBLIC_LISTENER_ARN" "card-ops.karta.cards"   "$TG_ARN_card_ops"   9  "$EXISTING_RULES"
 
 # Shared manage.karta.cards — higher priority (=2, beats Vera's 4) so the
 # path-based rule wins before the host-only rule to vera-admin.
 create_host_path_rule "$PUBLIC_LISTENER_ARN" "manage.karta.cards" "/palisade-api/*" "$TG_ARN_admin" 2 "$EXISTING_RULES"
 
-# ---- Internal ALB (HTTP:3006 for data-prep) ----
+# ---- Internal ALB (HTTP:3006 for data-prep, HTTP:3007 for rca, HTTP:3010 for card-ops) ----
+# rca exposes both a public WS (for the mobile provisioning agent) and an
+# internal HTTP endpoint (for activation's inbound callbacks).  card-ops
+# internal listener backs activation's HMAC-gated POST /register — the
+# public listener is WebSocket-only.
 echo ""
-echo "--- Internal ALB (HTTP:3006 for data-prep) ---"
+echo "--- Internal ALB — Palisade service listeners ---"
 
-INTERNAL_3006_LISTENER_ARN=$(aws elbv2 describe-listeners \
-  --load-balancer-arn "$INTERNAL_ALB_ARN" \
-  --region "$REGION" \
-  --query "Listeners[?Port==\`3006\`].ListenerArn | [0]" \
-  --output text 2>/dev/null || true)
-
-if [ -z "$INTERNAL_3006_LISTENER_ARN" ] || [ "$INTERNAL_3006_LISTENER_ARN" = "None" ]; then
-  INTERNAL_3006_LISTENER_ARN=$(aws elbv2 create-listener \
+ensure_internal_listener() {
+  # ensure_internal_listener <port> <tg-arn> <label>
+  local port="$1" tg_arn="$2" label="$3"
+  local listener_arn
+  listener_arn=$(aws elbv2 describe-listeners \
     --load-balancer-arn "$INTERNAL_ALB_ARN" \
-    --protocol HTTP \
-    --port 3006 \
-    --default-actions "Type=forward,TargetGroupArn=${TG_ARN_data_prep}" \
     --region "$REGION" \
-    --query 'Listeners[0].ListenerArn' \
-    --output text)
-  echo "  [created] Internal HTTP:3006 listener -> palisade-data-prep"
-else
-  echo "  [exists] Internal HTTP:3006 listener ($INTERNAL_3006_LISTENER_ARN)"
-  aws elbv2 modify-listener \
-    --listener-arn "$INTERNAL_3006_LISTENER_ARN" \
-    --default-actions "Type=forward,TargetGroupArn=${TG_ARN_data_prep}" \
-    --region "$REGION" \
-    --output text > /dev/null
-  echo "  [updated] HTTP:3006 default action -> palisade-data-prep"
-fi
+    --query "Listeners[?Port==\`$port\`].ListenerArn | [0]" \
+    --output text 2>/dev/null || true)
 
-# ---- Internal ALB (HTTP:3007 for rca) ----
-echo ""
-echo "--- Internal ALB (HTTP:3007 for rca) ---"
+  if [ -z "$listener_arn" ] || [ "$listener_arn" = "None" ]; then
+    aws elbv2 create-listener \
+      --load-balancer-arn "$INTERNAL_ALB_ARN" \
+      --protocol HTTP \
+      --port "$port" \
+      --default-actions "Type=forward,TargetGroupArn=$tg_arn" \
+      --region "$REGION" \
+      --query 'Listeners[0].ListenerArn' --output text >/dev/null
+    echo "  [created] Internal HTTP:$port listener -> $label"
+  else
+    aws elbv2 modify-listener \
+      --listener-arn "$listener_arn" \
+      --default-actions "Type=forward,TargetGroupArn=$tg_arn" \
+      --region "$REGION" \
+      --output text >/dev/null
+    echo "  [updated] Internal HTTP:$port listener -> $label"
+  fi
+}
 
-INTERNAL_3007_LISTENER_ARN=$(aws elbv2 describe-listeners \
-  --load-balancer-arn "$INTERNAL_ALB_ARN" \
-  --region "$REGION" \
-  --query "Listeners[?Port==\`3007\`].ListenerArn | [0]" \
-  --output text 2>/dev/null || true)
-
-if [ -z "$INTERNAL_3007_LISTENER_ARN" ] || [ "$INTERNAL_3007_LISTENER_ARN" = "None" ]; then
-  INTERNAL_3007_LISTENER_ARN=$(aws elbv2 create-listener \
-    --load-balancer-arn "$INTERNAL_ALB_ARN" \
-    --protocol HTTP \
-    --port 3007 \
-    --default-actions "Type=forward,TargetGroupArn=${TG_ARN_rca}" \
-    --region "$REGION" \
-    --query 'Listeners[0].ListenerArn' \
-    --output text)
-  echo "  [created] Internal HTTP:3007 listener -> palisade-rca"
-else
-  echo "  [exists] Internal HTTP:3007 listener ($INTERNAL_3007_LISTENER_ARN)"
-  aws elbv2 modify-listener \
-    --listener-arn "$INTERNAL_3007_LISTENER_ARN" \
-    --default-actions "Type=forward,TargetGroupArn=${TG_ARN_rca}" \
-    --region "$REGION" \
-    --output text > /dev/null
-  echo "  [updated] HTTP:3007 default action -> palisade-rca"
-fi
+ensure_internal_listener 3006 "$TG_ARN_data_prep"       "palisade-data-prep"
+ensure_internal_listener 3007 "$TG_ARN_rca"             "palisade-rca"
+ensure_internal_listener 3010 "$TG_ARN_card_ops"        "palisade-card-ops"
 
 # ---- Public ALB HTTPS:443 listener (requires validated ACM cert) ----
 echo ""
@@ -914,6 +1198,8 @@ if [ -n "$ACM_CERT_ARN" ] && [ "$ACM_CERT_ARN" != "None" ]; then
 
     create_host_rule "$PUBLIC_HTTPS_LISTENER_ARN" "tap.karta.cards"        "$TG_ARN_tap"        6 "$EXISTING_HTTPS_RULES"
     create_host_rule "$PUBLIC_HTTPS_LISTENER_ARN" "activation.karta.cards" "$TG_ARN_activation" 7 "$EXISTING_HTTPS_RULES"
+    create_host_rule "$PUBLIC_HTTPS_LISTENER_ARN" "rca.karta.cards"        "$TG_ARN_rca"        8 "$EXISTING_HTTPS_RULES"
+    create_host_rule "$PUBLIC_HTTPS_LISTENER_ARN" "card-ops.karta.cards"   "$TG_ARN_card_ops"   9 "$EXISTING_HTTPS_RULES"
     create_host_path_rule "$PUBLIC_HTTPS_LISTENER_ARN" "manage.karta.cards" "/palisade-api/*" "$TG_ARN_admin" 2 "$EXISTING_HTTPS_RULES"
   else
     echo "  [skip] HTTPS:443 listener not found — run Vera's aws-setup.sh first."
@@ -994,7 +1280,7 @@ echo " 6. ECS SERVICES"
 echo "============================================================"
 # ===========================================================================
 
-for svc in tap activation admin data-prep rca batch-processor sftp; do
+for svc in tap activation admin data-prep rca batch-processor card-ops sftp; do
   SVC_NAME="palisade-${svc}"
   PORT=$(svc_port "$svc")
   var_name="${svc//-/_}"
@@ -1054,6 +1340,438 @@ done
 
 # ===========================================================================
 echo ""
+echo "============================================================"
+echo " 7. ECS SECURITY GROUP — INBOUND RULES"
+echo "============================================================"
+# ===========================================================================
+
+INTERNAL_ALB_SG=$(aws elbv2 describe-load-balancers \
+  --names vera-internal --region "$REGION" \
+  --query 'LoadBalancers[0].SecurityGroups[0]' --output text 2>/dev/null || true)
+
+ensure_sg_ingress() {
+  local port="$1" src_sg="$2" desc="$3"
+  local exists
+  exists=$(aws ec2 describe-security-groups --region "$REGION" --group-ids "$ECS_SG" \
+    --query "SecurityGroups[0].IpPermissions[?FromPort==\`$port\` && contains(UserIdGroupPairs[].GroupId, \`$src_sg\`)].IpProtocol" \
+    --output text 2>/dev/null)
+  if [ -n "$exists" ]; then
+    echo "  [exists] $ECS_SG inbound :$port from $src_sg"
+  else
+    aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$ECS_SG" \
+      --ip-permissions "IpProtocol=tcp,FromPort=$port,ToPort=$port,UserIdGroupPairs=[{GroupId=$src_sg,Description=$desc}]" \
+      --query 'SecurityGroupRules[0].SecurityGroupRuleId' --output text >/dev/null
+    echo "  [added] $ECS_SG :$port from $src_sg ($desc)"
+  fi
+}
+
+if [ -n "$INTERNAL_ALB_SG" ] && [ "$INTERNAL_ALB_SG" != "None" ]; then
+  ensure_sg_ingress 3006 "$INTERNAL_ALB_SG" "internal-alb-palisade-data-prep"
+  ensure_sg_ingress 3007 "$INTERNAL_ALB_SG" "internal-alb-palisade-rca"
+  ensure_sg_ingress 3010 "$INTERNAL_ALB_SG" "internal-alb-palisade-card-ops"
+fi
+
+# SFTP via NLB — preserves source IP, no SG hop.
+EXISTING_SFTP=$(aws ec2 describe-security-groups --region "$REGION" --group-ids "$ECS_SG" \
+  --query "SecurityGroups[0].IpPermissions[?FromPort==\`22\`].IpProtocol" --output text)
+if [ -z "$EXISTING_SFTP" ]; then
+  aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$ECS_SG" \
+    --ip-permissions 'IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=0.0.0.0/0,Description="SFTP via NLB"}]' \
+    --query 'SecurityGroupRules[0].SecurityGroupRuleId' --output text >/dev/null
+  echo "  [added] $ECS_SG :22 from 0.0.0.0/0 (SFTP via NLB)"
+else
+  echo "  [exists] $ECS_SG inbound :22"
+fi
+
+# ===========================================================================
+echo ""
+echo "============================================================"
+echo " 8. IAM — per-service task roles"
+echo "============================================================"
+# ===========================================================================
+#
+# Each Palisade service gets its own task role (kept separate from the
+# shared execution role so we can grant runtime privileges without widening
+# image-pull / secrets-injection scope).
+
+# --- data-prep: AWS Payment Cryptography + KMS on the SAD key ---
+ensure_iam_role "${DATA_PREP_TASK_ROLE##*/}" "$ASSUME_ECS_TASK"
+put_inline_policy "${DATA_PREP_TASK_ROLE##*/}" "palisade-data-prep-apc-kms" "$(cat <<POLICY
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "payment-cryptography:*",
+        "payment-cryptography-data:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:GenerateDataKey",
+        "kms:DescribeKey"
+      ],
+      "Resource": "arn:aws:kms:${REGION}:${ACCOUNT}:key/*"
+    }
+  ]
+}
+POLICY
+)"
+
+# --- card-ops: SecretsManager read on GP master keys per IssuerProfile +
+#     KMS decrypt on the SAD key (for personalise_payment_applet).
+ensure_iam_role "${CARD_OPS_TASK_ROLE##*/}" "$ASSUME_ECS_TASK"
+put_inline_policy "${CARD_OPS_TASK_ROLE##*/}" "palisade-card-ops-gp-keys-kms" "$(cat <<POLICY
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [ "secretsmanager:GetSecretValue" ],
+      "Resource": [
+        "arn:aws:secretsmanager:${REGION}:${ACCOUNT}:secret:palisade/gp/*",
+        "${ARN_GP_MASTER_KEY}"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [ "kms:Decrypt", "kms:DescribeKey" ],
+      "Resource": "arn:aws:kms:${REGION}:${ACCOUNT}:key/*"
+    }
+  ]
+}
+POLICY
+)"
+
+# --- admin: S3 write on chip-profiles + embossing + microsites, KMS
+#     encrypt on embossing payloads.
+ensure_iam_role "${ADMIN_TASK_ROLE##*/}" "$ASSUME_ECS_TASK"
+put_inline_policy "${ADMIN_TASK_ROLE##*/}" "palisade-admin-s3-kms" "$(cat <<POLICY
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:DeleteObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::${CHIP_PROFILES_BUCKET}",
+        "arn:aws:s3:::${CHIP_PROFILES_BUCKET}/*",
+        "arn:aws:s3:::${EMBOSSING_BUCKET_NAME}",
+        "arn:aws:s3:::${EMBOSSING_BUCKET_NAME}/*",
+        "arn:aws:s3:::${MICROSITE_BUCKET_NAME}",
+        "arn:aws:s3:::${MICROSITE_BUCKET_NAME}/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [ "kms:Encrypt", "kms:GenerateDataKey", "kms:DescribeKey" ],
+      "Resource": "arn:aws:kms:${REGION}:${ACCOUNT}:key/*"
+    }
+  ]
+}
+POLICY
+)"
+
+# --- batch-processor: S3 read + KMS decrypt on embossing payloads.
+ensure_iam_role "${BATCH_PROCESSOR_TASK_ROLE##*/}" "$ASSUME_ECS_TASK"
+put_inline_policy "${BATCH_PROCESSOR_TASK_ROLE##*/}" "palisade-batch-processor-s3-kms" "$(cat <<POLICY
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [ "s3:GetObject", "s3:ListBucket" ],
+      "Resource": [
+        "arn:aws:s3:::${EMBOSSING_BUCKET_NAME}",
+        "arn:aws:s3:::${EMBOSSING_BUCKET_NAME}/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [ "kms:Decrypt", "kms:DescribeKey" ],
+      "Resource": "arn:aws:kms:${REGION}:${ACCOUNT}:key/*"
+    }
+  ]
+}
+POLICY
+)"
+
+# --- sftp: S3 read/write on embossing bucket (partners drop + we pick up).
+ensure_iam_role "${SFTP_TASK_ROLE##*/}" "$ASSUME_ECS_TASK"
+put_inline_policy "${SFTP_TASK_ROLE##*/}" "palisade-sftp-s3" "$(cat <<POLICY
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [ "s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:ListBucket" ],
+      "Resource": [
+        "arn:aws:s3:::${EMBOSSING_BUCKET_NAME}",
+        "arn:aws:s3:::${EMBOSSING_BUCKET_NAME}/*"
+      ]
+    }
+  ]
+}
+POLICY
+)"
+
+# ===========================================================================
+echo ""
+echo "============================================================"
+echo " 9. RDS — Palisade Postgres instance"
+echo "============================================================"
+# ===========================================================================
+#
+# Palisade runs a SEPARATE Postgres instance from Vera's — the two DBs
+# can't share because the schemas collide (Palisade's Program vs Vera's
+# legacy program rows, different IssuerProfile shapes, etc.).  Local
+# docker-compose exposes host port 5433 to avoid clobbering Vera's 5432;
+# the managed RDS instance below uses the standard 5432 inside its SG.
+#
+# The secret palisade/DATABASE_URL is left as CHANGEME so this script
+# doesn't leak the RDS master password.  After provisioning, set the
+# real URL via:
+#   aws secretsmanager put-secret-value \
+#     --secret-id palisade/DATABASE_URL \
+#     --secret-string "postgres://palisade:<pwd>@<endpoint>:5432/palisade"
+
+RDS_EXISTS=$(aws rds describe-db-instances \
+  --db-instance-identifier "$RDS_INSTANCE_ID" \
+  --region "$REGION" \
+  --query 'DBInstances[0].DBInstanceIdentifier' \
+  --output text 2>/dev/null || true)
+
+if [ -n "$RDS_EXISTS" ] && [ "$RDS_EXISTS" != "None" ]; then
+  echo "  [exists] RDS instance $RDS_INSTANCE_ID"
+  RDS_ENDPOINT=$(aws rds describe-db-instances \
+    --db-instance-identifier "$RDS_INSTANCE_ID" \
+    --region "$REGION" \
+    --query 'DBInstances[0].Endpoint.Address' \
+    --output text)
+  echo "  Endpoint: $RDS_ENDPOINT"
+else
+  # Subnet group — must cover at least two AZs.
+  if ! aws rds describe-db-subnet-groups \
+         --db-subnet-group-name "$RDS_SUBNET_GROUP" \
+         --region "$REGION" >/dev/null 2>&1; then
+    aws rds create-db-subnet-group \
+      --db-subnet-group-name "$RDS_SUBNET_GROUP" \
+      --db-subnet-group-description "Palisade Postgres subnets" \
+      --subnet-ids ${PRIVATE_SUBNETS//,/ } \
+      --region "$REGION" \
+      --query 'DBSubnetGroup.DBSubnetGroupName' --output text >/dev/null
+    echo "  [created] RDS subnet group $RDS_SUBNET_GROUP"
+  fi
+
+  # Security group — allows inbound 5432 from the ECS SG only.
+  RDS_SG_ID=$(aws ec2 describe-security-groups \
+    --filters "Name=group-name,Values=$RDS_SG_NAME" "Name=vpc-id,Values=$VPC" \
+    --region "$REGION" \
+    --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
+  if [ -z "$RDS_SG_ID" ] || [ "$RDS_SG_ID" = "None" ]; then
+    RDS_SG_ID=$(aws ec2 create-security-group \
+      --group-name "$RDS_SG_NAME" \
+      --description "Palisade RDS inbound 5432 from ECS tasks" \
+      --vpc-id "$VPC" \
+      --region "$REGION" \
+      --query 'GroupId' --output text)
+    aws ec2 authorize-security-group-ingress \
+      --group-id "$RDS_SG_ID" \
+      --protocol tcp --port 5432 \
+      --source-group "$ECS_SG" \
+      --region "$REGION" >/dev/null
+    echo "  [created] RDS SG $RDS_SG_ID (5432 from $ECS_SG)"
+  fi
+
+  # CreateDBInstance — db.t4g.micro for cost; bump in prod via a follow-up
+  # modify-db-instance.  Master password is auto-generated into Secrets
+  # Manager (ManageMasterUserPassword=true) so we never handle it.
+  aws rds create-db-instance \
+    --db-instance-identifier "$RDS_INSTANCE_ID" \
+    --db-instance-class db.t4g.micro \
+    --engine postgres \
+    --engine-version 16 \
+    --allocated-storage 20 \
+    --storage-type gp3 \
+    --db-name "$RDS_DB_NAME" \
+    --master-username palisade \
+    --manage-master-user-password \
+    --vpc-security-group-ids "$RDS_SG_ID" \
+    --db-subnet-group-name "$RDS_SUBNET_GROUP" \
+    --backup-retention-period 7 \
+    --publicly-accessible false \
+    --storage-encrypted \
+    --region "$REGION" \
+    --query 'DBInstance.DBInstanceIdentifier' --output text >/dev/null
+  CREATED_RDS+=("$RDS_INSTANCE_ID")
+  echo "  [created] RDS instance $RDS_INSTANCE_ID (takes ~10 min to become available)"
+  echo "  After provisioning, set palisade/DATABASE_URL with the endpoint."
+fi
+
+# ===========================================================================
+echo ""
+echo "============================================================"
+echo " 10. S3 + KMS — chip profiles, embossing, microsites, SAD key"
+echo "============================================================"
+# ===========================================================================
+
+ensure_s3_bucket() {
+  # ensure_s3_bucket <bucket-name> <description>
+  local bucket="$1"
+  local desc="$2"
+  if aws s3api head-bucket --bucket "$bucket" --region "$REGION" 2>/dev/null; then
+    echo "  [exists] S3 bucket $bucket ($desc)"
+  else
+    # ap-southeast-2 requires a LocationConstraint.
+    aws s3api create-bucket \
+      --bucket "$bucket" \
+      --region "$REGION" \
+      --create-bucket-configuration "LocationConstraint=${REGION}" \
+      --query 'Location' --output text >/dev/null
+    # Turn on default encryption + block public access.
+    aws s3api put-bucket-encryption \
+      --bucket "$bucket" \
+      --server-side-encryption-configuration \
+        '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' \
+      --region "$REGION"
+    aws s3api put-public-access-block \
+      --bucket "$bucket" \
+      --public-access-block-configuration \
+        "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true" \
+      --region "$REGION"
+    CREATED_BUCKETS+=("$bucket")
+    echo "  [created] S3 bucket $bucket ($desc)"
+  fi
+}
+
+ensure_s3_bucket "$CHIP_PROFILES_BUCKET"    "chip-profile JSON uploads (admin write, card-ops read)"
+ensure_s3_bucket "$EMBOSSING_BUCKET_NAME"   "embossing batch payloads (admin write, batch-processor read)"
+ensure_s3_bucket "$MICROSITE_BUCKET_NAME"   "per-program activation microsites (admin write, CloudFront read)"
+
+# ---- KMS — SAD encryption key ----
+# SAD blobs are encrypted envelope-style: KMS-wrapped data key, then AES
+# inside the blob.  Rotation: AWS-managed annual schedule (enabled below).
+# Retention: no key deletion path from this script; use the KMS console to
+# schedule a deletion with the default 30-day pending window if needed.
+echo ""
+echo "--- KMS key: $KMS_SAD_ALIAS ---"
+SAD_KEY_ARN=$(aws kms describe-key \
+  --key-id "$KMS_SAD_ALIAS" \
+  --region "$REGION" \
+  --query 'KeyMetadata.Arn' --output text 2>/dev/null || true)
+
+if [ -n "$SAD_KEY_ARN" ] && [ "$SAD_KEY_ARN" != "None" ]; then
+  echo "  [exists] KMS key $KMS_SAD_ALIAS ($SAD_KEY_ARN)"
+else
+  SAD_KEY_ID=$(aws kms create-key \
+    --description "Palisade SAD blob encryption (data-prep / rca / card-ops)" \
+    --key-usage ENCRYPT_DECRYPT \
+    --region "$REGION" \
+    --query 'KeyMetadata.KeyId' --output text)
+  aws kms enable-key-rotation --key-id "$SAD_KEY_ID" --region "$REGION" >/dev/null
+  aws kms create-alias \
+    --alias-name "$KMS_SAD_ALIAS" \
+    --target-key-id "$SAD_KEY_ID" \
+    --region "$REGION" >/dev/null
+  SAD_KEY_ARN=$(aws kms describe-key \
+    --key-id "$KMS_SAD_ALIAS" \
+    --region "$REGION" \
+    --query 'KeyMetadata.Arn' --output text)
+  CREATED_KMS_KEYS+=("$KMS_SAD_ALIAS")
+  echo "  [created] KMS key $KMS_SAD_ALIAS ($SAD_KEY_ARN), rotation enabled"
+fi
+
+# Update palisade/KMS_SAD_KEY_ARN to point at the real key ARN (only if the
+# secret is still the placeholder so we don't clobber an operator override).
+CURRENT_SAD_SECRET=$(secret_value "palisade/KMS_SAD_KEY_ARN")
+if [ "$CURRENT_SAD_SECRET" = "CHANGEME" ]; then
+  aws secretsmanager put-secret-value \
+    --secret-id "palisade/KMS_SAD_KEY_ARN" \
+    --secret-string "$SAD_KEY_ARN" \
+    --region "$REGION" \
+    --query 'ARN' --output text >/dev/null
+  echo "  [updated] palisade/KMS_SAD_KEY_ARN -> $SAD_KEY_ARN"
+fi
+
+# ===========================================================================
+echo ""
+echo "============================================================"
+echo " 11. COGNITO — user pool for mobile + admin"
+echo "============================================================"
+# ===========================================================================
+
+COGNITO_POOL_ID=$(aws cognito-idp list-user-pools \
+  --max-results 60 \
+  --region "$REGION" \
+  --query "UserPools[?Name=='$COGNITO_POOL_NAME'].Id | [0]" \
+  --output text 2>/dev/null || true)
+
+if [ -n "$COGNITO_POOL_ID" ] && [ "$COGNITO_POOL_ID" != "None" ]; then
+  echo "  [exists] Cognito user pool $COGNITO_POOL_NAME ($COGNITO_POOL_ID)"
+else
+  COGNITO_POOL_ID=$(aws cognito-idp create-user-pool \
+    --pool-name "$COGNITO_POOL_NAME" \
+    --region "$REGION" \
+    --policies '{"PasswordPolicy":{"MinimumLength":12,"RequireUppercase":true,"RequireLowercase":true,"RequireNumbers":true,"RequireSymbols":false}}' \
+    --auto-verified-attributes email \
+    --username-attributes email \
+    --mfa-configuration OPTIONAL \
+    --enabled-mfas SOFTWARE_TOKEN_MFA \
+    --query 'UserPool.Id' --output text)
+  CREATED_COGNITO+=("user-pool $COGNITO_POOL_NAME")
+  echo "  [created] Cognito user pool $COGNITO_POOL_NAME ($COGNITO_POOL_ID)"
+fi
+
+COGNITO_CLIENT_ID=$(aws cognito-idp list-user-pool-clients \
+  --user-pool-id "$COGNITO_POOL_ID" \
+  --region "$REGION" \
+  --query "UserPoolClients[?ClientName=='palisade-mobile'].ClientId | [0]" \
+  --output text 2>/dev/null || true)
+
+if [ -n "$COGNITO_CLIENT_ID" ] && [ "$COGNITO_CLIENT_ID" != "None" ]; then
+  echo "  [exists] Cognito app client palisade-mobile ($COGNITO_CLIENT_ID)"
+else
+  COGNITO_CLIENT_ID=$(aws cognito-idp create-user-pool-client \
+    --user-pool-id "$COGNITO_POOL_ID" \
+    --client-name "palisade-mobile" \
+    --no-generate-secret \
+    --explicit-auth-flows ALLOW_USER_PASSWORD_AUTH ALLOW_REFRESH_TOKEN_AUTH ALLOW_USER_SRP_AUTH \
+    --region "$REGION" \
+    --query 'UserPoolClient.ClientId' --output text)
+  CREATED_COGNITO+=("app-client palisade-mobile")
+  echo "  [created] Cognito app client palisade-mobile ($COGNITO_CLIENT_ID)"
+fi
+
+# Sync back into Secrets Manager — overwrite the CHANGEME placeholder.
+CURRENT_POOL_SECRET=$(secret_value "palisade/COGNITO_USER_POOL_ID")
+if [ "$CURRENT_POOL_SECRET" = "CHANGEME" ]; then
+  aws secretsmanager put-secret-value \
+    --secret-id "palisade/COGNITO_USER_POOL_ID" \
+    --secret-string "$COGNITO_POOL_ID" \
+    --region "$REGION" --query 'ARN' --output text >/dev/null
+  echo "  [updated] palisade/COGNITO_USER_POOL_ID -> $COGNITO_POOL_ID"
+fi
+CURRENT_CLIENT_SECRET=$(secret_value "palisade/COGNITO_CLIENT_ID")
+if [ "$CURRENT_CLIENT_SECRET" = "CHANGEME" ]; then
+  aws secretsmanager put-secret-value \
+    --secret-id "palisade/COGNITO_CLIENT_ID" \
+    --secret-string "$COGNITO_CLIENT_ID" \
+    --region "$REGION" --query 'ARN' --output text >/dev/null
+  echo "  [updated] palisade/COGNITO_CLIENT_ID -> $COGNITO_CLIENT_ID"
+fi
+
+# ===========================================================================
+echo ""
 echo ""
 echo "============================================================"
 echo " SUMMARY"
@@ -1108,6 +1826,36 @@ if [ ${#SKIPPED_SERVICES[@]} -gt 0 ]; then
   echo ""
 fi
 
+if [ ${#CREATED_BUCKETS[@]} -gt 0 ]; then
+  echo "Created S3 buckets:"
+  for b in "${CREATED_BUCKETS[@]}"; do echo "  - $b"; done
+  echo ""
+fi
+
+if [ ${#CREATED_KMS_KEYS[@]} -gt 0 ]; then
+  echo "Created KMS keys:"
+  for k in "${CREATED_KMS_KEYS[@]}"; do echo "  - $k"; done
+  echo ""
+fi
+
+if [ ${#CREATED_RDS[@]} -gt 0 ]; then
+  echo "Created RDS instances:"
+  for r in "${CREATED_RDS[@]}"; do echo "  - $r"; done
+  echo ""
+fi
+
+if [ ${#CREATED_ROLES[@]} -gt 0 ]; then
+  echo "Created IAM roles:"
+  for r in "${CREATED_ROLES[@]}"; do echo "  - $r"; done
+  echo ""
+fi
+
+if [ ${#CREATED_COGNITO[@]} -gt 0 ]; then
+  echo "Created Cognito resources:"
+  for c in "${CREATED_COGNITO[@]}"; do echo "  - $c"; done
+  echo ""
+fi
+
 if [ ${#PLACEHOLDER_SECRETS[@]} -gt 0 ]; then
   echo "============================================================"
   echo " ACTION REQUIRED: Update these placeholder secrets"
@@ -1119,80 +1867,52 @@ if [ ${#PLACEHOLDER_SECRETS[@]} -gt 0 ]; then
   echo ""
 fi
 
-# ===========================================================================
-echo ""
-echo "============================================================"
-echo " 7. ECS SECURITY GROUP — INBOUND RULES"
-echo "============================================================"
-# ===========================================================================
-
-INTERNAL_ALB_SG=$(aws elbv2 describe-load-balancers \
-  --names vera-internal --region "$REGION" \
-  --query 'LoadBalancers[0].SecurityGroups[0]' --output text 2>/dev/null || true)
-
-ensure_sg_ingress() {
-  local port="$1" src_sg="$2" desc="$3"
-  local exists
-  exists=$(aws ec2 describe-security-groups --region "$REGION" --group-ids "$ECS_SG" \
-    --query "SecurityGroups[0].IpPermissions[?FromPort==\`$port\` && contains(UserIdGroupPairs[].GroupId, \`$src_sg\`)].IpProtocol" \
-    --output text 2>/dev/null)
-  if [ -n "$exists" ]; then
-    echo "  [exists] $ECS_SG inbound :$port from $src_sg"
-  else
-    aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$ECS_SG" \
-      --ip-permissions "IpProtocol=tcp,FromPort=$port,ToPort=$port,UserIdGroupPairs=[{GroupId=$src_sg,Description=$desc}]" \
-      --query 'SecurityGroupRules[0].SecurityGroupRuleId' --output text >/dev/null
-    echo "  [added] $ECS_SG :$port from $src_sg ($desc)"
-  fi
-}
-
-if [ -n "$INTERNAL_ALB_SG" ] && [ "$INTERNAL_ALB_SG" != "None" ]; then
-  ensure_sg_ingress 3006 "$INTERNAL_ALB_SG" "internal-alb-palisade-data-prep"
-  ensure_sg_ingress 3007 "$INTERNAL_ALB_SG" "internal-alb-palisade-rca"
-fi
-
-# SFTP via NLB — preserves source IP, no SG hop.
-EXISTING_SFTP=$(aws ec2 describe-security-groups --region "$REGION" --group-ids "$ECS_SG" \
-  --query "SecurityGroups[0].IpPermissions[?FromPort==\`22\`].IpProtocol" --output text)
-if [ -z "$EXISTING_SFTP" ]; then
-  aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$ECS_SG" \
-    --ip-permissions 'IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=0.0.0.0/0,Description="SFTP via NLB"}]' \
-    --query 'SecurityGroupRules[0].SecurityGroupRuleId' --output text >/dev/null
-  echo "  [added] $ECS_SG :22 from 0.0.0.0/0 (SFTP via NLB)"
-else
-  echo "  [exists] $ECS_SG inbound :22"
-fi
-
 echo ""
 echo "============================================================"
 echo " OTHER MANUAL STEPS"
 echo "============================================================"
 echo ""
 echo "1. Verify the ECS security group ($ECS_SG) allows:"
-echo "   - Inbound from the public ALB SG on ports 3001, 3002, 3009"
-echo "     (palisade-tap, palisade-activation, palisade-admin)"
-echo "   - Inbound from the internal ALB SG on ports 3006, 3007"
-echo "     (managed above — idempotent)"
+echo "   - Inbound from the public ALB SG on ports 3001, 3002, 3007, 3009, 3010"
+echo "     (palisade-tap, -activation, -rca, -admin, -card-ops)"
+echo "   - Inbound from the internal ALB SG on ports 3006, 3007, 3010"
+echo "     (managed by §7 above — idempotent)"
 echo "   - Inbound TCP:22 from 0.0.0.0/0 for SFTP (managed above)"
 echo ""
 echo "2. DNS records (all pointing at the shared public ALB):"
 echo "   - tap.karta.cards"
 echo "   - activation.karta.cards"
+echo "   - rca.karta.cards"
+echo "   - card-ops.karta.cards"
 echo "   - manage.karta.cards         (shared with vera-admin)"
 echo ""
 echo "3. CNAME: sftp.karta.cards -> $SFTP_NLB_DNS"
 echo ""
-echo "4. ECR repositories: palisade-tap, palisade-activation, palisade-admin,"
-echo "   palisade-data-prep, palisade-rca, palisade-batch-processor, palisade-sftp"
+echo "4. Per-IssuerProfile GP master keys: populate"
+echo "     palisade/gp/<issuer-profile-id>/enc"
+echo "     palisade/gp/<issuer-profile-id>/mac"
+echo "     palisade/gp/<issuer-profile-id>/dek"
+echo "   and set IssuerProfile.gp{Enc,Mac,Dek}KeyArn to those ARNs in the"
+echo "   admin UI.  The palisade-card-ops task role grants"
+echo "   secretsmanager:GetSecretValue on all palisade/gp/* prefixes."
 echo ""
-echo "5. Vera's SERVICE_AUTH_KEYS must contain an entry keyed 'palisade'"
-echo "   whose value matches palisade/PALISADE_VERA_VAULT_SECRET.  Palisade's"
-echo "   activation HMAC-signs calls to Vera's vault with that key."
+echo "5. APC IMK ARNs: populate palisade/APC_UDK_IMK_ARN,"
+echo "   palisade/APC_MK_KDK_ARN, palisade/APC_SDM_{META,FILE}_MASTER_KEY_ARN"
+echo "   with real AWS Payment Cryptography key ARNs before enabling the"
+echo "   hsm backend.  Per-IssuerProfile overrides go in the DB row."
 echo ""
-echo "6. Vera's aws-setup.sh routes manage.karta.cards -> vera-admin at"
+echo "6. Vera's aws-setup.sh is expected to create vera/SERVICE_AUTH_"
+echo "   PALISADE_SECRET with the matching value for PAY_AUTH_KEYS['pay']"
+echo "   above.  Rotate both together."
+echo ""
+echo "7. Vera's aws-setup.sh routes manage.karta.cards -> vera-admin at"
 echo "   priority 4.  This script adds priority 2 with a /palisade-api/*"
 echo "   path condition -> palisade-admin.  Don't lower either priority."
 echo ""
-echo "7. Seed palisade/SFTP_USERS with the real partner list."
+echo "8. Seed palisade/SFTP_USERS with the real partner list (JSON)."
+echo ""
+echo "9. After RDS becomes available, set palisade/DATABASE_URL with the"
+echo "   real endpoint + password (RDS manages the password in Secrets"
+echo "   Manager — see the rds!db-$RDS_INSTANCE_ID secret)."
 echo ""
 echo "Done."
