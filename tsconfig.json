@@ -14,6 +14,7 @@
     { "path": "./packages/vault-client" },
     { "path": "./packages/handoff" },
     { "path": "./packages/sdm-keys" },
+    { "path": "./packages/metrics" },
     { "path": "./services/admin" },
     { "path": "./services/tap" },
     { "path": "./services/activation" },
