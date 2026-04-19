@@ -408,6 +408,7 @@ model Card {
   activationSessions   ActivationSession[]
   sadRecords           SadRecord[]
   provisioningSessions ProvisioningSession[]
+  cardOpSessions       CardOpSession[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -551,6 +552,20 @@ model IssuerProfile {
   imkAlgorithm     String @default("TDES_2KEY")
   derivationMethod String @default("METHOD_A")
 
+  // --- PA TRANSFER_SAD metadata tail ---------------------------------------
+  // Real per-FI identifiers the PA applet writes to NVM during
+  // processTransferSad.  `bankId` and `progId` are 4-byte unsigned ints
+  // stored as plain DB integers (PA wire format: 4-byte big-endian).
+  // `postProvisionUrl` is the hostname (no protocol) the chip bakes into
+  // its post-activation NDEF URL so subsequent taps route straight at the
+  // mobile app deep link instead of the activation flow.  Nullable because
+  // legacy IssuerProfile rows predate these columns; new rows must set
+  // them or RCA refuses to ship the plan (unless
+  // RCA_ALLOW_MINIMAL_SAD=1 is set for dev).
+  bankId           Int?
+  progId           Int?
+  postProvisionUrl String?
+
   // AWS Payment Cryptography key ARNs
   tmkKeyArn      String @default("") // Token Master Key (iCVV)
   imkAcKeyArn    String @default("") // Issuer Master Key - AC (ARQC)
@@ -558,6 +573,20 @@ model IssuerProfile {
   imkSmcKeyArn   String @default("") // Issuer Master Key - SMC (encryption)
   imkIdnKeyArn   String @default("") // Optional: ICC Dynamic Number
   issuerPkKeyArn String @default("") // Signs ICC PK Certificates (RSA)
+
+  // GlobalPlatform SCP03 static key ARNs — the AES-128 ENC / MAC / DEK
+  // triplet used by the card-ops service to authenticate admin GP
+  // operations (applet install/uninstall, wipe, etc.) against cards
+  // issued under this program.  Each ARN may point at either a KMS key
+  // (with the 16-byte key material stored as a wrapped CiphertextBlob
+  // in Secrets Manager) or directly at a Secrets Manager secret whose
+  // value IS the 16-byte key material.  Nullable — programs without
+  // their own set fall back to the env-wide GP test key in dev
+  // (CARD_OPS_USE_TEST_KEYS=1).  Any null in production triggers a
+  // warning; card-ops refuses to use test keys unless the env flag is set.
+  gpEncKeyArn String?
+  gpMacKeyArn String?
+  gpDekKeyArn String?
 
   // Pre-computed certificates from CA enrollment
   caPkIndex           String @default("")
@@ -632,6 +661,15 @@ model ProvisioningSession {
 
   // ICC public key received during KEYGEN phase (uncompressed, 65 bytes)
   iccPublicKey Bytes?
+  // Vendor-signed chip attestation bytes received during KEYGEN phase.
+  // For NXP JCOP 5 / Infineon Secora this is the raw ECDSA-SHA-256 DER
+  // signature the PA applet emitted after the 65-byte uncompressed public
+  // key and before the 42-byte CPLC trailer.  Captured for offline
+  // analysis today; cert-chain verification lives in
+  // AttestationVerifier.verify() (stub mode — always ok=true) until
+  // mobile supports the protocol checkpoint needed to reject before
+  // TRANSFER_SAD.
+  attestation  Bytes?
   // Provenance hash from FINAL_STATUS
   provenance   String?
   // FIDO credential data from FINAL_STATUS
@@ -646,6 +684,58 @@ model ProvisioningSession {
 
   @@index([cardId])
   @@index([phase])
+}
+
+// Admin-operated card management session — the same general shape as
+// ProvisioningSession but for OUT-OF-BAND GlobalPlatform operations
+// driven by a signed-in admin via the card-ops service:
+//
+//   list_applets, install_pa, install_t4t, install_receiver,
+//   reset_pa_state, uninstall_pa, uninstall_t4t, uninstall_receiver,
+//   wipe_card
+//
+// Phases (String rather than enum so ops can evolve without a
+// migration): READY → RUNNING → COMPLETE | FAILED.  `scpState` holds the
+// opaque SCP03 session key material + MAC chaining IV during the WS
+// lifetime and is cleared (set to null) on completion — it must never
+// outlive the session.  `apduLog` is an append-only audit of every
+// APDU pair exchanged, kept for compliance (who did what, to which card).
+model CardOpSession {
+  id       String @id @default(cuid())
+  cardId   String
+  card     Card   @relation(fields: [cardId], references: [id])
+
+  // One of: list_applets | install_pa | install_t4t | install_receiver |
+  //         reset_pa_state | uninstall_pa | uninstall_t4t |
+  //         uninstall_receiver | wipe_card
+  operation String
+
+  // Cognito sub of the admin who initiated the session (audit trail).
+  initiatedBy String
+
+  // READY → RUNNING → COMPLETE | FAILED
+  phase String @default("READY")
+
+  // Append-only APDU audit trail for the session.  Shape:
+  //   [{ ts, direction: 'out'|'in', hex, sw?, phase? }]
+  apduLog Json?
+
+  // Opaque SCP03 state — session keys (S-ENC, S-MAC, S-RMAC),
+  // MAC chaining value, sequence counter, security level.  Lives only
+  // during the WS; cleared on COMPLETE or FAILED to avoid key material
+  // persisting longer than necessary.
+  scpState Json?
+
+  completedAt   DateTime?
+  failedAt      DateTime?
+  failureReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([cardId])
+  @@index([phase])
+  @@index([initiatedBy])
 }
 
 // ---------------------------------------------------------------------------

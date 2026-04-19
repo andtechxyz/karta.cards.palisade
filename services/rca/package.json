@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@palisade/core": "*",
+    "@palisade/data-prep": "*",
     "@palisade/db": "*",
     "@palisade/emv": "*",
     "@palisade/service-auth": "*",

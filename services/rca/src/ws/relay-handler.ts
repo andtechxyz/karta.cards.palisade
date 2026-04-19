@@ -1,29 +1,61 @@
 /**
  * WebSocket relay handler for provisioning sessions.
  *
- * Protocol (JSON messages):
- *   Server → App: { type: "apdu", hex, phase, progress }
- *   App → Server: { type: "response", hex, sw }
- *   App → Server: { type: "pa_fci", hex, sw }
- *   Server → App: { type: "complete", proxyCardId }
- *   Server → App: { type: "error", code, message }
+ * Two protocol modes coexist on the same WS endpoint:
  *
- * Ported from palisade-rca/app/api/websocket.py.
+ *   - **Classical** (default): server sends one APDU, waits for the
+ *     response, then sends the next.  5 phases, 4 server-to-app
+ *     round-trips per tap.  This is what the production mobile builds
+ *     speak today.
+ *
+ *   - **Plan** (opt-in via `?mode=plan`): server pre-computes the entire
+ *     5-APDU sequence and ships it on connect as a single `{type:'plan'}`
+ *     message.  The phone queues the plan locally and streams responses
+ *     back indexed by step.  1 server-to-app message total.  Cuts ~2 s
+ *     off the tap on 500 ms-RTT bad-connection scenarios.
+ *
+ * Protocol (JSON messages):
+ *
+ *   Classical:
+ *     Server → App: { type: "apdu", hex, phase, progress }
+ *     App → Server: { type: "pa_fci", hex, sw }       (after SELECT PA)
+ *     App → Server: { type: "response", hex, sw }     (subsequent APDUs)
+ *
+ *   Plan:
+ *     Server → App: { type: "plan", version, steps: [{i,apdu,phase,progress,expectSw}, ...] }
+ *     App → Server: { type: "response", i, hex, sw }  (one per step)
+ *
+ *   Shared terminal messages:
+ *     Server → App: { type: "complete", proxyCardId }
+ *     Server → App: { type: "error", code, message }
+ *     App → Server: { type: "error", code, message }
  */
 
 import type { WebSocket } from 'ws';
+import { prisma } from '@palisade/db';
+
 import { SessionManager, type WSMessage } from '../services/session-manager.js';
 
 const sessionManager = new SessionManager();
 
+export interface RelayOptions {
+  /** When true, send a pre-computed plan on connect instead of streaming APDUs. */
+  planMode?: boolean;
+}
+
 /**
  * Handle a WebSocket connection for a provisioning session.
+ *
+ * The caller (index.ts) has already validated the sessionId exists and
+ * is in INIT phase; we just drive the session from here.
  */
 export async function handleRelayConnection(
   ws: WebSocket,
   sessionId: string,
+  options: RelayOptions = {},
 ): Promise<void> {
-  console.log(`[rca-ws] relay connected: session=${sessionId}`);
+  const mode = options.planMode ? 'plan' : 'classical';
+  console.log(`[rca-ws] relay connected: session=${sessionId}, mode=${mode}`);
 
   ws.on('message', async (raw) => {
     try {
@@ -62,15 +94,45 @@ export async function handleRelayConnection(
     console.error(`[rca-ws] relay error: session=${sessionId}`, err);
   });
 
-  // Send initial ready message — SELECT the Palisade Provisioning Agent
-  // applet by its instance AID.  `A00000006250414C` is the AID the JavaCard
-  // converter assigns when building from com.palisade.pa (package AID
-  // A0000000625041 + 1-byte module tag 0x4C).  Palisade's own reference
-  // perso installs `gp --install pa.cap` with no --create override, so the
-  // default module AID is the live instance AID we SELECT here.
+  if (options.planMode) {
+    // Plan mode: assemble the full APDU plan and ship it in one message.
+    // The phone runs the whole sequence locally against the chip and
+    // streams indexed responses back — no server round-trips between
+    // steps.  We mark the session PLAN_SENT so `handleMessage` knows to
+    // route subsequent `response` messages through the plan-mode
+    // handlers (distinguished at runtime by the `i` field on the inbound
+    // response).
+    try {
+      const plan = await sessionManager.buildPlanForSession(sessionId);
+      await prisma.provisioningSession.update({
+        where: { id: sessionId },
+        data: { phase: 'PLAN_SENT' },
+      });
+      ws.send(JSON.stringify(plan));
+    } catch (err) {
+      console.error(`[rca-ws] plan build failed for session ${sessionId}:`, err);
+      if (ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'error',
+          code: 'PLAN_BUILD_FAILED',
+          message: 'Could not assemble provisioning plan',
+        }));
+        ws.close(1011, 'Plan build failed');
+      }
+      return;
+    }
+    return;
+  }
+
+  // Classical mode: send SELECT PA and let the phase machine drive the
+  // rest via pa_fci → GENERATE_KEYS → TRANSFER_SAD → FINAL_STATUS →
+  // CONFIRM.  AID A00000006250414C is the converter default for
+  // com.palisade.pa (package AID A0000000625041 + module tag 0x4C),
+  // matching Palisade's reference perso (`gp --install pa.cap` with no
+  // --create override).
   ws.send(JSON.stringify({
     type: 'apdu',
-    hex: '00A40400' + '08' + 'A00000006250414C', // SELECT PA by AID
+    hex: '00A40400' + '08' + 'A00000006250414C',
     phase: 'select_pa',
     progress: 0.05,
   }));

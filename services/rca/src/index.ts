@@ -62,6 +62,16 @@ wss.on('connection', async (ws, req) => {
 
   const sessionId = match[1];
 
+  // Parse the query string once for all protocol-level feature flags.
+  // Today we only check `mode=plan` to enable plan-mode (pre-computed
+  // APDU sequence), but this is the hook-point if we add compression,
+  // attestation-gate checkpoints, etc.
+  //
+  // The URL constructor needs a base — we're only interested in the
+  // query params, so any valid base works.
+  const parsedUrl = new URL(req.url ?? '/', 'http://localhost');
+  const planMode = parsedUrl.searchParams.get('mode') === 'plan';
+
   // Validate the session exists, is in INIT phase, and was created recently.
   // The sessionId itself is the auth token — it's a cuid with 25+ chars of
   // entropy, returned only via the HMAC-gated /api/provision/start endpoint.
@@ -88,7 +98,7 @@ wss.on('connection', async (ws, req) => {
     return;
   }
 
-  handleRelayConnection(ws, sessionId);
+  handleRelayConnection(ws, sessionId, { planMode });
 });
 
 // ---------------------------------------------------------------------------

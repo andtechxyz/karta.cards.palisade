@@ -26,6 +26,17 @@ export interface CognitoAuthConfig {
    * 403 if the group claim is missing or does not include this value.
    */
   requiredGroup?: string;
+  /**
+   * If set, the user's `email` claim must appear in this list (case-insensitive).
+   * An empty array is treated as "allow nobody" — the caller MUST NOT pass `[]`
+   * if they intend to allow everyone; omit the field entirely in that case.
+   * Rejects with 403 when the email is missing or not on the list.
+   *
+   * Used for admin-operated endpoints where group membership alone is too
+   * coarse (e.g. card-ops needs a tighter breakglass set than the general
+   * `admin` group).  Pair with `requiredGroup` for defence in depth.
+   */
+  emailAllowlist?: readonly string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +126,23 @@ export function createCognitoAuthMiddleware(config: CognitoAuthConfig): RequestH
           message: `Requires membership in '${config.requiredGroup}' group`,
         });
         return;
+      }
+
+      // Enforce email allowlist if configured.  Case-insensitive match
+      // because Cognito preserves original email casing but operators
+      // should be able to type the list in any consistent form.  An
+      // empty-but-present allowlist means "no one" — explicitly reject
+      // so a misconfigured env doesn't silently open the door.
+      if (config.emailAllowlist) {
+        const email = user.email?.toLowerCase();
+        const list = config.emailAllowlist.map((e) => e.toLowerCase());
+        if (!email || !list.includes(email)) {
+          res.status(403).json({
+            error: 'forbidden',
+            message: 'Email not on admin allowlist',
+          });
+          return;
+        }
       }
 
       req.cognitoUser = user;

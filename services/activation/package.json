@@ -15,6 +15,7 @@
     "@palisade/sdm-keys": "*",
     "@palisade/service-auth": "*",
     "@palisade/vault-client": "*",
+    "@palisade/admin-config": "*",
     "@palisade/cognito-auth": "*",
     "@palisade/webauthn": "*",
     "dotenv": "^16.4.5",

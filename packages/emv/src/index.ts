@@ -16,8 +16,16 @@ export { EMV_TAGS } from './emv-tags.js';
 export type { TagSource, TagInfo } from './emv-tags.js';
 export { ChipProfile } from './chip-profile.js';
 export type { DGIDefinition, DGISource, ChipProfileData } from './chip-profile.js';
-export { buildIad } from './iad-builder.js';
-export type { Scheme } from './iad-builder.js';
+export {
+  buildIad,
+  packMcCvn10Cvr,
+  packMcCvn17Or18Cvr,
+  packVisaCvn10Cvr,
+  packVisaCvn22Cvr,
+  resolveDacIdn,
+  deriveDacIdn,
+} from './iad-builder.js';
+export type { Scheme, CvrInputs, BuildIadOptions } from './iad-builder.js';
 export { SADBuilder } from './sad-builder.js';
 export type { CardData, IssuerProfileForSad } from './sad-builder.js';
 export {

@@ -54,6 +54,10 @@ const defaults: Record<string, string> = {
   // Admin browser-facing auth — must differ from PROVISION_AUTH_KEYS to catch
   // accidental key-swap bugs.
   ADMIN_API_KEY: HEX32_J,
+  // card-ops service shared secret (activation → card-ops /register).
+  SERVICE_AUTH_CARD_OPS_SECRET: HEX32_A,
+  // card-ops inbound HMAC keys (its own PROVISION_AUTH_KEYS-analog).
+  CARD_OPS_AUTH_KEYS: JSON.stringify({ activation: HEX32_A }),
   // Admin proxy to pay service (admin UI's transaction tab)
   PAY_SERVICE_URL: 'http://localhost:3003',
   PAY_ADMIN_API_KEY: HEX32_J,
