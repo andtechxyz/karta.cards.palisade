@@ -16,4 +16,6 @@ services/*/frontend/package-lock.json
 
 *.tsbuildinfo
 
+scratch/
+
 .claude/
