@@ -47,6 +47,18 @@ const createSchema = z
     imkAlgorithm: z.string().min(1).max(64).optional(),
     derivationMethod: z.string().min(1).max(64).optional(),
 
+    // PA TRANSFER_SAD metadata tail.  `bankId` + `progId` are 4-byte
+    // unsigned big-endian ints the PA applet writes to NVM during
+    // processTransferSad; `postProvisionUrl` is the hostname (no
+    // protocol) baked into post-activation NDEF URLs.  All three are
+    // nullable because legacy rows predate the columns — new rows
+    // should set them or RCA refuses to ship the plan (see
+    // RCA_ALLOW_MINIMAL_SAD).  PA applet caps the url bytes at 255
+    // in the TRANSFER_SAD tail.
+    bankId: z.number().int().min(0).max(0xFFFFFFFF).nullable().optional(),
+    progId: z.number().int().min(0).max(0xFFFFFFFF).nullable().optional(),
+    postProvisionUrl: z.string().max(255).nullable().optional(),
+
     // AWS Payment Cryptography key ARNs
     tmkKeyArn: arnField.optional(),
     imkAcKeyArn: arnField.optional(),
@@ -130,6 +142,15 @@ function maskArns<T extends Record<string, unknown>>(profile: T): T {
   return masked;
 }
 
+// List projection: keep masked ARNs, expose `bankId` + `progId` for the
+// badge column, but drop `postProvisionUrl` — the url belongs to the
+// detail view only (no reason to broadcast every FI's activation host on
+// the table view, and it keeps the list payload slim).
+function stripForList<T extends Record<string, unknown>>(profile: T): T {
+  const { postProvisionUrl: _omit, ...rest } = profile as T & { postProvisionUrl?: unknown };
+  return rest as T;
+}
+
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
@@ -142,7 +163,7 @@ router.get('/', async (_req, res) => {
       chipProfile: { select: { id: true, name: true, scheme: true } },
     },
   });
-  res.json(profiles.map(maskArns));
+  res.json(profiles.map((p) => stripForList(maskArns(p))));
 });
 
 router.get('/:id', async (req, res) => {
