@@ -157,7 +157,8 @@ const ISSUERPROFILE_MC_AU = {
   imkAcKeyArn:       '',
   imkSmiKeyArn:      '',
   imkSmcKeyArn:      '',
-  issuerRsaKeyArn:   '',
+  imkIdnKeyArn:      '',           // optional ICC Dynamic Number key
+  issuerPkKeyArn:    '',           // issuer RSA key (signs ICC PK certs)
   gpEncKeyArn:       '',
   gpMacKeyArn:       '',
   gpDekKeyArn:       '',
@@ -244,7 +245,8 @@ const ISSUERPROFILE_VISA_US = {
   imkAcKeyArn:       '',
   imkSmiKeyArn:      '',
   imkSmcKeyArn:      '',
-  issuerRsaKeyArn:   '',
+  imkIdnKeyArn:      '',           // optional ICC Dynamic Number key
+  issuerPkKeyArn:    '',           // issuer RSA key (signs ICC PK certs)
   gpEncKeyArn:       '',
   gpMacKeyArn:       '',
   gpDekKeyArn:       '',
