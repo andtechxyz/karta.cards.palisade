@@ -9,11 +9,22 @@ import { decryptPiccData } from './picc.js';
 // the SDM tag byte (0xC7) at plaintext offset 0 — every other key produces
 // effectively-random bytes there with probability 1/256.
 //
-// Complexity: O(N) derivations per tap, where N is the number of active cards
-// in the program.  There is no way to lower this without exposing UID in the
-// URL plaintext (a privacy requirement says no).  If the program fleet gets
-// large, add an LRU cache keyed by UID fingerprint in the SdmDeriver or a
-// pre-warmed in-process map — both are pure-function optimisations.
+// This code path is live in production: Karta Platinum cards' NDEF URL
+// template is `https://mobile.karta.cards/t/{urlCode}?e={PICCData}&m={CMAC}`
+// (no cardRef), and the mobile app POSTs the `{e, m}` pair back here at
+// every tap.  See apps/mobile/src/screens/tap/TapVerifyScreen.tsx.
+//
+// Complexity: O(N) per tap where N = active cards in the program.  Each
+// iteration costs 1 AES-GCM decrypt (local) + 1 CMAC derivation (HSM call
+// in prod, AES-CMAC in dev).  The HSM call is the dominant factor — assume
+// ~10ms p50, so a program with 10k active cards is ~100s worst case.  There
+// is NO way to lower this without putting the UID (or a UID-deriveable
+// fingerprint) in the URL, which the privacy spec forbids.
+//
+// If a program's active-card count starts to matter, the cheap lever is an
+// in-process LRU keyed by UID: same UID → same derived key, so we avoid the
+// HSM round-trip on repeat taps.  The expensive lever is sharding the
+// trial loop across workers.  Neither is in scope today.
 //
 // Filters to ACTIVATED + PROVISIONED only — SHIPPED cards have no business
 // hitting this endpoint (their NDEF URL points at the activation flow, not at
