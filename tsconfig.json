@@ -1,6 +1,7 @@
 {
   "files": [],
   "references": [
+    { "path": "./packages/admin-config" },
     { "path": "./packages/cognito-auth" },
     { "path": "./packages/db" },
     { "path": "./packages/core" },
@@ -12,11 +13,15 @@
     { "path": "./packages/provisioning-client" },
     { "path": "./packages/vault-client" },
     { "path": "./packages/handoff" },
+    { "path": "./packages/sdm-keys" },
+    { "path": "./packages/metrics" },
+    { "path": "./services/admin" },
     { "path": "./services/tap" },
     { "path": "./services/activation" },
     { "path": "./services/data-prep" },
     { "path": "./services/rca" },
     { "path": "./services/batch-processor" },
+    { "path": "./services/card-ops" },
     { "path": "./services/sftp" }
   ]
 }

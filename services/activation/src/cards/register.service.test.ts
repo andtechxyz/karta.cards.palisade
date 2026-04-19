@@ -52,8 +52,6 @@ const VALID_INPUT = {
   cardRef: 'ref_1',
   uid: 'AABBCCDDEEFF11',
   chipSerial: 'JCOP5_UNIT',
-  sdmMetaReadKey: '00112233445566778899aabbccddeeff',
-  sdmFileReadKey: '112233445566778899aabbccddeeff00',
   programId: 'prog_x',
   batchId: 'batch_x',
   card: {
@@ -156,7 +154,7 @@ describe('registerCard — happy path', () => {
     expect(registerCardMock.mock.calls[0][0]).not.toHaveProperty('cardId');
   });
 
-  it('encrypts UID and both SDM keys in lowercase', async () => {
+  it('encrypts UID in lowercase (and only UID — SDM keys are HSM-derived, never stored)', async () => {
     vi.mocked(findCard()).mockResolvedValue(null);
     vi.mocked(createCard()).mockResolvedValue({
       id: 'card_new',
@@ -167,10 +165,7 @@ describe('registerCard — happy path', () => {
     await registerCard(VALID_INPUT);
 
     const plaintexts = vi.mocked(encrypt).mock.calls.map((c) => c[0]);
-    expect(plaintexts).toHaveLength(3);
-    expect(plaintexts).toContain(VALID_INPUT.uid.toLowerCase());
-    expect(plaintexts).toContain(VALID_INPUT.sdmMetaReadKey.toLowerCase());
-    expect(plaintexts).toContain(VALID_INPUT.sdmFileReadKey.toLowerCase());
+    expect(plaintexts).toEqual([VALID_INPUT.uid.toLowerCase()]);
   });
 
   it('creates a SHIPPED Card with the opaque vaultToken and mirrored PAN metadata', async () => {
@@ -202,8 +197,8 @@ describe('registerCard — happy path', () => {
     expect(data.panExpiryMonth).toBe(VALID_INPUT.card.expiryMonth);
     expect(data.panExpiryYear).toBe(VALID_INPUT.card.expiryYear);
     expect(data.uidEncrypted).toBe(`enc(${VALID_INPUT.uid.toLowerCase()})`);
-    expect(data.sdmMetaReadKeyEncrypted).toBe(`enc(${VALID_INPUT.sdmMetaReadKey.toLowerCase()})`);
-    expect(data.sdmFileReadKeyEncrypted).toBe(`enc(${VALID_INPUT.sdmFileReadKey.toLowerCase()})`);
+    expect(data).not.toHaveProperty('sdmMetaReadKeyEncrypted');
+    expect(data).not.toHaveProperty('sdmFileReadKeyEncrypted');
     expect(data.keyVersion).toBe(1);
     expect(data.programId).toBe(VALID_INPUT.programId);
     expect(data.batchId).toBe(VALID_INPUT.batchId);
@@ -213,20 +208,3 @@ describe('registerCard — happy path', () => {
   });
 });
 
-describe('registerCard — vault key drift guard', () => {
-  it('throws 500 vault_key_drift if any of the three encrypts use a different key version', async () => {
-    vi.mocked(findCard()).mockResolvedValue(null);
-    let n = 0;
-    vi.mocked(encrypt).mockImplementation((plaintext: string) => {
-      n += 1;
-      return { ciphertext: `enc(${plaintext})`, keyVersion: n === 3 ? 2 : 1 } as never;
-    });
-
-    await expect(registerCard(VALID_INPUT)).rejects.toMatchObject({
-      name: 'ApiError',
-      status: 500,
-      code: 'vault_key_drift',
-    });
-    expect(createCard()).not.toHaveBeenCalled();
-  });
-});

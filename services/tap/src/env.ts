@@ -1,9 +1,18 @@
-import { defineEnv, baseEnvShape, cardFieldCryptoEnvShape } from '@palisade/core';
+import {
+  defineEnv,
+  baseEnvShape,
+  cardFieldCryptoEnvShape,
+  sdmKeyDerivationEnvShape,
+} from '@palisade/core';
 import { z } from 'zod';
+
+import type { SdmBackend } from '@palisade/sdm-keys';
+export type { SdmBackend };
 
 const { get: getTapConfig, reset: _resetTapConfig } = defineEnv({
   ...baseEnvShape,
   ...cardFieldCryptoEnvShape,
+  ...sdmKeyDerivationEnvShape,
   PORT: z.coerce.number().int().positive().default(3001),
   TAP_HANDOFF_SECRET: z.string().min(32),
   ACTIVATION_URL: z.string().url(),
@@ -15,3 +24,4 @@ const { get: getTapConfig, reset: _resetTapConfig } = defineEnv({
 });
 
 export { getTapConfig, _resetTapConfig };
+export { assertSdmEnv } from '@palisade/core';

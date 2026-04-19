@@ -13,7 +13,7 @@
  * PANs never live outside the vault after processing completes.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { prisma } from '@palisade/db';
 import { decrypt, EnvKeyProvider } from '@palisade/core';
@@ -166,19 +166,18 @@ async function markFailed(batchId: string, message: string): Promise<void> {
 async function registerCard(record: EmbossingRecord, programId: string): Promise<void> {
   const config = getBatchConfig();
 
-  // If the record didn't come with SDM keys / UID, synthesize placeholders
-  // so the activation service accepts the row.  Production batches from
-  // Episode Six / pers bureaus always include these; the placeholders are
-  // a safety net for test data that lacks them.
-  const randomHex = (n: number): string =>
-    [...Array(n)].map(() => Math.floor(Math.random() * 16).toString(16)).join('');
+  // If the record didn't come with a cardRef / UID, synthesize placeholders so
+  // the activation service accepts the row.  Production batches from Episode
+  // Six / pers bureaus always include both; the placeholders are a safety net
+  // for test data that lacks them.  SDM read keys are NOT sent — activation
+  // does not accept them on register (tap-service derives them per-tap from
+  // UID via AES-CMAC(MASTER_<role>, UID)).
+  const randomHex = (bytes: number): string => randomBytes(bytes).toString('hex');
 
   const body = JSON.stringify({
-    cardRef: record.cardRef ?? `card_${Date.now()}_${randomHex(6)}`,
-    uid: record.uid ?? randomHex(14),
+    cardRef: record.cardRef ?? `card_${Date.now()}_${randomHex(3)}`,
+    uid: record.uid ?? randomHex(7),
     chipSerial: record.chipSerial,
-    sdmMetaReadKey: record.sdmMetaReadKey ?? randomHex(32),
-    sdmFileReadKey: record.sdmFileReadKey ?? randomHex(32),
     programId,
     batchId: undefined,
     card: {

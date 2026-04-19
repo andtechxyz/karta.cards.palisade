@@ -1,44 +1,123 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { EmvDerivationService } from './emv-derivation.js';
+import type { DerivedMasterKey, UdkDeriver } from './udk-deriver.js';
 
-// Only exercises the mock-mode path.  The real AWS Payment Cryptography path
-// has no usable test stub — it'd be an SDK mock that asserts request shapes,
-// which is low-value and already covered by data-prep.service.test.ts.
+// EmvDerivationService is now a thin fan-out over UdkDeriver.  The real
+// crypto — ECB rounds, KCV, iCVV — is exercised in udk-deriver.test.ts.
+// Here we only verify orchestration: that the service forwards each call
+// to the injected deriver with the right arguments and reshapes the
+// parallel results into DerivedKeys.
 
-describe('EmvDerivationService mock mode', () => {
-  const svc = new EmvDerivationService('ap-southeast-2', true);
+function makeStubDeriver(): UdkDeriver & {
+  deriveIcvv: ReturnType<typeof vi.fn>;
+  deriveMasterKey: ReturnType<typeof vi.fn>;
+} {
+  const mk = (suffix: string): DerivedMasterKey => ({
+    keyArn: `stub:${suffix}`,
+    kcv: `KCV${suffix}`,
+    keyBytes: Buffer.from(`keybytes-${suffix}`),
+  });
+  return {
+    deriveIcvv: vi.fn().mockResolvedValue('123'),
+    deriveMasterKey: vi
+      .fn()
+      .mockImplementation(async (arn: string) => mk(arn.slice(-3))),
+  };
+}
 
-  it('produces a 3-digit iCVV', async () => {
-    const icvv = await svc.deriveIcvv('unused-arn', '4242424242424242', '2812');
-    expect(icvv).toMatch(/^\d{3}$/);
+describe('EmvDerivationService (orchestrator)', () => {
+  it('deriveIcvv forwards to the backend unchanged', async () => {
+    const deriver = makeStubDeriver();
+    const svc = new EmvDerivationService(deriver);
+
+    const icvv = await svc.deriveIcvv('arn:tmk', '4242424242424242', '2812');
+
+    expect(icvv).toBe('123');
+    expect(deriver.deriveIcvv).toHaveBeenCalledWith(
+      'arn:tmk',
+      '4242424242424242',
+      '2812',
+    );
   });
 
-  it('iCVV is deterministic for the same PAN + expiry', async () => {
-    const a = await svc.deriveIcvv('unused-arn', '4242424242424242', '2812');
-    const b = await svc.deriveIcvv('unused-arn', '4242424242424242', '2812');
-    expect(a).toBe(b);
+  it('deriveAllKeys fans out to four backend calls in parallel', async () => {
+    const deriver = makeStubDeriver();
+    const svc = new EmvDerivationService(deriver);
+
+    await svc.deriveAllKeys(
+      'arn:tmk',
+      'arn:imk-ac',
+      'arn:imk-smi',
+      'arn:imk-smc',
+      '4242424242424242',
+      '2812',
+      '01',
+    );
+
+    expect(deriver.deriveIcvv).toHaveBeenCalledWith(
+      'arn:tmk',
+      '4242424242424242',
+      '2812',
+    );
+    expect(deriver.deriveMasterKey).toHaveBeenCalledTimes(3);
+    expect(deriver.deriveMasterKey).toHaveBeenCalledWith(
+      'arn:imk-ac',
+      '4242424242424242',
+      '01',
+    );
+    expect(deriver.deriveMasterKey).toHaveBeenCalledWith(
+      'arn:imk-smi',
+      '4242424242424242',
+      '01',
+    );
+    expect(deriver.deriveMasterKey).toHaveBeenCalledWith(
+      'arn:imk-smc',
+      '4242424242424242',
+      '01',
+    );
   });
 
-  it('iCVV changes when PAN changes', async () => {
-    const a = await svc.deriveIcvv('unused-arn', '4242424242424242', '2812');
-    const b = await svc.deriveIcvv('unused-arn', '4000000000000000', '2812');
-    expect(a).not.toBe(b);
-  });
+  it('deriveAllKeys reshapes backend outputs into DerivedKeys', async () => {
+    const deriver = makeStubDeriver();
+    const svc = new EmvDerivationService(deriver);
 
-  it('deriveMasterKey returns a mock: ARN and 6-hex KCV', async () => {
-    const k = await svc.deriveMasterKey('unused-imk', '4242424242424242', '01');
-    expect(k.keyArn).toMatch(/^mock:/);
-    expect(k.kcv).toMatch(/^[0-9A-F]{6}$/);
-  });
-
-  it('deriveAllKeys exercises the full mock path', async () => {
     const keys = await svc.deriveAllKeys(
-      'tmk', 'imk-ac', 'imk-smi', 'imk-smc',
-      '4242424242424242', '2812', '01',
+      'arn:tmk',
+      'arn:imk-ac',
+      'arn:imk-smi',
+      'arn:imk-smc',
+      '4242424242424242',
+      '2812',
+      '01',
+    );
+
+    expect(keys.icvv).toBe('123');
+    expect(keys.mkAcArn).toBe('stub:-ac');
+    expect(keys.mkAcKcv).toBe('KCV-ac');
+    expect(keys.mkAcKeyBytes).toEqual(Buffer.from('keybytes--ac'));
+    expect(keys.mkSmiArn).toBe('stub:smi');
+    expect(keys.mkSmcArn).toBe('stub:smc');
+  });
+
+  it('fromBackend("mock") wires up MockUdkDeriver end-to-end', async () => {
+    const svc = EmvDerivationService.fromBackend('mock');
+
+    const icvv = await svc.deriveIcvv('arn:tmk', '4242424242424242', '2812');
+    expect(icvv).toMatch(/^\d{3}$/);
+
+    const keys = await svc.deriveAllKeys(
+      'arn:tmk',
+      'arn:imk-ac',
+      'arn:imk-smi',
+      'arn:imk-smc',
+      '4242424242424242',
+      '2812',
+      '01',
     );
     expect(keys.icvv).toMatch(/^\d{3}$/);
     expect(keys.mkAcArn).toMatch(/^mock:/);
     expect(keys.mkSmiArn).toMatch(/^mock:/);
     expect(keys.mkSmcArn).toMatch(/^mock:/);
+    expect(keys.mkAcKeyBytes).toHaveLength(16);
   });
 });

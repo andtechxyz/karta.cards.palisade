@@ -63,13 +63,14 @@ export const baseEnvShape = {
 // Cryptographic key env shapes — split by purpose.
 //
 // PCI-DSS 3.5/3.6 require keys to be scoped to their protected data.  The
-// vault PAN keyspace (Vera-side) and the card-field (UID + SDM) keyspace
-// cover different fields protected by different services; they MUST NOT
-// share a root.  Each shape below is spread into only the services that
-// legitimately need it:
+// vault PAN keyspace (Vera-side) and the card-field (UID) keyspace cover
+// different fields protected by different services; they MUST NOT share a
+// root.  Each shape below is spread into only the services that legitimately
+// need it:
 //
 //   vaultPanCryptoEnvShape     → vault service only
 //   cardFieldCryptoEnvShape    → activation (write) + tap (read)
+//   sdmKeyDerivationEnvShape   → tap (primary) + activation (karta-url CMAC)
 //
 // The UID dedup fingerprint (activation-only) is declared inline in
 // activation's env shape — no shared fragment, because nothing else uses it.
@@ -82,11 +83,60 @@ export const vaultPanCryptoEnvShape = {
   VAULT_PAN_FINGERPRINT_KEY: hexKey(32),
 } as const;
 
-/** DEK for Card.uid + SDM read keys (activation writes, tap reads). */
+/** DEK for Card.uid (activation writes, tap reads). */
 export const cardFieldCryptoEnvShape = {
   CARD_FIELD_DEK_V1: hexKey(32),
   CARD_FIELD_DEK_ACTIVE_VERSION: z.coerce.number().int().positive().default(1),
 } as const;
+
+/**
+ * SDM key-derivation backend selection.  The two AES-128 SDM keys (metaRead,
+ * fileRead) are NEVER stored at rest; they are derived on every tap from the
+ * card UID via AES-CMAC(MASTER_<role>, UID) (NXP AN12196 / AN14683).
+ *
+ * Used by tap (primary — derives on every SUN verify) and activation (for the
+ * karta-url CMAC baked into the begin-activation assertion payload).
+ *
+ *   hsm    — AWS Payment Cryptography GenerateMac(CMAC).  Prod.
+ *   local  — Node crypto AES-CMAC, masters HKDF'd from DEV_SDM_ROOT_SEED.  Dev.
+ *   mock   — sha256 stand-ins.  Unit tests only.
+ */
+export const sdmKeyDerivationEnvShape = {
+  SDM_KEY_BACKEND: z.enum(['hsm', 'local', 'mock']).default('hsm'),
+  SDM_META_MASTER_KEY_ARN: z.string().default(''),
+  SDM_FILE_MASTER_KEY_ARN: z.string().default(''),
+  DEV_SDM_ROOT_SEED: z.string().default(''),
+  AWS_REGION: z.string().default('ap-southeast-2'),
+} as const;
+
+/**
+ * Validate a resolved env against `sdmKeyDerivationEnvShape`.  Call once per
+ * process from the deriver factory — throws with a clear message if the
+ * selected backend's required inputs are missing.
+ */
+export function assertSdmEnv(cfg: {
+  SDM_KEY_BACKEND: 'hsm' | 'local' | 'mock';
+  SDM_META_MASTER_KEY_ARN: string;
+  SDM_FILE_MASTER_KEY_ARN: string;
+  DEV_SDM_ROOT_SEED: string;
+}): void {
+  if (cfg.SDM_KEY_BACKEND === 'hsm') {
+    if (!cfg.SDM_META_MASTER_KEY_ARN || !cfg.SDM_FILE_MASTER_KEY_ARN) {
+      throw new Error(
+        "SDM_KEY_BACKEND='hsm' requires SDM_META_MASTER_KEY_ARN and " +
+          'SDM_FILE_MASTER_KEY_ARN to be set to the ARNs of the two AES-128 ' +
+          'CMAC keys in AWS Payment Cryptography.',
+      );
+    }
+  } else if (cfg.SDM_KEY_BACKEND === 'local') {
+    if (!/^[0-9a-fA-F]{64}$/.test(cfg.DEV_SDM_ROOT_SEED)) {
+      throw new Error(
+        "SDM_KEY_BACKEND='local' requires DEV_SDM_ROOT_SEED to be a 32-byte " +
+          'hex string (64 hex chars).',
+      );
+    }
+  }
+}
 
 // -----------------------------------------------------------------------------
 // Service-to-service auth env shapes.

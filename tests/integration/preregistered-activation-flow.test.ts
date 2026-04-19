@@ -28,7 +28,7 @@ interface FakeCard {
   id: string;
   cardRef: string;
   status: string;
-  sdmFileReadKeyEncrypted: string;
+  uidEncrypted: string;
   keyVersion: number;
   programId: string | null;
   program?: {
@@ -145,15 +145,24 @@ const mockPrisma = vi.hoisted(() => ({
 
 vi.mock('@palisade/db', () => ({ prisma: mockPrisma }));
 
-// Core: decrypt returns a fake 32-hex string (16-byte key); aesCmac returns 16 zero bytes.
+// Core: decrypt returns a fake 7-byte NTAG424 UID hex; aesCmac returns 16 zero bytes.
 vi.mock('@palisade/core', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@palisade/core')>();
   return {
     ...actual,
-    decrypt: vi.fn(() => '00112233445566778899aabbccddeeff'),
+    decrypt: vi.fn(() => '04aabbccddeeff'),
     aesCmac: vi.fn(() => Buffer.alloc(16)),
   };
 });
+
+// Stub the activation-side SDM deriver — begin.service calls
+// deriveFileReadKey(uid) to get the CMAC key for the karta-url extension.
+vi.mock('../../services/activation/src/cards/sdm-deriver.js', () => ({
+  getSdmDeriver: vi.fn(() => ({
+    deriveMetaReadKey: vi.fn(async () => Buffer.alloc(16, 0xbb)),
+    deriveFileReadKey: vi.fn(async () => Buffer.alloc(16, 0xbb)),
+  })),
+}));
 
 vi.mock('@palisade/webauthn', () => ({
   buildNfcCardRegistrationOptions: vi.fn(() => ({ rpName: 'test' })),
@@ -232,7 +241,7 @@ function seedCard(): FakeCard {
     id: 'card_1',
     cardRef: 'kc_e2e_1',
     status: 'SHIPPED',
-    sdmFileReadKeyEncrypted: 'enc_file_key',
+    uidEncrypted: 'enc_uid',
     keyVersion: 1,
     programId: 'p_1',
     program: {

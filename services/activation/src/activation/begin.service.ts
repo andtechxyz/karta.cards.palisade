@@ -8,13 +8,14 @@ import type {
 } from '@simplewebauthn/types';
 import { CardStatus } from '@prisma/client';
 import { prisma } from '@palisade/db';
-import { notFound, conflict, internal, aesCmac, decrypt } from '@palisade/core';
+import { notFound, conflict, decrypt, aesCmac } from '@palisade/core';
 import {
   buildNfcCardRegistrationOptions,
   buildAuthenticationOptions,
 } from '@palisade/webauthn';
 import { renderNdefUrls } from '../programs/ndef.js';
 import { getCardFieldKeyProvider } from '../cards/key-provider.js';
+import { getSdmDeriver } from '../cards/sdm-deriver.js';
 import { loadActiveSession } from './session.js';
 
 // First leg of the activation ceremony.
@@ -59,7 +60,7 @@ export async function beginActivationRegistration(
       id: true,
       cardRef: true,
       status: true,
-      sdmFileReadKeyEncrypted: true,
+      uidEncrypted: true,
       keyVersion: true,
       program: {
         select: {
@@ -103,22 +104,24 @@ export async function beginActivationRegistration(
     const bakedBase = stripUrlForChip(postActivationUrl);
     const urlBytes = Buffer.from(bakedBase, 'utf8');
 
-    // Decrypt the card's sdmFileReadKey — same key the T4T applet's macKey
-    // is loaded from at install time.  Needed to compute a CMAC the applet
-    // will accept.
-    const fileReadKeyHex = decrypt(
-      {
-        ciphertext: card.sdmFileReadKeyEncrypted,
-        keyVersion: card.keyVersion,
-      },
+    // Derive the sdmFileReadKey from the card's UID — same key the T4T
+    // applet's macKey is loaded from at install time, and the same key
+    // tap-service derives on every SUN verify.  We decrypt the stored UID,
+    // run it through the SDM deriver (HSM in prod / local in dev), and use
+    // the resulting 16-byte key to CMAC the URL the chip should bake in.
+    const uidHex = decrypt(
+      { ciphertext: card.uidEncrypted, keyVersion: card.keyVersion },
       getCardFieldKeyProvider(),
     );
-    const fileReadKey = Buffer.from(fileReadKeyHex, 'hex');
-    if (fileReadKey.length !== 16) {
-      throw internal('bad_file_read_key', 'sdmFileReadKey is not 16 bytes');
+    const uid = Buffer.from(uidHex, 'hex');
+    const fileReadKey = await getSdmDeriver().deriveFileReadKey(uid);
+    let cmac: Buffer;
+    try {
+      cmac = aesCmac(fileReadKey, urlBytes); // 16 bytes
+    } finally {
+      fileReadKey.fill(0); // scrub
+      uid.fill(0);
     }
-    const cmac = aesCmac(fileReadKey, urlBytes); // 16 bytes
-    fileReadKey.fill(0); // scrub
 
     // Build the extended credential ID bytes: <realCredId> || <url> || <cmac>
     // Channel (a) — present in allowCredentials[0].id, picked up by the

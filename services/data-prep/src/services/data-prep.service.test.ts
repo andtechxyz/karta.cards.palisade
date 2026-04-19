@@ -59,7 +59,6 @@ vi.mock('@palisade/emv', async (importOriginal) => {
 import { prisma } from '@palisade/db';
 import { KMSClient } from '@aws-sdk/client-kms';
 import { DataPrepService, type PrepareInput } from './data-prep.service.js';
-import { EmvDerivationService } from './emv-derivation.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -261,95 +260,6 @@ describe('DataPrepService', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Tests: EmvDerivationService
-// ---------------------------------------------------------------------------
-
-describe('EmvDerivationService', () => {
-  let emv: EmvDerivationService;
-  let mockPcDataSend: ReturnType<typeof vi.fn>;
-  let mockPcControlSend: ReturnType<typeof vi.fn>;
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    emv = new EmvDerivationService('ap-southeast-2');
-
-    mockPcDataSend = vi.fn();
-    mockPcControlSend = vi.fn();
-    (emv as any).pcData = { send: mockPcDataSend };
-    (emv as any).pcControl = { send: mockPcControlSend };
-  });
-
-  describe('deriveIcvv', () => {
-    it('calls GenerateCardValidationDataCommand with correct params', async () => {
-      mockPcDataSend.mockResolvedValue({ ValidationData: '456' });
-
-      const result = await emv.deriveIcvv('arn:tmk', '4242424242424242', '2812');
-
-      expect(mockPcDataSend).toHaveBeenCalledOnce();
-      expect(result).toBe('456');
-    });
-
-    it('returns "000" when ValidationData is undefined', async () => {
-      mockPcDataSend.mockResolvedValue({});
-
-      const result = await emv.deriveIcvv('arn:tmk', '4242424242424242', '2812');
-      expect(result).toBe('000');
-    });
-  });
-
-  describe('deriveMasterKey', () => {
-    it('calls EncryptDataCommand twice (left + right halves) and ImportKeyCommand', async () => {
-      // First two calls → pcData.send for left and right halves
-      mockPcDataSend
-        .mockResolvedValueOnce({ CipherText: 'AABBCCDD' }) // left
-        .mockResolvedValueOnce({ CipherText: '11223344' }) // right
-        .mockResolvedValueOnce({ CipherText: 'FFFFFF000000' }); // KCV call
-
-      mockPcControlSend.mockResolvedValue({
-        Key: { KeyArn: 'arn:derived-key' },
-      });
-
-      const result = await emv.deriveMasterKey('arn:imk', '4242424242424242', '01');
-
-      // 2 encrypt calls (left half + right half) + 1 KCV call = 3 total
-      expect(mockPcDataSend).toHaveBeenCalledTimes(3);
-      expect(mockPcControlSend).toHaveBeenCalledOnce();
-      expect(result.keyArn).toBe('arn:derived-key');
-      expect(result.kcv).toBe('FFFFFF');
-    });
-  });
-
-  describe('deriveAllKeys', () => {
-    it('returns all 7 fields (icvv + 3 key ARNs + 3 KCVs)', async () => {
-      // deriveIcvv
-      mockPcDataSend.mockResolvedValue({ ValidationData: '789', CipherText: 'AABBCCDD' });
-
-      // All deriveMasterKey calls — each does 2 encrypt + 1 kcv + 1 import
-      mockPcControlSend.mockResolvedValue({
-        Key: { KeyArn: 'arn:derived' },
-      });
-
-      const result = await emv.deriveAllKeys(
-        'arn:tmk',
-        'arn:imk-ac',
-        'arn:imk-smi',
-        'arn:imk-smc',
-        '4242424242424242',
-        '2812',
-        '01',
-      );
-
-      expect(result).toHaveProperty('icvv', '789');
-      expect(result).toHaveProperty('mkAcArn');
-      expect(result).toHaveProperty('mkAcKcv');
-      expect(result).toHaveProperty('mkSmiArn');
-      expect(result).toHaveProperty('mkSmiKcv');
-      expect(result).toHaveProperty('mkSmcArn');
-      expect(result).toHaveProperty('mkSmcKcv');
-
-      // icvv call + (3 master keys x (2 encrypt + 1 kcv)) = 1 + 9 = 10
-      expect(mockPcDataSend.mock.calls.length).toBeGreaterThanOrEqual(4);
-    });
-  });
-});
+// EmvDerivationService unit tests live in emv-derivation.test.ts; per-backend
+// UdkDeriver tests (including AWS PC request shapes) live in
+// udk-deriver.test.ts.  DataPrepService is covered here.

@@ -10,6 +10,7 @@ import activationRouter from './routes/activation.routes.js';
 import cardsRouter from './routes/cards.routes.js';
 import { createProvisioningRouter } from './routes/provisioning.routes.js';
 import { createCardsMineRouter } from './routes/cards-mine.routes.js';
+import { createCardOpRouter } from './routes/card-op.routes.js';
 
 const config = getActivationConfig();
 const app = express();
@@ -49,6 +50,16 @@ app.use('/api/provisioning',
   express.json({ limit: '64kb', verify: captureRawBody }),
   authRateLimit,
   createProvisioningRouter(),
+);
+
+// --- Admin card-ops initiation ---
+// Cognito-gated (admin group + email allowlist).  Router creates a
+// CardOpSession, calls card-ops for S2S register, and returns the
+// WebSocket URL the admin client should connect to.
+app.use('/api/admin/card-op',
+  express.json({ limit: '64kb' }),
+  apiRateLimit,
+  createCardOpRouter(),
 );
 
 serveFrontend(app, import.meta.url);

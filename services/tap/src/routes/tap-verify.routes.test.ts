@@ -28,7 +28,7 @@ vi.mock('../env.js', () => ({
 }));
 
 vi.mock('../key-provider.js', () => ({
-  // Identity provider — encrypted blobs in the mocks ARE the hex keys.
+  // Identity provider — encrypted blobs in the mocks ARE the plaintext hex.
   // Avoids needing AES-GCM envelope test vectors.
   getCardFieldKeyProvider: vi.fn(() => ({})),
 }));
@@ -37,10 +37,29 @@ vi.mock('@palisade/core', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@palisade/core')>();
   return {
     ...actual,
-    // Identity decrypt — `ciphertext` is just the plaintext hex.
+    // Identity decrypt — `ciphertext` IS the plaintext hex.
     decrypt: vi.fn((payload: { ciphertext: string }) => payload.ciphertext),
   };
 });
+
+// The route now asks the sdm-deriver singleton for per-UID meta/file keys
+// instead of reading them out of the DB.  We register a per-UID lookup
+// table up-front; each test populates it with the UIDs it cares about.
+const deriverTable = new Map<string, { meta: Buffer; file: Buffer }>();
+vi.mock('../sdm-deriver.js', () => ({
+  getSdmDeriver: vi.fn(() => ({
+    deriveMetaReadKey: vi.fn(async (uid: Buffer) => {
+      const entry = deriverTable.get(uid.toString('hex'));
+      if (!entry) return Buffer.alloc(16, 0); // non-match
+      return Buffer.from(entry.meta);
+    }),
+    deriveFileReadKey: vi.fn(async (uid: Buffer) => {
+      const entry = deriverTable.get(uid.toString('hex'));
+      if (!entry) return Buffer.alloc(16, 0);
+      return Buffer.from(entry.file);
+    }),
+  })),
+}));
 
 import { prisma } from '@palisade/db';
 import tapVerifyRouter from './tap-verify.routes.js';
@@ -104,6 +123,7 @@ afterEach(() => {
 
 beforeEach(() => {
   vi.resetAllMocks();
+  deriverTable.clear();
 });
 
 const programFind = () => prisma.program.findUnique as unknown as ReturnType<typeof vi.fn>;
@@ -179,14 +199,17 @@ function makeChipFixture(opts: {
 describe('POST /api/tap/verify/:urlCode', () => {
   it('happy path — real PICC + MAC under the matching card → 200 + handoff', async () => {
     const fx = makeChipFixture({ urlCode: 'kp' });
+    deriverTable.set(fx.uid.toString('hex'), {
+      meta: Buffer.from(fx.metaKeyHex, 'hex'),
+      file: Buffer.from(fx.fileKeyHex, 'hex'),
+    });
     programFind().mockResolvedValueOnce({ id: 'karta_platinum', urlCode: 'kp' });
     cardFindMany().mockResolvedValueOnce([{
       id: 'card_1',
       status: 'ACTIVATED',
       lastReadCounter: 0,
       keyVersion: 1,
-      sdmMetaReadKeyEncrypted: fx.metaKeyHex,
-      sdmFileReadKeyEncrypted: fx.fileKeyHex,
+      uidEncrypted: fx.uid.toString('hex'),
     }]);
     cardUpdateMany().mockResolvedValueOnce({ count: 1 });
 
@@ -207,24 +230,32 @@ describe('POST /api/tap/verify/:urlCode', () => {
 
   it('finds the right card when multiple candidates exist (trial-decrypt loop)', async () => {
     const fx = makeChipFixture({ urlCode: 'kp', uid: Buffer.from('aabbccddeeff11', 'hex') });
+    const decoyUid = Buffer.from('11111111111111', 'hex');
+    // Only the "real" UID maps to matching meta/file keys.  The decoy UID
+    // gets a bogus all-zero meta key → picc decrypt tag check fails.
+    deriverTable.set(fx.uid.toString('hex'), {
+      meta: Buffer.from(fx.metaKeyHex, 'hex'),
+      file: Buffer.from(fx.fileKeyHex, 'hex'),
+    });
+    deriverTable.set(decoyUid.toString('hex'), {
+      meta: Buffer.alloc(16, 0),
+      file: Buffer.alloc(16, 0),
+    });
     programFind().mockResolvedValueOnce({ id: 'karta_platinum', urlCode: 'kp' });
     cardFindMany().mockResolvedValueOnce([
-      // Decoy with random keys — won't decrypt the PICC validly
       {
         id: 'card_decoy',
         status: 'ACTIVATED',
         lastReadCounter: 0,
         keyVersion: 1,
-        sdmMetaReadKeyEncrypted: '00'.repeat(16),
-        sdmFileReadKeyEncrypted: '00'.repeat(16),
+        uidEncrypted: decoyUid.toString('hex'),
       },
       {
         id: 'card_real',
         status: 'ACTIVATED',
         lastReadCounter: 0,
         keyVersion: 1,
-        sdmMetaReadKeyEncrypted: fx.metaKeyHex,
-        sdmFileReadKeyEncrypted: fx.fileKeyHex,
+        uidEncrypted: fx.uid.toString('hex'),
       },
     ]);
     cardUpdateMany().mockResolvedValueOnce({ count: 1 });
@@ -244,14 +275,18 @@ describe('POST /api/tap/verify/:urlCode', () => {
   });
 
   it('404 card_not_found when no card decrypts the PICC', async () => {
+    const uid = Buffer.from('ffffffffffffff', 'hex');
+    deriverTable.set(uid.toString('hex'), {
+      meta: Buffer.alloc(16, 0),
+      file: Buffer.alloc(16, 0),
+    });
     programFind().mockResolvedValueOnce({ id: 'karta_platinum', urlCode: 'kp' });
     cardFindMany().mockResolvedValueOnce([{
       id: 'card_x',
       status: 'ACTIVATED',
       lastReadCounter: 0,
       keyVersion: 1,
-      sdmMetaReadKeyEncrypted: '00'.repeat(16),
-      sdmFileReadKeyEncrypted: '00'.repeat(16),
+      uidEncrypted: uid.toString('hex'),
     }]);
     const res = await inject(buildApp(), 'POST', '/api/tap/verify/kp', {
       e: 'A'.repeat(32), m: 'B'.repeat(16),
@@ -262,14 +297,17 @@ describe('POST /api/tap/verify/:urlCode', () => {
 
   it('401 sun_invalid when MAC has been tampered', async () => {
     const fx = makeChipFixture({ urlCode: 'kp' });
+    deriverTable.set(fx.uid.toString('hex'), {
+      meta: Buffer.from(fx.metaKeyHex, 'hex'),
+      file: Buffer.from(fx.fileKeyHex, 'hex'),
+    });
     programFind().mockResolvedValueOnce({ id: 'karta_platinum', urlCode: 'kp' });
     cardFindMany().mockResolvedValueOnce([{
       id: 'card_1',
       status: 'ACTIVATED',
       lastReadCounter: 0,
       keyVersion: 1,
-      sdmMetaReadKeyEncrypted: fx.metaKeyHex,
-      sdmFileReadKeyEncrypted: fx.fileKeyHex,
+      uidEncrypted: fx.uid.toString('hex'),
     }]);
     // PICC is valid, MAC is bogus
     const res = await inject(buildApp(), 'POST', '/api/tap/verify/kp', {
@@ -281,14 +319,17 @@ describe('POST /api/tap/verify/:urlCode', () => {
 
   it('410 sun_counter_replay when the counter is not strictly greater than stored', async () => {
     const fx = makeChipFixture({ urlCode: 'kp', counter: 5 });
+    deriverTable.set(fx.uid.toString('hex'), {
+      meta: Buffer.from(fx.metaKeyHex, 'hex'),
+      file: Buffer.from(fx.fileKeyHex, 'hex'),
+    });
     programFind().mockResolvedValueOnce({ id: 'karta_platinum', urlCode: 'kp' });
     cardFindMany().mockResolvedValueOnce([{
       id: 'card_1',
       status: 'ACTIVATED',
       lastReadCounter: 5, // stored counter is already at 5
       keyVersion: 1,
-      sdmMetaReadKeyEncrypted: fx.metaKeyHex,
-      sdmFileReadKeyEncrypted: fx.fileKeyHex,
+      uidEncrypted: fx.uid.toString('hex'),
     }]);
     cardUpdateMany().mockResolvedValueOnce({ count: 0 }); // race / replay
 
