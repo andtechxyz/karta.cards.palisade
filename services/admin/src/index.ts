@@ -16,6 +16,7 @@ import partnerCredentialsRouter from './routes/partner-credentials.routes.js';
 import partnerIngestionRouter, { partnerHmacMiddleware } from './routes/partner-ingestion.routes.js';
 import issuerProfilesRouter from './routes/issuer-profiles.routes.js';
 import chipProfilesRouter from './routes/chip-profiles.routes.js';
+import capabilitiesRouter from './routes/capabilities.routes.js';
 
 const config = getAdminConfig();
 const app = express();
@@ -32,10 +33,27 @@ app.use(cors({ origin: config.CORS_ORIGINS, credentials: false, allowedHeaders: 
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '64kb' }));
 
+// Prod path-prefix normalisation.  The shared admin SPA (Vera-owned) calls
+// Palisade under /palisade-api/* — Vera's Vite dev proxy rewrites it to
+// /api/*, but AWS ALB listener rules can't rewrite paths.  Rewriting at the
+// request layer keeps every route declaration below on /api/* and works
+// uniformly in dev (post-Vite) and prod (raw from ALB).
+app.use((req, _res, next) => {
+  if (req.url.startsWith('/palisade-api/')) {
+    req.url = '/api' + req.url.slice('/palisade-api'.length);
+  } else if (req.url === '/palisade-api') {
+    req.url = '/api';
+  }
+  next();
+});
+
 // Health is the ALB probe — must answer without auth.
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'admin' });
 });
+
+// Capability probe — unauthenticated, parity with Vera admin.
+app.use('/api/capabilities', capabilitiesRouter);
 
 // Rate limit all API routes before auth checks.
 app.use('/api', apiRateLimit);

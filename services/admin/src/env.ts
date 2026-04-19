@@ -7,7 +7,11 @@ import { z } from 'zod';
 const { get: getAdminConfig, reset: _resetAdminConfig } = defineEnv({
   ...baseEnvShape,
   CORS_ORIGINS: originList,
-  PORT: z.coerce.number().int().positive().default(3005),
+  // 3009 (not 3005) so Palisade admin and Vera admin can both run on the
+  // same dev box.  The shared admin SPA's Vite proxy targets 3009 for the
+  // /palisade-api/* path prefix; 3009 also keeps clear of Palisade's
+  // existing data-prep (3006), rca (3007), and batch-processor (3008).
+  PORT: z.coerce.number().int().positive().default(3009),
   WEBAUTHN_ORIGIN: z.string().url().default('https://manage.karta.cards'),
   // Activation leg — batch CSV ingestion HMAC-signs calls to
   // activation's /api/cards/register as keyId='admin'.

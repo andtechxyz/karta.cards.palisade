@@ -1,10 +1,10 @@
 # ---------------------------------------------------------------------------
-# Vera SFTP service — standalone Dockerfile.  The main multi-stage Dockerfile
-# can't share a runner here because SFTP needs openssh-server and a bash
-# entrypoint that runs sshd alongside the Node ingester.
+# Palisade SFTP service — standalone Dockerfile.  The main multi-stage
+# Dockerfile can't share a runner here because SFTP needs openssh-server
+# and a bash entrypoint that runs sshd alongside the Node ingester.
 #
-# Build:  docker build -f services/sftp/Dockerfile -t vera-sftp .
-# Run:    docker run -p 2222:22 --env-file .env vera-sftp
+# Build:  docker build -f services/sftp/Dockerfile -t palisade-sftp .
+# Run:    docker run -p 2222:22 --env-file .env palisade-sftp
 # ---------------------------------------------------------------------------
 
 # --- Stage 1: install + compile everything (mirrors the main Dockerfile) ---
@@ -17,29 +17,26 @@ WORKDIR /app
 COPY package.json package-lock.json tsconfig.json tsconfig.base.json ./
 
 # package.json fan-out so `npm ci` resolves the whole workspace graph.
-COPY packages/core/package.json              packages/core/
-COPY packages/db/package.json                packages/db/
-COPY packages/webauthn/package.json          packages/webauthn/
-COPY packages/handoff/package.json           packages/handoff/
-COPY packages/vault-client/package.json      packages/vault-client/
-COPY packages/programs/package.json          packages/programs/
-COPY packages/service-auth/package.json      packages/service-auth/
-COPY packages/retention/package.json         packages/retention/
-COPY packages/emv/package.json               packages/emv/
-COPY packages/provisioning-client/package.json packages/provisioning-client/
-COPY packages/cognito-auth/package.json      packages/cognito-auth/
-COPY services/tap/package.json               services/tap/
-COPY services/activation/package.json        services/activation/
-COPY services/pay/package.json               services/pay/
-COPY services/vault/package.json             services/vault/
-COPY services/admin/package.json             services/admin/
-COPY services/data-prep/package.json         services/data-prep/
-COPY services/rca/package.json               services/rca/
-COPY services/batch-processor/package.json   services/batch-processor/
-COPY services/sftp/package.json              services/sftp/
-COPY services/activation/frontend/package.json services/activation/frontend/
-COPY services/pay/frontend/package.json      services/pay/frontend/
-COPY services/admin/frontend/package.json    services/admin/frontend/
+COPY packages/core/package.json                 packages/core/
+COPY packages/db/package.json                   packages/db/
+COPY packages/webauthn/package.json             packages/webauthn/
+COPY packages/handoff/package.json              packages/handoff/
+COPY packages/vault-client/package.json         packages/vault-client/
+COPY packages/card-programs/package.json        packages/card-programs/
+COPY packages/service-auth/package.json         packages/service-auth/
+COPY packages/retention/package.json            packages/retention/
+COPY packages/emv/package.json                  packages/emv/
+COPY packages/provisioning-client/package.json  packages/provisioning-client/
+COPY packages/cognito-auth/package.json         packages/cognito-auth/
+COPY packages/sdm-keys/package.json             packages/sdm-keys/
+COPY services/tap/package.json                  services/tap/
+COPY services/activation/package.json           services/activation/
+COPY services/admin/package.json                services/admin/
+COPY services/data-prep/package.json            services/data-prep/
+COPY services/rca/package.json                  services/rca/
+COPY services/batch-processor/package.json      services/batch-processor/
+COPY services/sftp/package.json                 services/sftp/
+COPY services/activation/frontend/package.json  services/activation/frontend/
 
 RUN npm ci
 
@@ -62,8 +59,9 @@ RUN apk add --no-cache tini openssl openssh-server bash jq \
 
 WORKDIR /app
 
-# Whole workspace (prisma engine, @palisade/* symlinks, all deps).  Same pattern
-# as the shared Dockerfile — workspace resolution breaks if we cherry-pick.
+# Whole workspace (prisma engine, @palisade/* symlinks, all deps).  Same
+# pattern as the shared Dockerfile — workspace resolution breaks if we
+# cherry-pick.
 COPY --from=builder /app/package.json          ./
 COPY --from=builder /app/node_modules/         node_modules/
 

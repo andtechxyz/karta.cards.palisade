@@ -1,0 +1,160 @@
+# Palisade CI/CD — build, test, and deploy all services to AWS ECS.
+#
+# Shares the AWS account (600743178530), ECS cluster (`vera`), VPC, and
+# ALBs with the Vera repo — see scripts/aws-setup.sh header.  All Palisade
+# resources are prefixed `palisade-*`.  Secrets live in a separate
+# `palisade/*` namespace in Secrets Manager.
+#
+# Required GitHub Secrets (same IAM user as Vera is fine):
+#   AWS_ACCESS_KEY_ID      — IAM access key with permissions for ECR push and ECS deploy
+#   AWS_SECRET_ACCESS_KEY  — Corresponding IAM secret key
+#
+# The IAM user needs these policies:
+#   - ecr:GetAuthorizationToken, ecr:BatchCheckLayerAvailability, ecr:PutImage,
+#     ecr:InitiateLayerUpload, ecr:UploadLayerPart, ecr:CompleteLayerUpload,
+#     ecr:BatchGetImage, ecr:GetDownloadUrlForLayer
+#   - ecs:UpdateService, ecs:DescribeServices, ecs:DescribeTaskDefinition,
+#     ecs:RegisterTaskDefinition
+#   - iam:PassRole (for the ECS task execution role)
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: ap-southeast-2
+  ECR_REGISTRY: 600743178530.dkr.ecr.ap-southeast-2.amazonaws.com
+  ECS_CLUSTER: vera
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Test — install, type-check, run tests
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - run: npm ci
+      - run: npm audit --audit-level=high
+        continue-on-error: true
+      - run: npx prisma generate --schema packages/db/prisma/schema.prisma
+      - run: npx tsc -b
+      - run: npx vitest run
+
+  # ---------------------------------------------------------------------------
+  # Build & Deploy — one job per service via matrix
+  # ---------------------------------------------------------------------------
+  build-and-deploy:
+    name: Deploy ${{ matrix.service }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Port numbers match scripts/aws-setup.sh task defs + Vera admin's
+        # Vite proxy expectations (admin on 3009).  sftp rides its own
+        # Dockerfile because it needs sshd + a bash entrypoint that runs
+        # sshd alongside the ingester.
+        include:
+          - service: tap
+            port: 3001
+          - service: activation
+            port: 3002
+          - service: admin
+            port: 3009
+          - service: data-prep
+            port: 3006
+          - service: rca
+            port: 3007
+          - service: batch-processor
+            port: 3008
+          - service: sftp
+            port: 22
+            dockerfile: services/sftp/Dockerfile
+
+    env:
+      IMAGE_TAG: ${{ github.sha }}
+      ECR_REPO: palisade-${{ matrix.service }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        run: |
+          SHORT_SHA=${GITHUB_SHA::7}
+          FULL_IMAGE=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}
+          DOCKERFILE="${{ matrix.dockerfile || 'Dockerfile' }}"
+
+          docker build \
+            --build-arg SERVICE=${{ matrix.service }} \
+            -f "${DOCKERFILE}" \
+            -t ${FULL_IMAGE}:${SHORT_SHA} \
+            -t ${FULL_IMAGE}:latest \
+            .
+
+          docker push ${FULL_IMAGE}:${SHORT_SHA}
+          docker push ${FULL_IMAGE}:latest
+
+          echo "full_image=${FULL_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+        id: build
+
+      - name: Update ECS task definition and deploy
+        run: |
+          SERVICE_NAME=palisade-${{ matrix.service }}
+          FULL_IMAGE=${{ steps.build.outputs.full_image }}:${{ steps.build.outputs.short_sha }}
+
+          # Fetch the current task definition
+          TASK_DEF_ARN=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${SERVICE_NAME} \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition "${TASK_DEF_ARN}" \
+            --query 'taskDefinition')
+
+          # Update the container image in the task definition and register a new revision
+          NEW_TASK_DEF=$(echo "${TASK_DEF}" | \
+            jq --arg IMAGE "${FULL_IMAGE}" \
+              '.containerDefinitions[0].image = $IMAGE' | \
+            jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "${NEW_TASK_DEF}" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          # Update the ECS service to use the new task definition
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${SERVICE_NAME} \
+            --task-definition "${NEW_TASK_DEF_ARN}" \
+            --force-new-deployment \
+            --query 'service.serviceName' \
+            --output text
+
+          echo "Deployed ${FULL_IMAGE} to ${SERVICE_NAME} (task def: ${NEW_TASK_DEF_ARN})"
