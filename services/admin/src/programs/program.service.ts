@@ -1,19 +1,17 @@
 import { Prisma, type Program } from '@prisma/client';
 import { prisma } from '@palisade/db';
 import { conflict, notFound } from '@palisade/core';
-import { normaliseCurrency, tierRuleSetSchema } from '@palisade/card-programs';
 import { renderNdefUrls, validateNdefUrlTemplate, type NdefUrlPair } from './ndef.js';
 
 // -----------------------------------------------------------------------------
 // Program CRUD — admin service.
 // Full read/write access: create, update, list, get, NDEF URL resolution.
+// Tier rules + currency live on Vera's TokenisationProgram (Phase 4c).
 // -----------------------------------------------------------------------------
 
 export interface UpsertProgramInput {
   id: string;
   name: string;
-  currency: string;
-  tierRules: unknown; // Zod-validated inside
   programType?: string; // Zod-validated by route; defaults to PREPAID_RELOADABLE in DB
   preActivationNdefUrlTemplate?: string | null;
   postActivationNdefUrlTemplate?: string | null;
@@ -22,7 +20,6 @@ export interface UpsertProgramInput {
 }
 
 export async function createProgram(input: UpsertProgramInput): Promise<Program> {
-  const rules = tierRuleSetSchema.parse(input.tierRules);
   if (input.preActivationNdefUrlTemplate) {
     validateNdefUrlTemplate(input.preActivationNdefUrlTemplate);
   }
@@ -34,8 +31,6 @@ export async function createProgram(input: UpsertProgramInput): Promise<Program>
       data: {
         id: input.id,
         name: input.name,
-        currency: normaliseCurrency(input.currency),
-        tierRules: rules,
         // Column has a DB default (PREPAID_RELOADABLE) — only pass when the
         // caller explicitly set one so creates without a programType still
         // hit the default path.
@@ -60,8 +55,6 @@ export async function updateProgram(
 ): Promise<Program> {
   const data: Prisma.ProgramUpdateInput = {};
   if (patch.name !== undefined) data.name = patch.name;
-  if (patch.currency !== undefined) data.currency = normaliseCurrency(patch.currency);
-  if (patch.tierRules !== undefined) data.tierRules = tierRuleSetSchema.parse(patch.tierRules);
   if (patch.programType !== undefined) data.programType = patch.programType;
   if (patch.preActivationNdefUrlTemplate !== undefined) {
     if (patch.preActivationNdefUrlTemplate) {

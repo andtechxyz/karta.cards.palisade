@@ -38,7 +38,7 @@ router.patch('/:id', validateBody(patchSchema), async (req, res) => {
         id: true,
         cardRef: true,
         programId: true,
-        program: { select: { id: true, name: true, currency: true } },
+        program: { select: { id: true, name: true } },
       },
     });
     res.json(card);
