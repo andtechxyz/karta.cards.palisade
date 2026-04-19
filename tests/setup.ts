@@ -59,6 +59,11 @@ const defaults: Record<string, string> = {
   PAY_ADMIN_API_KEY: HEX32_J,
   // CORS — all test origins.
   CORS_ORIGINS: 'https://pay.karta.cards,https://activation.karta.cards,https://manage.karta.cards',
+  // data-prep UDK backend — default to the mock backend for unit tests.
+  // Individual tests that want real EMV Method A swap to the 'local' backend
+  // (DEV_UDK_ROOT_SEED below) before constructing EmvDerivationService.
+  DATA_PREP_UDK_BACKEND: 'mock',
+  DEV_UDK_ROOT_SEED: HEX32_A,
 };
 
 for (const [k, v] of Object.entries(defaults)) {

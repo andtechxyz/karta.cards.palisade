@@ -59,7 +59,7 @@ export class DataPrepService {
 
   constructor() {
     const config = getDataPrepConfig();
-    this.emv = new EmvDerivationService(config.AWS_REGION, config.DATA_PREP_MOCK_EMV);
+    this.emv = EmvDerivationService.fromEnv();
     this.kms = new KMSClient({ region: config.AWS_REGION });
   }
 
