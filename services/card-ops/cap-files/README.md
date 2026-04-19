@@ -1,37 +1,43 @@
 # CAP files shipped with card-ops
 
-The card-ops service ships the following CAP files so admin install
-operations always deploy the current applet binaries:
+This directory is the resolution root for every CAP file card-ops loads
+at runtime. Two resolution paths:
 
-- `pa.cap` — Palisade Provisioning Agent applet (package AID `A0000000625041`)
-- `PalisadeT4T.cap` — Tap-For-Tap applet (TODO: drop in from palisade-t4t build)
-- `test-receiver.cap` — test receiver applet (TODO: drop in from test harness)
-- `mchip_advance_v1.2.3.cap` — NXP M/Chip Advance v1.2.3 payment applet
-  (CVN 18).  Referenced by `ChipProfile.paymentAppletCapFilename` on
-  545490 Pty Ltd's Mastercard AU program.  **TODO**: sourced from NXP;
-  drop in here when the CAP ships.
-- `vsdc_v2.9.2.cap` — Visa VSDC 2.9.2 payment applet (CVN 22).
-  Referenced by `ChipProfile.paymentAppletCapFilename` on Karta USA's
-  Visa US program.  **TODO**: sourced from Visa / the VPA; drop in here
-  when the CAP ships.
+- **Dictionary keys** (`loadCap(key)` in `src/gp/cap-loader.ts`) — three
+  canonical keys baked into `CAP_NAMES`:
+  - `pa` → `pa.cap`
+  - `t4t` → `PalisadeT4T.cap`
+  - `receiver` → `test-receiver.cap`
+- **Filename lookup** (`loadCapByFilename(filename)`) — used by the
+  generic `install_payment_applet` op; reads the filename from
+  `ChipProfile.paymentAppletCapFilename` and resolves it here.
 
-## Sourcing
+## Files currently in this directory
 
-- `pa.cap` is built from `Palisade/tools/jcbuild/` in the reference tree and
-  also lives at `Palisade/pa.cap` for direct consumption.
-- `PalisadeT4T.cap` and `test-receiver.cap` TODOs are tracked for a future
-  session — placeholders live here so the build wiring and CAP parser still
-  link, and the install operations will reject with `CAP_FILE_MISSING` at
-  runtime if their file is absent.
-- `mchip_advance_v1.2.3.cap` comes from NXP as part of the M/Chip Advance
-  license delivery.  File must be a standard JC-converter CAP (zipped
-  Header.cap, Directory.cap, Applet.cap, etc.).  The install operation
-  resolves it via `ChipProfile.paymentAppletCapFilename`, so adding a
-  new version is an admin UI write followed by dropping the binary
-  here — no code change required.
-- `vsdc_v2.9.2.cap` comes from Visa via the VPA (Visa Personalization
-  Assistant) toolchain or the direct licensee drop.  Same drop-in
-  convention as the M/Chip CAP above.
+| Filename | Status | Source |
+|---|---|---|
+| `pa.cap` | present | built from `Palisade/tools/jcbuild/` in the reference tree; also lives at `Palisade/pa.cap` |
+| `PalisadeT4T.cap` | **missing** | drop in from palisade-t4t build; `t4t` key is wired but ops will throw `CAP_FILE_MISSING` until the file arrives |
+| `test-receiver.cap` | **missing** | drop in from test harness; same behaviour |
+| `mchip_advance_v1.2.3.cap` | **missing** | NXP M/Chip Advance v1.2.3 (CVN 18); linked from 545490 Pty Ltd's `ChipProfile.paymentAppletCapFilename`; ships in the M/Chip Advance license delivery |
+| `vsdc_v2.9.2.cap` | **missing** | Visa VSDC 2.9.2 (CVN 22); linked from Karta USA Inc's `ChipProfile.paymentAppletCapFilename`; ships via the VPA toolchain or direct licensee drop |
+
+The two payment-applet CAPs are expected to arrive this week per the
+external gates tracked in `docs/SESSION-HANDOFF-2026-04-19.md` (Vera
+side). Neither is blocking card-ops service startup — the
+`install_payment_applet` op only needs the CAP at call time, and
+returns `CAP_FILE_MISSING` cleanly over the WS if absent.
+
+## Adding a new payment-applet CAP
+
+The install operation resolves the CAP via
+`ChipProfile.paymentAppletCapFilename`, so adding a new version is:
+
+1. Drop the CAP binary into this directory.
+2. Update the `ChipProfile` row (via admin SPA or `psql`) so
+   `paymentAppletCapFilename` matches the new filename.
+3. No code change or deploy required if the filename is already in the
+   DB — the CAP loader reads from disk on each call.
 
 ## Build-time embedding
 
@@ -41,5 +47,7 @@ The Dockerfile copies this whole directory into the runtime image:
 COPY --from=builder /app/services/card-ops/cap-files/ services/card-ops/cap-files/
 ```
 
-The service resolves files via `process.env.CAP_FILES_DIR` (set in env) or
-defaults to the `cap-files/` directory alongside the compiled `dist/`.
+The service resolves files via `process.env.CAP_FILES_DIR` (set in env)
+or defaults to `services/card-ops/cap-files/` relative to the compiled
+service — this works identically in dev (`tsx` running from `src/`) and
+in prod (compiled `dist/`).
