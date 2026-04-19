@@ -1,18 +1,9 @@
-// Admin barrel — re-exports the @palisade/card-programs surface plus admin-only bits
-// (Prisma-backed CRUD + NDEF template rendering).  Routes and other admin
-// modules import from here for a single-stop surface.
+// Admin barrel — Program CRUD + NDEF template rendering.  Tier rules and
+// currency live on Vera's TokenisationProgram (see @vera/programs), so this
+// barrel covers card-domain program operations only.
 
-export {
-  DEFAULT_TIER_RULES,
-  matchRule,
-  parseTierRuleSet,
-  tierRuleSchema,
-  tierRuleSetSchema,
-  currencySchema,
-  normaliseCurrency,
-  resolveRulesFromProgram,
-} from '@palisade/card-programs';
-export type { TierRule, TierRuleSet } from '@palisade/card-programs';
+export { programTypeSchema } from '@palisade/card-programs';
+export type { ProgramType } from '@palisade/card-programs';
 
 export {
   createProgram,

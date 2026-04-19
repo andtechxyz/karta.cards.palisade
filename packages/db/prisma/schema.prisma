@@ -215,20 +215,14 @@ model EmbossingBatch {
 // primary key — it's the stable identifier the provisioning-agent already
 // hands us, so we use it verbatim rather than translating to a cuid.
 //
-// `tierRules` is a JSON array of TierRule objects (schema enforced at write
-// time by src/programs/tier-rules.ts).  Rules map amount ranges to the set of
-// CredentialKinds acceptable for authentication — e.g. Bank A may say
-// "under AUD 200: PLATFORM only; AUD 200+: CROSS_PLATFORM only", while
-// Bank B can configure its own thresholds without code changes.
-//
-// A card with no linked Program (programId NULL, or pointing to a deleted
-// program) falls back to DEFAULT_TIER_RULES.
+// Tier rules and currency are not stored here.  They live on Vera's
+// TokenisationProgram (keyed by the same id) as a token-control concern;
+// admin UI edits them via the Vera backend.  Palisade's Program covers the
+// card-domain surface only (NDEF templates, program type, FI, embossing).
 
 model Program {
-  id        String @id // Palisade programId, e.g. "prog_mc_plat_01"
-  name      String
-  currency  String @db.VarChar(3) // ISO 4217 — all rules and card txns in this currency
-  tierRules Json // TierRule[] — shape validated by Zod on write
+  id   String @id // Palisade programId, e.g. "prog_mc_plat_01"
+  name String
 
   // Product classification.  Drives UI, reporting, and behaviour at tap
   // (e.g. RETAIL cards gate the activation flow on the SHIPPED → SOLD

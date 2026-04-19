@@ -4,12 +4,10 @@ import { validateBody } from '@palisade/core';
 import { programTypeSchema } from '@palisade/card-programs';
 import {
   createProgram,
-  currencySchema,
   getProgram,
   listPrograms,
   resolveNdefUrlsByCardRef,
   resolveNdefUrlsForCard,
-  tierRuleSetSchema,
   updateProgram,
 } from '../programs/index.js';
 
@@ -24,8 +22,6 @@ const router: Router = Router();
 
 const upsertBaseSchema = z.object({
   name: z.string().min(1).max(128),
-  currency: currencySchema,
-  tierRules: tierRuleSetSchema,
   programType: programTypeSchema.optional(),
   preActivationNdefUrlTemplate: z.string().url().nullable().optional(),
   postActivationNdefUrlTemplate: z.string().url().nullable().optional(),
