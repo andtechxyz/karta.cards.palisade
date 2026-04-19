@@ -1,5 +1,5 @@
 {
-  "name": "@palisade/activation",
+  "name": "@palisade/card-ops",
   "version": "0.0.1",
   "private": true,
   "type": "module",
@@ -10,24 +10,19 @@
   "dependencies": {
     "@palisade/core": "*",
     "@palisade/db": "*",
-    "@palisade/handoff": "*",
-    "@palisade/retention": "*",
     "@palisade/service-auth": "*",
-    "@palisade/vault-client": "*",
-    "@palisade/admin-config": "*",
-    "@palisade/cognito-auth": "*",
-    "@palisade/webauthn": "*",
+    "adm-zip": "^0.5.17",
     "dotenv": "^16.4.5",
-    "undici": "^7.3.0",
     "express": "^4.21.2",
     "express-async-errors": "^3.1.0",
-    "cors": "^2.8.5",
+    "ws": "^8.18.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {
-    "@types/cors": "^2.8.17",
+    "@types/adm-zip": "^0.5.7",
     "@types/express": "^4.17.21",
     "@types/node": "^22.10.5",
+    "@types/ws": "^8.5.13",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }

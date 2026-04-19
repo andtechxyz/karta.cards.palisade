@@ -402,6 +402,146 @@ describe('createCognitoAuthMiddleware', () => {
     expect(next).not.toHaveBeenCalled();
   });
 
+  // ---------------------------------------------------------------------
+  // emailAllowlist
+  // ---------------------------------------------------------------------
+
+  it('allows when user email is on the emailAllowlist', async () => {
+    vi.mocked(jwtVerify).mockResolvedValue({
+      payload: {
+        sub: 'admin-1',
+        email: 'admin@karta.cards',
+        token_use: 'id',
+        aud: 'test-client-id',
+      },
+      protectedHeader: { alg: 'RS256' },
+      key: {} as any,
+    } as any);
+
+    const gated = createCognitoAuthMiddleware({
+      userPoolId: 'ap-southeast-2_TestPool',
+      clientId: 'test-client-id',
+      emailAllowlist: ['admin@karta.cards', 'ops@karta.cards'],
+    });
+
+    const req = mockReq({ authorization: 'Bearer t' });
+    const res = mockRes();
+    const next = mockNext();
+    await gated(req, res, next);
+
+    expect(next).toHaveBeenCalledOnce();
+    expect(res.status).not.toHaveBeenCalled();
+  });
+
+  it('403 forbidden when user email is not on the emailAllowlist', async () => {
+    vi.mocked(jwtVerify).mockResolvedValue({
+      payload: {
+        sub: 'intruder',
+        email: 'evil@example.com',
+        token_use: 'id',
+        aud: 'test-client-id',
+      },
+      protectedHeader: { alg: 'RS256' },
+      key: {} as any,
+    } as any);
+
+    const gated = createCognitoAuthMiddleware({
+      userPoolId: 'ap-southeast-2_TestPool',
+      clientId: 'test-client-id',
+      emailAllowlist: ['admin@karta.cards'],
+    });
+
+    const req = mockReq({ authorization: 'Bearer t' });
+    const res = mockRes();
+    const next = mockNext();
+    await gated(req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ error: 'forbidden' }),
+    );
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('403 forbidden when email claim is missing under emailAllowlist', async () => {
+    vi.mocked(jwtVerify).mockResolvedValue({
+      payload: {
+        sub: 'user-no-email',
+        token_use: 'id',
+        aud: 'test-client-id',
+      },
+      protectedHeader: { alg: 'RS256' },
+      key: {} as any,
+    } as any);
+
+    const gated = createCognitoAuthMiddleware({
+      userPoolId: 'ap-southeast-2_TestPool',
+      clientId: 'test-client-id',
+      emailAllowlist: ['admin@karta.cards'],
+    });
+
+    const req = mockReq({ authorization: 'Bearer t' });
+    const res = mockRes();
+    const next = mockNext();
+    await gated(req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('emailAllowlist match is case-insensitive', async () => {
+    vi.mocked(jwtVerify).mockResolvedValue({
+      payload: {
+        sub: 'admin-casing',
+        email: 'Admin@Karta.Cards',
+        token_use: 'id',
+        aud: 'test-client-id',
+      },
+      protectedHeader: { alg: 'RS256' },
+      key: {} as any,
+    } as any);
+
+    const gated = createCognitoAuthMiddleware({
+      userPoolId: 'ap-southeast-2_TestPool',
+      clientId: 'test-client-id',
+      emailAllowlist: ['admin@karta.cards'],
+    });
+
+    const req = mockReq({ authorization: 'Bearer t' });
+    const res = mockRes();
+    const next = mockNext();
+    await gated(req, res, next);
+
+    expect(next).toHaveBeenCalledOnce();
+  });
+
+  it('empty emailAllowlist rejects everybody (fail-closed)', async () => {
+    vi.mocked(jwtVerify).mockResolvedValue({
+      payload: {
+        sub: 'any-user',
+        email: 'anyone@example.com',
+        token_use: 'id',
+        aud: 'test-client-id',
+      },
+      protectedHeader: { alg: 'RS256' },
+      key: {} as any,
+    } as any);
+
+    const gated = createCognitoAuthMiddleware({
+      userPoolId: 'ap-southeast-2_TestPool',
+      clientId: 'test-client-id',
+      emailAllowlist: [],
+    });
+
+    const req = mockReq({ authorization: 'Bearer t' });
+    const res = mockRes();
+    const next = mockNext();
+    await gated(req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(next).not.toHaveBeenCalled();
+  });
+
   it('rejects a token without a token_use claim', async () => {
     vi.mocked(jwtVerify).mockResolvedValue({
       payload: { sub: 'user-uuid' },

@@ -408,6 +408,7 @@ model Card {
   activationSessions   ActivationSession[]
   sadRecords           SadRecord[]
   provisioningSessions ProvisioningSession[]
+  cardOpSessions       CardOpSession[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -669,6 +670,58 @@ model ProvisioningSession {
 
   @@index([cardId])
   @@index([phase])
+}
+
+// Admin-operated card management session — the same general shape as
+// ProvisioningSession but for OUT-OF-BAND GlobalPlatform operations
+// driven by a signed-in admin via the card-ops service:
+//
+//   list_applets, install_pa, install_t4t, install_receiver,
+//   reset_pa_state, uninstall_pa, uninstall_t4t, uninstall_receiver,
+//   wipe_card
+//
+// Phases (String rather than enum so ops can evolve without a
+// migration): READY → RUNNING → COMPLETE | FAILED.  `scpState` holds the
+// opaque SCP03 session key material + MAC chaining IV during the WS
+// lifetime and is cleared (set to null) on completion — it must never
+// outlive the session.  `apduLog` is an append-only audit of every
+// APDU pair exchanged, kept for compliance (who did what, to which card).
+model CardOpSession {
+  id       String @id @default(cuid())
+  cardId   String
+  card     Card   @relation(fields: [cardId], references: [id])
+
+  // One of: list_applets | install_pa | install_t4t | install_receiver |
+  //         reset_pa_state | uninstall_pa | uninstall_t4t |
+  //         uninstall_receiver | wipe_card
+  operation String
+
+  // Cognito sub of the admin who initiated the session (audit trail).
+  initiatedBy String
+
+  // READY → RUNNING → COMPLETE | FAILED
+  phase String @default("READY")
+
+  // Append-only APDU audit trail for the session.  Shape:
+  //   [{ ts, direction: 'out'|'in', hex, sw?, phase? }]
+  apduLog Json?
+
+  // Opaque SCP03 state — session keys (S-ENC, S-MAC, S-RMAC),
+  // MAC chaining value, sequence counter, security level.  Lives only
+  // during the WS; cleared on COMPLETE or FAILED to avoid key material
+  // persisting longer than necessary.
+  scpState Json?
+
+  completedAt   DateTime?
+  failedAt      DateTime?
+  failureReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([cardId])
+  @@index([phase])
+  @@index([initiatedBy])
 }
 
 // ---------------------------------------------------------------------------
