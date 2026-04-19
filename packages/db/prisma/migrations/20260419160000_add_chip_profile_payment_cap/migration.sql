@@ -1,0 +1,15 @@
+-- Add ChipProfile.paymentAppletCapFilename
+--
+-- Filename (relative to services/card-ops/cap-files/) for the payment
+-- applet ELF — NXP M/Chip Advance (.cap) or Visa VSDC (.cap).  The
+-- install_payment_applet card-op resolves this at runtime to locate the
+-- CAP on disk, then runs the standard INSTALL [load] / LOAD / INSTALL
+-- [install+selectable] pipeline with the EMV AID (IssuerProfile.aid) as
+-- the instance AID.
+--
+-- Nullable by design: most existing ChipProfile rows pre-date the
+-- ceremony.  A run of install_payment_applet on a card whose
+-- ChipProfile.paymentAppletCapFilename is NULL fails fast with
+-- NOT_PROVISIONED, which is the intended "we haven't loaded the vendor
+-- CAP yet" signal.
+ALTER TABLE "ChipProfile" ADD COLUMN "paymentAppletCapFilename" TEXT;
