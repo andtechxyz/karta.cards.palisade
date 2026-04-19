@@ -10,8 +10,6 @@ const registerSchema = z.object({
   cardRef: z.string().regex(/^[A-Za-z0-9_-]{4,64}$/, 'cardRef must be 4-64 alphanumeric / _ / -'),
   uid: hexKey(7),
   chipSerial: z.string().max(64).optional(),
-  sdmMetaReadKey: hexKey(16),
-  sdmFileReadKey: hexKey(16),
   programId: z.string().max(64).optional(),
   batchId: z.string().max(64).optional(),
   card: z.object({

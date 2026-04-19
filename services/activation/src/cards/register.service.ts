@@ -1,6 +1,6 @@
 import { CardStatus } from '@prisma/client';
 import { prisma } from '@palisade/db';
-import { encrypt, ApiError, conflict, internal } from '@palisade/core';
+import { encrypt, ApiError, conflict } from '@palisade/core';
 import { createVaultClient, VaultClientError, type VaultClient } from '@palisade/vault-client';
 import { createProvisioningClient, ProvisioningClientError, type ProvisioningClient } from '@palisade/provisioning-client';
 import { getActivationConfig } from '../env.js';
@@ -12,17 +12,16 @@ import { getCardFieldKeyProvider } from './key-provider.js';
 // SUN-tap (separate flow) flips it to ACTIVATED and registers the passkey.
 //
 // PANs go over HTTP to the vault service (never persisted directly from
-// activation).  UID + SDM keys are still encrypted inline — those are part of
-// the Card row, not the VaultEntry, and vault-service doesn't own them.
-// Audit attribution on the vault side comes from the HMAC keyId ('activation');
-// this service does not self-report an actor.
+// activation).  UID is encrypted inline — the SDM meta/file read keys are
+// NEVER persisted; tap-service derives them per-tap from the stored UID via
+// AES-CMAC(MASTER_<role>, UID) (NXP AN12196/AN14683).  Audit attribution on
+// the vault side comes from the HMAC keyId ('activation'); this service does
+// not self-report an actor.
 
 export interface RegisterCardInput {
   cardRef: string;
   uid: string;
   chipSerial?: string;
-  sdmMetaReadKey: string;
-  sdmFileReadKey: string;
   programId?: string;
   batchId?: string;
   card: {
@@ -99,18 +98,10 @@ export async function registerCard(input: RegisterCardInput): Promise<RegisterCa
   }
 
   // Encrypt BEFORE the vault call so a key-version drift fails fast without
-  // creating an orphaned VaultEntry we can't link a Card to.  These fields
-  // live under the card-field DEK (distinct from vault's PAN DEK).
+  // creating an orphaned VaultEntry we can't link a Card to.  UID lives under
+  // the card-field DEK (distinct from vault's PAN DEK).
   const cardFieldKp = getCardFieldKeyProvider();
   const uidEnc = encrypt(uidNormalised, cardFieldKp);
-  const metaKeyEnc = encrypt(input.sdmMetaReadKey.toLowerCase(), cardFieldKp);
-  const fileKeyEnc = encrypt(input.sdmFileReadKey.toLowerCase(), cardFieldKp);
-  if (
-    uidEnc.keyVersion !== metaKeyEnc.keyVersion ||
-    metaKeyEnc.keyVersion !== fileKeyEnc.keyVersion
-  ) {
-    throw internal('vault_key_drift', 'vault key version drift mid-call');
-  }
 
   let vaulted;
   try {
@@ -150,8 +141,6 @@ export async function registerCard(input: RegisterCardInput): Promise<RegisterCa
       uidEncrypted: uidEnc.ciphertext,
       uidFingerprint,
       chipSerial: input.chipSerial,
-      sdmMetaReadKeyEncrypted: metaKeyEnc.ciphertext,
-      sdmFileReadKeyEncrypted: fileKeyEnc.ciphertext,
       keyVersion: uidEnc.keyVersion,
       programId: input.programId,
       batchId: input.batchId,

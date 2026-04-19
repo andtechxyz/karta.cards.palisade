@@ -20,10 +20,6 @@ export interface EmbossingRecord {
   cardholderName: string;
   /** PICC UID hex (optional — often provided out-of-band by pers bureau) */
   uid?: string;
-  /** SDM meta-read key hex (optional) */
-  sdmMetaReadKey?: string;
-  /** SDM file-read key hex (optional) */
-  sdmFileReadKey?: string;
   /** Chip serial (optional) */
   chipSerial?: string;
   /** Card reference slug (optional — generated server-side if absent) */

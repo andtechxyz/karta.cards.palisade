@@ -123,10 +123,6 @@ function buildRecord(row: Record<string, string>): EmbossingRecord {
   if (cvc) record.cvc = cvc;
   const uid = (row['uid'] ?? '').trim();
   if (uid) record.uid = uid;
-  const sdmMeta = (row['sdm_meta_read_key'] ?? '').trim();
-  if (sdmMeta) record.sdmMetaReadKey = sdmMeta;
-  const sdmFile = (row['sdm_file_read_key'] ?? '').trim();
-  if (sdmFile) record.sdmFileReadKey = sdmFile;
   const chipSerial = (row['chip_serial'] ?? '').trim();
   if (chipSerial) record.chipSerial = chipSerial;
   const cardRef = (row['card_ref'] ?? '').trim();

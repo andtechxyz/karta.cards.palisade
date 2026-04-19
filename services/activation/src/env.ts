@@ -1,9 +1,18 @@
-import { defineEnv, baseEnvShape, cardFieldCryptoEnvShape, authKeysJson, hexKey, originList } from '@palisade/core';
+import {
+  defineEnv,
+  baseEnvShape,
+  cardFieldCryptoEnvShape,
+  sdmKeyDerivationEnvShape,
+  authKeysJson,
+  hexKey,
+  originList,
+} from '@palisade/core';
 import { z } from 'zod';
 
 const { get: getActivationConfig, reset: _resetActivationConfig } = defineEnv({
   ...baseEnvShape,
   ...cardFieldCryptoEnvShape,
+  ...sdmKeyDerivationEnvShape,
   CORS_ORIGINS: originList,
   // Separate from vault's SERVICE_AUTH_KEYS — both services share one .env in
   // dev; different caller sets need different key maps.

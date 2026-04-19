@@ -12,6 +12,7 @@
     "@palisade/db": "*",
     "@palisade/handoff": "*",
     "@palisade/retention": "*",
+    "@palisade/sdm-keys": "*",
     "@palisade/service-auth": "*",
     "@palisade/vault-client": "*",
     "@palisade/admin-config": "*",
