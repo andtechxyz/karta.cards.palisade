@@ -253,6 +253,8 @@ describe('POST /api/admin/card-op/start', () => {
       'install_pa',
       'install_t4t',
       'install_receiver',
+      'install_payment_applet',
+      'personalise_payment_applet',
       'reset_pa_state',
       'uninstall_pa',
       'uninstall_t4t',

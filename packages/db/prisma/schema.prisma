@@ -516,6 +516,14 @@ model ChipProfile {
   mkSmiDgi         Int     @default(2049) // 0x0801
   mkSmcDgi         Int     @default(2050) // 0x0802
 
+  // Filename under services/card-ops/cap-files/ for the payment applet
+  // ELF (e.g. "mchip_advance_v1.2.3.cap" for NXP M/Chip Advance,
+  // "vsdc_v2.9.2.cap" for Visa VSDC).  Null until the vendor CAP is
+  // registered — the install_payment_applet op reads this to resolve
+  // the CAP off disk and INSTALL [load] + LOAD + INSTALL [install+selectable]
+  // with the EMV AID (IssuerProfile.aid) as the instance AID.
+  paymentAppletCapFilename String?
+
   // Optional scoping — when set, this profile is only visible to this program.
   // Null means the profile is global/catalog (shared across all programs).
   programId String?

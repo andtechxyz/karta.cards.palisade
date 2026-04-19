@@ -46,6 +46,15 @@ const { get: getCardOpsConfig, reset: _resetCardOpsConfig } = defineEnv({
   // staging/production so a missing ARN is a loud warning rather than
   // silent key reuse.
   CARD_OPS_USE_TEST_KEYS: z.string().optional(),
+
+  // KMS key ARN for decrypting SadRecord.sadEncrypted.  Used by the
+  // personalise_payment_applet op to resolve the plaintext DGI blob
+  // that then gets streamed to the payment applet via STORE DATA.
+  //
+  // Empty string = dev mode (AES-128-ECB via @palisade/emv's
+  // decryptSadDev).  Production sets this to the same ARN as
+  // data-prep / rca so decrypts round-trip across services.
+  KMS_SAD_KEY_ARN: z.string().default(''),
 });
 
 export { getCardOpsConfig, _resetCardOpsConfig };

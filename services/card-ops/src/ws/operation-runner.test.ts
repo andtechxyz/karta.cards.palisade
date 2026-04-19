@@ -35,6 +35,23 @@ vi.mock('../operations/install-pa.js', () => ({
     instanceAid: 'A00000006250414C',
   }),
 }));
+vi.mock('../operations/install-payment-applet.js', () => ({
+  runInstallPaymentApplet: vi.fn().mockResolvedValue({
+    type: 'complete',
+    packageAid: 'A0000000041010',
+    moduleAid: 'A0000000041010',
+    instanceAid: 'A0000000041010',
+    capFilename: 'mchip_advance_v1.2.3.cap',
+  }),
+}));
+vi.mock('../operations/personalise-payment-applet.js', () => ({
+  runPersonalisePaymentApplet: vi.fn().mockResolvedValue({
+    type: 'complete',
+    instanceAid: 'A0000000041010',
+    dgiCount: 3,
+    proxyCardId: 'pcx_1',
+  }),
+}));
 vi.mock('../operations/reset-pa-state.js', () => ({
   runResetPaState: vi.fn().mockResolvedValue({ type: 'complete' }),
 }));
@@ -90,6 +107,22 @@ describe('runOperation dispatch', () => {
     const ctx = ctxFor('install_pa');
     await runOperation(ctx);
     expect(ctx.sent[ctx.sent.length - 1].type).toBe('complete');
+  });
+
+  it('install_payment_applet → routes to handler and emits complete', async () => {
+    const ctx = ctxFor('install_payment_applet');
+    await runOperation(ctx);
+    const terminal = ctx.sent[ctx.sent.length - 1];
+    expect(terminal.type).toBe('complete');
+    expect((terminal as any).capFilename).toBe('mchip_advance_v1.2.3.cap');
+  });
+
+  it('personalise_payment_applet → routes to handler and emits complete', async () => {
+    const ctx = ctxFor('personalise_payment_applet');
+    await runOperation(ctx);
+    const terminal = ctx.sent[ctx.sent.length - 1];
+    expect(terminal.type).toBe('complete');
+    expect((terminal as any).dgiCount).toBe(3);
   });
 
   it('reset_pa_state → routes to handler and emits complete', async () => {
