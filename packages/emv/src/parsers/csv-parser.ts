@@ -5,8 +5,11 @@
  * Batch format: each line = one card record following the header order.
  *
  * Required fields: pan, expiry_month, expiry_year, cardholder_name
- * Optional:  cvc, uid, sdm_meta_read_key, sdm_file_read_key, chip_serial,
- *            card_ref
+ * Optional:  cvc, uid, chip_serial, card_ref
+ *
+ * Note: SDM meta/file read keys are intentionally NOT accepted.  They are
+ * derived on demand by tap-service via AES-CMAC(MASTER_<role>, UID) — the
+ * batch file never carries them (NXP AN12196 / AN14683 UDK pattern).
  *
  * Quoting: standard CSV — values containing commas or double-quotes must
  * be wrapped in double quotes, with internal quotes escaped by doubling.
@@ -102,8 +105,6 @@ function buildRecord(row: Record<string, string>): EmbossingRecord {
 
   if (row['cvc']) record.cvc = row['cvc'];
   if (row['uid']) record.uid = row['uid'];
-  if (row['sdm_meta_read_key']) record.sdmMetaReadKey = row['sdm_meta_read_key'];
-  if (row['sdm_file_read_key']) record.sdmFileReadKey = row['sdm_file_read_key'];
   if (row['chip_serial']) record.chipSerial = row['chip_serial'];
   if (row['card_ref']) record.cardRef = row['card_ref'];
 

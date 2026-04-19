@@ -14,6 +14,8 @@ export {
   baseEnvShape,
   vaultPanCryptoEnvShape,
   cardFieldCryptoEnvShape,
+  sdmKeyDerivationEnvShape,
+  assertSdmEnv,
   serviceAuthServerEnvShape,
   authKeysJson,
   hexKey,

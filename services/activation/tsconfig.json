@@ -12,6 +12,7 @@
     { "path": "../../packages/db" },
     { "path": "../../packages/handoff" },
     { "path": "../../packages/retention" },
+    { "path": "../../packages/sdm-keys" },
     { "path": "../../packages/service-auth" },
     { "path": "../../packages/vault-client" },
     { "path": "../../packages/webauthn" }

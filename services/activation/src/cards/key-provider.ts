@@ -3,11 +3,12 @@ import { getActivationConfig } from '../env.js';
 
 // -----------------------------------------------------------------------------
 // Activation-service-local KeyProvider — wraps the CARD_FIELD_DEK keyspace
-// used to encrypt Card.uidEncrypted and the two SDM read keys.
+// used to encrypt Card.uidEncrypted.  SDM read keys are NEVER stored; they
+// are derived on demand from the UID via the SDM deriver (see sdm-deriver.ts).
 //
-// Tap service uses the same keyspace (to decrypt SDM keys for SUN verify);
-// vault service does NOT — its PAN DEK is a separate keyspace entirely
-// (PCI-DSS 3.5/3.6 — keys scoped to the data they protect).
+// Tap service uses the same keyspace (to decrypt the UID before running it
+// through the SDM deriver); vault service does NOT — its PAN DEK is a separate
+// keyspace entirely (PCI-DSS 3.5/3.6 — keys scoped to the data they protect).
 // -----------------------------------------------------------------------------
 
 let _kp: EnvKeyProvider | null = null;

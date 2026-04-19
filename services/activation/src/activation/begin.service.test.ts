@@ -29,18 +29,30 @@ vi.mock('@simplewebauthn/server', () => ({
   })),
 }));
 
-// Core: we mock decrypt and aesCmac but keep the other helpers.
+// Core: mock decrypt + aesCmac, keep everything else real.
 vi.mock('@palisade/core', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@palisade/core')>();
   return {
     ...actual,
-    decrypt: vi.fn(() => '00112233445566778899aabbccddeeff'),
+    decrypt: vi.fn(() => '04aabbccddeeff'), // 7-byte NTAG424 UID
     aesCmac: vi.fn(() => Buffer.from('AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 'hex')),
   };
 });
 
 vi.mock('../cards/key-provider.js', () => ({
   getCardFieldKeyProvider: vi.fn(() => ({})),
+}));
+
+// Stub the SDM deriver — begin.service calls deriveFileReadKey(uid) to get the
+// 16-byte CMAC key.  The real deriver requires DEV_SDM_ROOT_SEED env + deps we
+// don't want in unit tests, so we replace it with a fake that returns a
+// deterministic buffer.  aesCmac is separately mocked above, so the return
+// value here is just what gets passed (and then zeroed).
+vi.mock('../cards/sdm-deriver.js', () => ({
+  getSdmDeriver: vi.fn(() => ({
+    deriveMetaReadKey: vi.fn(async () => Buffer.alloc(16, 0xaa)),
+    deriveFileReadKey: vi.fn(async () => Buffer.alloc(16, 0xaa)),
+  })),
 }));
 
 vi.mock('../programs/ndef.js', () => ({
@@ -77,7 +89,7 @@ describe('beginActivationRegistration', () => {
   it('register mode: no preregistered cred → returns registration options', async () => {
     cardFind().mockResolvedValue({
       id: 'card_1', cardRef: 'kc_1', status: 'SHIPPED',
-      sdmFileReadKeyEncrypted: '...', keyVersion: 1,
+      uidEncrypted: 'enc_uid', keyVersion: 1,
       program: { preActivationNdefUrlTemplate: null, postActivationNdefUrlTemplate: 'X' },
       credentials: [],
     });
@@ -97,7 +109,7 @@ describe('beginActivationRegistration', () => {
     const realCredBytes = Buffer.from('realcred', 'ascii').toString('base64url');
     cardFind().mockResolvedValue({
       id: 'card_1', cardRef: 'kc_1', status: 'SHIPPED',
-      sdmFileReadKeyEncrypted: 'enc',
+      uidEncrypted: 'enc_uid',
       keyVersion: 1,
       program: {
         preActivationNdefUrlTemplate: null,
@@ -131,7 +143,7 @@ describe('beginActivationRegistration', () => {
     const realCredBytes = Buffer.from('realcred', 'ascii').toString('base64url');
     cardFind().mockResolvedValue({
       id: 'card_1', cardRef: 'kc_1', status: 'SHIPPED',
-      sdmFileReadKeyEncrypted: 'enc', keyVersion: 1,
+      uidEncrypted: 'enc_uid', keyVersion: 1,
       program: {
         preActivationNdefUrlTemplate: null,
         postActivationNdefUrlTemplate: 'https://tap.karta.cards/pay/{cardRef}?e={PICCData}&m={CMAC}',
@@ -160,7 +172,7 @@ describe('beginActivationRegistration', () => {
     const realCredBytes = Buffer.from('realcred', 'ascii').toString('base64url');
     cardFind().mockResolvedValue({
       id: 'card_1', cardRef: 'kc_1', status: 'SHIPPED',
-      sdmFileReadKeyEncrypted: 'enc', keyVersion: 1,
+      uidEncrypted: 'enc_uid', keyVersion: 1,
       program: {
         preActivationNdefUrlTemplate: null,
         postActivationNdefUrlTemplate: 'X',
@@ -186,7 +198,7 @@ describe('beginActivationRegistration', () => {
   it('throws when card is already activated', async () => {
     cardFind().mockResolvedValue({
       id: 'card_1', cardRef: 'kc_1', status: 'ACTIVATED',
-      sdmFileReadKeyEncrypted: '', keyVersion: 1,
+      uidEncrypted: 'enc_uid', keyVersion: 1,
       program: null, credentials: [],
     });
     await expect(beginActivationRegistration('sess_1')).rejects.toMatchObject({

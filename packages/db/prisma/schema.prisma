@@ -354,12 +354,12 @@ model Card {
   retailSoldAt     DateTime?
 
   // --- SDM keys (NXP AN12196 / AN14683) ------------------------------------
-  // AES-128 keys written into the card during personalisation.  Both kept
-  // ciphertext-at-rest under the same vault key version.  `metaRead` decrypts
-  // PICC; `fileRead` is the master from which per-tap session keys derive.
-  sdmMetaReadKeyEncrypted String
-  sdmFileReadKeyEncrypted String
-  keyVersion              Int // VaultEncryptionKey.version used above
+  // The two AES-128 SDM keys (metaRead + fileRead) are NEVER stored.  They
+  // are derived on every tap via AES-CMAC(MASTER_<role>, UID), where the
+  // MASTER keys live in the HSM.  The chip is personalised with the same
+  // derivation so the server can reproduce the keys given only its UID.
+  // See @palisade/sdm-keys.
+  keyVersion              Int // VaultEncryptionKey.version used to wrap uidEncrypted above
 
   // Monotonic SDM read counter.  Each successful SUN-tap must present a
   // counter strictly greater than this; the verify path advances atomically

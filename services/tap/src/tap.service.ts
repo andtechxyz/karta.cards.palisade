@@ -4,6 +4,7 @@ import { signHandoff, type HandoffPayload } from '@palisade/handoff';
 import { verifySunUrl, type SunVerificationResult } from './sun/index.js';
 import { getTapConfig } from './env.js';
 import { getCardFieldKeyProvider } from './key-provider.js';
+import { getSdmDeriver } from './sdm-deriver.js';
 
 // SUN-tap handler — invoked by the cardholder's phone after the card emits
 // its NDEF URL.  Verifies the SUN signature, advances the monotonic read
@@ -56,8 +57,6 @@ export async function handleSunTap(input: HandleSunTapInput): Promise<HandleSunT
       status: true,
       lastReadCounter: true,
       uidEncrypted: true,
-      sdmMetaReadKeyEncrypted: true,
-      sdmFileReadKeyEncrypted: true,
       keyVersion: true,
     },
   });
@@ -67,14 +66,14 @@ export async function handleSunTap(input: HandleSunTapInput): Promise<HandleSunT
   }
 
   const cardFieldKp = getCardFieldKeyProvider();
-  const sdmMetaReadKey = Buffer.from(
-    decrypt({ ciphertext: card.sdmMetaReadKeyEncrypted, keyVersion: card.keyVersion }, cardFieldKp),
+  const uid = Buffer.from(
+    decrypt({ ciphertext: card.uidEncrypted, keyVersion: card.keyVersion }, cardFieldKp),
     'hex',
   );
-  const sdmFileReadKey = Buffer.from(
-    decrypt({ ciphertext: card.sdmFileReadKeyEncrypted, keyVersion: card.keyVersion }, cardFieldKp),
-    'hex',
-  );
+
+  const deriver = getSdmDeriver();
+  const sdmMetaReadKey = await deriver.deriveMetaReadKey(uid);
+  const sdmFileReadKey = await deriver.deriveFileReadKey(uid);
 
   let result: SunVerificationResult;
   try {
@@ -86,6 +85,7 @@ export async function handleSunTap(input: HandleSunTapInput): Promise<HandleSunT
   } finally {
     sdmMetaReadKey.fill(0);
     sdmFileReadKey.fill(0);
+    uid.fill(0);
   }
 
   if (!result.valid) {

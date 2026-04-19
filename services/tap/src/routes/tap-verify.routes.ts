@@ -11,6 +11,7 @@ import {
 } from '../sun/index.js';
 import { getTapConfig } from '../env.js';
 import { getCardFieldKeyProvider } from '../key-provider.js';
+import { getSdmDeriver } from '../sdm-deriver.js';
 
 // Mobile-app facing entry point for cardRef-less SUN URLs.  Given the raw
 // SUN params the chip emits — `?e=<picc-hex>&m=<mac-hex>` — verify the tap
@@ -22,9 +23,14 @@ import { getCardFieldKeyProvider } from '../key-provider.js';
 // The urlCode comes from the chip's stored NDEF URL:
 //   https://mobile.karta.cards/t/<urlCode>?e=<picc>&m=<cmac>
 // The mobile app parses the path segment and POSTs it back to us; we use
-// it to (a) scope trial-decrypt to one program (O(cards-in-program) today,
-// O(1) in Phase 2 HSM-derived keys), (b) reconstruct the MAC input to
-// match exactly what the chip signed.
+// it to (a) scope trial-decrypt to one program, (b) reconstruct the MAC
+// input to match exactly what the chip signed.
+//
+// Key derivation is O(N) per tap where N = cards in the program: the URL
+// carries no cardRef, only the encrypted PICC, so find-card must trial-
+// decrypt against each candidate's HSM-derived metaRead key (UID-in-URL is
+// a hard-no for privacy).  See services/tap/src/sun/find-card.ts for the
+// full trade-off analysis.
 //
 // Auth is the SUN signature itself — no Cognito.  Rate-limited upstream.
 
@@ -80,10 +86,12 @@ async function runVerify(
   input: RunVerifyInput,
 ): Promise<void> {
   const kp = getCardFieldKeyProvider();
+  const sdmDeriver = getSdmDeriver();
   const match = await findCardByPicc({
     programId: input.programId,
     piccHex: input.piccHex,
     keyProvider: kp,
+    sdmDeriver,
   });
   if (!match) {
     throw notFound(

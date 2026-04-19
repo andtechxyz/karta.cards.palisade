@@ -9,6 +9,7 @@
   "references": [
     { "path": "../../packages/core" },
     { "path": "../../packages/db" },
-    { "path": "../../packages/handoff" }
+    { "path": "../../packages/handoff" },
+    { "path": "../../packages/sdm-keys" }
   ]
 }
