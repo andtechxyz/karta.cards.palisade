@@ -12,6 +12,7 @@ vi.mock('@palisade/db', () => ({
   prisma: {
     card: {
       findUnique: vi.fn(),
+      updateMany: vi.fn(),
     },
   },
 }));
@@ -27,11 +28,13 @@ import {
   requireSignedRequest,
   signRequest,
 } from '@palisade/service-auth';
-import cardsLookupRouter from './cards-lookup.routes.js';
+import { createCardsPayRouter } from './cards-lookup.routes.js';
 
 type Mocked<T> = ReturnType<typeof vi.fn> & T;
 const cardFindUnique = () =>
   prisma.card.findUnique as unknown as Mocked<typeof prisma.card.findUnique>;
+const cardUpdateMany = () =>
+  prisma.card.updateMany as unknown as Mocked<typeof prisma.card.updateMany>;
 
 const PAY_SECRET = 'f'.repeat(64);
 const PAY_AUTH_KEYS = { pay: PAY_SECRET };
@@ -40,10 +43,9 @@ function buildApp() {
   const app = express();
   const payGate = requireSignedRequest({ keys: PAY_AUTH_KEYS });
   app.use(
-    '/api/cards/lookup',
+    '/api/cards',
     express.json({ limit: '64kb', verify: captureRawBody }),
-    payGate,
-    cardsLookupRouter,
+    createCardsPayRouter(payGate),
   );
   app.use(errorMiddleware);
   return app;
@@ -77,11 +79,12 @@ function makeSignedHeader(
 }
 
 /** Thin fetch wrapper that doesn't need undici/supertest.  Returns status+body. */
-async function get(
+async function request(
+  method: string,
   url: string,
   headers: Record<string, string> = {},
 ): Promise<{ status: number; body: unknown }> {
-  const res = await fetch(url, { headers });
+  const res = await fetch(url, { method, headers });
   const text = await res.text();
   let body: unknown;
   try {
@@ -94,6 +97,7 @@ async function get(
 
 beforeEach(() => {
   vi.mocked(cardFindUnique()).mockReset();
+  vi.mocked(cardUpdateMany()).mockReset();
 });
 
 describe('GET /api/cards/lookup/:cardId', () => {
@@ -114,7 +118,7 @@ describe('GET /api/cards/lookup/:cardId', () => {
     const { url, close } = await serve(app);
     try {
       const path = '/api/cards/lookup/card_1';
-      const res = await get(`${url}${path}`, {
+      const res = await request('GET', `${url}${path}`, {
         authorization: makeSignedHeader('GET', path),
       });
       expect(res.status).toBe(200);
@@ -157,7 +161,7 @@ describe('GET /api/cards/lookup/:cardId', () => {
     const { url, close } = await serve(app);
     try {
       const path = '/api/cards/lookup/card_missing';
-      const res = await get(`${url}${path}`, {
+      const res = await request('GET', `${url}${path}`, {
         authorization: makeSignedHeader('GET', path),
       });
       expect(res.status).toBe(404);
@@ -174,7 +178,7 @@ describe('GET /api/cards/lookup/:cardId', () => {
     const { url, close } = await serve(app);
     try {
       const path = '/api/cards/lookup/card_1';
-      const res = await get(`${url}${path}`);
+      const res = await request('GET', `${url}${path}`);
       expect(res.status).toBe(401);
       expect(res.body).toMatchObject({
         error: { code: 'missing_auth' },
@@ -199,7 +203,7 @@ describe('GET /api/cards/lookup/:cardId', () => {
         keyId: 'bogus',
         secret: PAY_SECRET,
       });
-      const res = await get(`${url}${path}`, { authorization: bogus });
+      const res = await request('GET', `${url}${path}`, { authorization: bogus });
       expect(res.status).toBe(401);
       expect(res.body).toMatchObject({ error: { code: 'unknown_key' } });
       expect(cardFindUnique()).not.toHaveBeenCalled();
@@ -221,10 +225,94 @@ describe('GET /api/cards/lookup/:cardId', () => {
         keyId: 'pay',
         secret: PAY_SECRET,
       });
-      const res = await get(`${url}${path}`, { authorization: mismatched });
+      const res = await request('GET', `${url}${path}`, { authorization: mismatched });
       expect(res.status).toBe(401);
       expect(res.body).toMatchObject({ error: { code: 'bad_signature' } });
       expect(cardFindUnique()).not.toHaveBeenCalled();
+    } finally {
+      await close();
+    }
+  });
+});
+
+describe('PATCH /api/cards/:cardId/atc-increment', () => {
+  it('returns 200 with the new ATC value after atomic increment', async () => {
+    vi.mocked(cardUpdateMany()).mockResolvedValue({ count: 1 } as never);
+    vi.mocked(cardFindUnique()).mockResolvedValue({ atc: 7 } as never);
+
+    const app = buildApp();
+    const { url, close } = await serve(app);
+    try {
+      const path = '/api/cards/card_1/atc-increment';
+      const res = await request('PATCH', `${url}${path}`, {
+        authorization: makeSignedHeader('PATCH', path),
+      });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ atc: 7 });
+
+      // Verify the Prisma call used the atomic increment operator.
+      const updateCall = vi.mocked(cardUpdateMany()).mock.calls[0]![0]!;
+      expect(updateCall.where).toEqual({ id: 'card_1' });
+      expect(updateCall.data).toEqual({ atc: { increment: 1 } });
+    } finally {
+      await close();
+    }
+  });
+
+  it('returns 404 card_not_found when the cardId is unknown', async () => {
+    vi.mocked(cardUpdateMany()).mockResolvedValue({ count: 0 } as never);
+
+    const app = buildApp();
+    const { url, close } = await serve(app);
+    try {
+      const path = '/api/cards/card_missing/atc-increment';
+      const res = await request('PATCH', `${url}${path}`, {
+        authorization: makeSignedHeader('PATCH', path),
+      });
+      expect(res.status).toBe(404);
+      expect(res.body).toMatchObject({
+        error: { code: 'card_not_found' },
+      });
+      // findUnique never runs when the update turned up nothing.
+      expect(cardFindUnique()).not.toHaveBeenCalled();
+    } finally {
+      await close();
+    }
+  });
+
+  it('returns 401 when the request is unsigned', async () => {
+    const app = buildApp();
+    const { url, close } = await serve(app);
+    try {
+      const path = '/api/cards/card_1/atc-increment';
+      const res = await request('PATCH', `${url}${path}`);
+      expect(res.status).toBe(401);
+      expect(res.body).toMatchObject({
+        error: { code: 'missing_auth' },
+      });
+      expect(cardUpdateMany()).not.toHaveBeenCalled();
+    } finally {
+      await close();
+    }
+  });
+
+  it('returns 401 when signed with a bad signature', async () => {
+    const app = buildApp();
+    const { url, close } = await serve(app);
+    try {
+      const path = '/api/cards/card_1/atc-increment';
+      // Sign with the wrong method to force bad_signature.
+      const mismatched = signRequest({
+        method: 'GET',
+        pathAndQuery: path,
+        body: Buffer.alloc(0),
+        keyId: 'pay',
+        secret: PAY_SECRET,
+      });
+      const res = await request('PATCH', `${url}${path}`, { authorization: mismatched });
+      expect(res.status).toBe(401);
+      expect(res.body).toMatchObject({ error: { code: 'bad_signature' } });
+      expect(cardUpdateMany()).not.toHaveBeenCalled();
     } finally {
       await close();
     }

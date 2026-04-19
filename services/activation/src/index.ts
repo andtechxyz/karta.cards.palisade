@@ -8,7 +8,8 @@ import { purgeExpiredActivationSessions, startSweeper } from '@palisade/retentio
 import { getActivationConfig } from './env.js';
 import activationRouter from './routes/activation.routes.js';
 import cardsRouter from './routes/cards.routes.js';
-import cardsLookupRouter from './routes/cards-lookup.routes.js';
+import { createCardsPayRouter } from './routes/cards-lookup.routes.js';
+import { createWebAuthnRouters } from './routes/webauthn-credentials.routes.js';
 import { createProvisioningRouter } from './routes/provisioning.routes.js';
 import { createCardsMineRouter } from './routes/cards-mine.routes.js';
 import { createCardOpRouter } from './routes/card-op.routes.js';
@@ -36,16 +37,25 @@ app.use('/api/cards/mine',
   createCardsMineRouter(),
 );
 
-// --- Cross-repo card lookup (pay-service-authed, HMAC) ---
-// Mounted BEFORE /api/cards so the more-specific /api/cards/lookup prefix
-// catches ahead of the provisioning-authed /api/cards mount.  Keyed off
-// a separate PAY_AUTH_KEYS map so rotating pay's secret doesn't disturb the
+// --- Cross-repo pay endpoints (pay-service-authed, HMAC) ---
+// Mounted BEFORE the provisioning /api/cards mount so pay's specific routes
+// (/lookup/:cardId, /:cardId/atc-increment, /:cardId/webauthn-credentials)
+// catch ahead of the provisioning-authed mount.  The pay gate is attached
+// PER-ROUTE inside the factories so non-matching requests (e.g.
+// POST /api/cards/register for the provisioning caller) fall through to the
+// provisioning router without being rejected at the HMAC gate.  Keyed off a
+// separate PAY_AUTH_KEYS map so rotating pay's secret doesn't disturb the
 // provisioning-agent / batch-processor callers.
 const payGate = requireSignedRequest({ keys: config.PAY_AUTH_KEYS });
-app.use('/api/cards/lookup',
+const webAuthnRouters = createWebAuthnRouters(payGate);
+app.use('/api/cards',
   express.json({ limit: '64kb', verify: captureRawBody }),
-  payGate,
-  cardsLookupRouter,
+  createCardsPayRouter(payGate),
+  webAuthnRouters.cardScoped,
+);
+app.use('/api/webauthn-credentials',
+  express.json({ limit: '64kb', verify: captureRawBody }),
+  webAuthnRouters.credentialScoped,
 );
 
 const provisionGate = requireSignedRequest({ keys: config.PROVISION_AUTH_KEYS });
