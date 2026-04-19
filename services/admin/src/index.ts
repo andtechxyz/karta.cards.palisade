@@ -14,6 +14,8 @@ import embossingTemplatesRouter from './routes/embossing-templates.routes.js';
 import embossingBatchesRouter from './routes/embossing-batches.routes.js';
 import partnerCredentialsRouter from './routes/partner-credentials.routes.js';
 import partnerIngestionRouter, { partnerHmacMiddleware } from './routes/partner-ingestion.routes.js';
+import issuerProfilesRouter from './routes/issuer-profiles.routes.js';
+import chipProfilesRouter from './routes/chip-profiles.routes.js';
 
 const config = getAdminConfig();
 const app = express();
@@ -56,6 +58,13 @@ app.use('/api/admin/financial-institutions', adminAuth, partnerCredentialsRouter
 // Partner ingestion endpoint (HMAC-authenticated — partner's secret, NOT Cognito).
 // Mounted OUTSIDE /api/admin so adminAuth doesn't intercept partner calls.
 app.use('/api/partners', partnerHmacMiddleware(), partnerIngestionRouter);
+// Issuer + Chip profile CRUD — full-fidelity (ARNs, EMV constants, DGIs).
+// Mounted outside /api/admin so the paths are /api/issuer-profiles
+// and /api/chip-profiles.  The older minimal variants inside
+// provisioning.routes.ts remain for now and will be retired once the
+// frontend migrations settle.
+app.use('/api/issuer-profiles', adminAuth, issuerProfilesRouter);
+app.use('/api/chip-profiles', adminAuth, chipProfilesRouter);
 app.use('/api/admin', adminAuth, provisioningRouter);
 // Microsite uploads handle their own multipart body parsing (no global
 // express.json() interference) and must sit on /api/admin/programs/...
