@@ -9,6 +9,8 @@
   "references": [
     { "path": "../../packages/core" },
     { "path": "../../packages/db" },
-    { "path": "../../packages/service-auth" }
+    { "path": "../../packages/emv" },
+    { "path": "../../packages/service-auth" },
+    { "path": "../data-prep" }
   ]
 }
