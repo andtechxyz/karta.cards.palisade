@@ -1,0 +1,44 @@
+# ---------------------------------------------------------------------------
+# sshd_config for Vera SFTP service.  SFTP-only, public-key auth only,
+# chrooted users.  No shell access, no port forwarding, no X11.
+# ---------------------------------------------------------------------------
+
+Port 22
+Protocol 2
+
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
+
+# Disable everything a shell user would want.  UsePAM is intentionally
+# omitted — Alpine's BusyBox-derived OpenSSH build doesn't include PAM
+# support, and emitting `UsePAM` (no or yes) makes sshd refuse to start.
+# Pubkey-only is enforced via PasswordAuthentication=no below.
+PermitRootLogin no
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+
+# Keep noise out of logs and give us a useful audit trail.
+LogLevel VERBOSE
+PrintMotd no
+ClientAliveInterval 30
+ClientAliveCountMax 4
+MaxStartups 10:30:60
+
+# SFTP subsystem — internal-sftp runs inside sshd, no separate binary needed.
+Subsystem sftp internal-sftp -l INFO
+
+# Chroot every member of sftponly to their home directory and force them
+# into internal-sftp.  Non-sftponly users (e.g. root inside the container)
+# are unaffected, but PermitRootLogin=no already blocks them.
+Match Group sftponly
+  ChrootDirectory /home/%u
+  ForceCommand internal-sftp -l INFO
+  AllowTcpForwarding no
+  X11Forwarding no
+  PermitTunnel no
+  AllowAgentForwarding no

@@ -1,0 +1,71 @@
+:root {
+  --bg: #0b0f19;
+  --panel: #131829;
+  --panel-2: #1b2238;
+  --ink: #eef2ff;
+  --mute: #9aa3b8;
+  --edge: #2b3556;
+  --accent: #6ea8ff;
+  --accent-2: #59d3a8;
+  --danger: #ff6b81;
+  --warn: #ffbf6b;
+  --radius: 10px;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: system-ui, -apple-system, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  min-height: 100vh;
+}
+a { color: var(--accent); }
+.app { min-height: 100vh; }
+.page {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 24px 20px 80px;
+}
+.page h1 { margin: 0 0 8px; font-size: 24px; }
+.page h2 { margin: 28px 0 12px; font-size: 18px; color: var(--mute); font-weight: 500; }
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin: 12px 0;
+}
+.panel-2 { background: var(--panel-2); }
+.btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  gap: 8px; padding: 12px 18px; border-radius: var(--radius);
+  border: 1px solid var(--edge); background: var(--panel-2); color: var(--ink);
+  cursor: pointer; font: inherit; font-weight: 600; min-height: 44px;
+}
+.btn.primary { background: var(--accent); color: #0b1020; border-color: transparent; }
+.btn.ghost { background: transparent; }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn-row { display: flex; gap: 10px; flex-wrap: wrap; }
+input, select {
+  width: 100%; padding: 10px 12px; min-height: 42px;
+  background: var(--panel-2); border: 1px solid var(--edge); color: var(--ink);
+  border-radius: var(--radius); font: inherit;
+}
+label { display: block; margin: 10px 0 6px; color: var(--mute); font-size: 14px; }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--edge); margin: 16px 0; }
+.tab { padding: 10px 14px; background: transparent; border: 0; color: var(--mute); cursor: pointer; font: inherit; }
+.tab.active { color: var(--ink); border-bottom: 2px solid var(--accent); }
+.small { color: var(--mute); font-size: 13px; }
+.mono { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 13px; }
+.tag {
+  display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px;
+  background: var(--panel-2); border: 1px solid var(--edge); color: var(--mute);
+}
+.tag.ok { color: var(--accent-2); border-color: var(--accent-2); }
+.tag.warn { color: var(--warn); border-color: var(--warn); }
+.tag.err { color: var(--danger); border-color: var(--danger); }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: 10px 8px; text-align: left; border-bottom: 1px solid var(--edge); font-size: 14px; }
+th { color: var(--mute); font-weight: 500; }
+.row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }

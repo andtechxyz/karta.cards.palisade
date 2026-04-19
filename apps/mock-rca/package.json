@@ -1,0 +1,14 @@
+{
+  "name": "mock-rca",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Mock Palisade RCA middleware for local mobile NFC relay testing",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node --watch src/server.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

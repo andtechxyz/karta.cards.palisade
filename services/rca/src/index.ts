@@ -1,0 +1,103 @@
+/**
+ * rca — Real-time Card Personalisation Agent (provisioning relay orchestrator).
+ *
+ * Internal service on port 3007. Exposes a REST endpoint to start sessions
+ * and a WebSocket endpoint for APDU relay between the mobile app and the
+ * card's Provisioning Agent applet.
+ *
+ * No CORS — service-to-service only (internal ALB, HMAC-gated).
+ */
+
+import 'dotenv/config';
+import 'express-async-errors';
+import { createServer } from 'node:http';
+import express from 'express';
+import { WebSocketServer } from 'ws';
+import { requireSignedRequest, captureRawBody } from '@palisade/service-auth';
+import { errorMiddleware } from '@palisade/core';
+import { prisma } from '@palisade/db';
+
+import { getRcaConfig } from './env.js';
+import { createProvisionRouter } from './routes/provision.routes.js';
+import { handleRelayConnection } from './ws/relay-handler.js';
+
+const config = getRcaConfig();
+const app = express();
+const server = createServer(app);
+
+app.set('trust proxy', 1);
+
+// Health check (unauthenticated)
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true, service: 'rca' });
+});
+
+// HMAC-gated REST endpoint
+const authGate = requireSignedRequest({ keys: config.PROVISION_AUTH_KEYS });
+app.use(
+  '/api/provision',
+  express.json({ limit: '64kb', verify: captureRawBody }),
+  authGate,
+  createProvisionRouter(),
+);
+
+app.use(errorMiddleware);
+
+// ---------------------------------------------------------------------------
+// WebSocket server for APDU relay
+// ---------------------------------------------------------------------------
+
+const wss = new WebSocketServer({
+  server,
+  path: undefined, // We handle path routing ourselves
+});
+
+wss.on('connection', async (ws, req) => {
+  // Extract session ID from path: /api/provision/relay/:sessionId
+  const match = req.url?.match(/\/api\/provision\/relay\/([a-zA-Z0-9_-]+)/);
+  if (!match) {
+    ws.close(4000, 'Invalid path — expected /api/provision/relay/:sessionId');
+    return;
+  }
+
+  const sessionId = match[1];
+
+  // Validate the session exists, is in INIT phase, and was created recently.
+  // The sessionId itself is the auth token — it's a cuid with 25+ chars of
+  // entropy, returned only via the HMAC-gated /api/provision/start endpoint.
+  try {
+    const session = await prisma.provisioningSession.findUnique({
+      where: { id: sessionId },
+    });
+    if (!session) {
+      ws.close(4001, 'Unknown session');
+      return;
+    }
+    if (session.phase !== 'INIT') {
+      ws.close(4001, 'Session not in INIT phase');
+      return;
+    }
+    const ageMs = Date.now() - session.createdAt.getTime();
+    if (ageMs > config.WS_TIMEOUT_SECONDS * 1000) {
+      ws.close(4001, 'Session expired');
+      return;
+    }
+  } catch (err) {
+    console.error('[rca-ws] session validation error:', err);
+    ws.close(4001, 'Session validation failed');
+    return;
+  }
+
+  handleRelayConnection(ws, sessionId);
+});
+
+// ---------------------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------------------
+
+const port = config.PORT;
+server.listen(port, () => {
+  console.log(`[rca] listening on :${port} (HTTP + WebSocket)`);
+});
+
+export default app;

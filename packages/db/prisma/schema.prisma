@@ -1,0 +1,887 @@
+// Vera — Palisade Payment Prototype
+//
+// Data model.  Key decisions (see plan at
+// /Users/danderson/.claude/plans/tingly-imagining-sketch.md and the lifecycle
+// diagram the user signed off on):
+//
+//   - No per-card IMK.  ARQC keys derive from VERA_ROOT_ARQC_SEED via BIN
+//     + PAN + ATC on the fly.
+//   - **No plaintext PICC UID anywhere.**  The UID is stored only as ciphertext
+//     (`uidEncrypted`) and as a deterministic HMAC fingerprint
+//     (`uidFingerprint`) for SUN-tap lookup.  The opaque `cardRef` is the only
+//     identifier that ever appears in a URL or HTTP boundary.
+//   - **No code-based activation.**  Activation is initiated by the cardholder
+//     tapping the physical card.  The SDM/SUN URL fires `/activate/:cardRef`
+//     with `e=<picc>&m=<cmac>` query params (counter lives inside the encrypted
+//     PICC, not as a separate `c=`); the backend decrypts + MAC-verifies,
+//     advances `lastReadCounter` atomically (replay defence), and mints an
+//     `ActivationSession` whose opaque token drives the identity-blind page.
+//   - **Card lifecycle: BLANK → SHIPPED → ACTIVATED → PERSONALISED → PROVISIONED → SUSPENDED/REVOKED.**
+//     The provisioning-agent calls `POST /api/cards/register` which lands the
+//     Card in SHIPPED with a linked VaultEntry.  First successful SUN-tap +
+//     WebAuthn registration flips it to ACTIVATED.  The mobile provisioning
+//     agent then writes EMV data to the chip via APDUs (PERSONALISED) and
+//     data-prep finalises the SAD (PROVISIONED).
+//   - VaultEntry is fingerprinted (HMAC-SHA256) for dedup without decrypt.
+//   - VaultEncryptionKey + keyVersion on VaultEntry / Card supports rotation
+//     for both PAN ciphertext and SDM-key ciphertext.
+//   - VaultAccessLog records every vault event — nothing touches PANs without
+//     an audit row.
+//   - Transaction status is an enum with explicit valid transitions enforced
+//     in service code (src/transactions/state-machine.ts).
+//   - Provider-agnostic: Transaction stores providerName /
+//     providerPaymentMethodId / providerTxnId.
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Financial Institutions
+// ---------------------------------------------------------------------------
+//
+// An FI is the BIN sponsor / card issuer (e.g. "InComm").  Programs hang
+// off an FI — one FI can run many programs (e.g. InComm → SecureGift,
+// InComm → GiftPlus).  Cards belong to programs; programs belong to FIs.
+// Used for data scoping / multi-tenant isolation in the admin UI.
+model FinancialInstitution {
+  id           String  @id @default(cuid())
+  name         String
+  slug         String  @unique // URL-safe slug (e.g. "incomm")
+  bin          String? // optional BIN assigned to this FI
+  contactEmail String?
+  contactName  String?
+  status       String  @default("ACTIVE") // ACTIVE | SUSPENDED
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  programs    Program[]
+  templates   EmbossingTemplate[]
+  credentials PartnerCredential[]
+
+  @@index([slug])
+}
+
+// ---------------------------------------------------------------------------
+// Partner API Credentials
+// ---------------------------------------------------------------------------
+//
+// Partner API credential for batch file ingestion.  Each FI can issue
+// multiple keyed credentials (e.g. one per upstream processor, or for
+// key rotation).  Secrets are stored hashed (scrypt) — never plaintext.
+// The secret is shown once at creation and never again.
+model PartnerCredential {
+  id                     String               @id @default(cuid())
+  financialInstitutionId String
+  financialInstitution   FinancialInstitution @relation(fields: [financialInstitutionId], references: [id], onDelete: Cascade)
+
+  // Partner-supplied identifier (e.g. "incomm-embossing-prod")
+  keyId      String @unique
+  // Hashed secret — constant-time comparable.  scrypt with a per-record
+  // salt; the secret itself is 256-bit random (not a user password) so
+  // we keep scrypt's default cost for rate-limiting at verify time.
+  secretHash String
+  salt       String
+
+  // Optional description for audit
+  description String?
+
+  // Status + lifecycle
+  status        String    @default("ACTIVE") // ACTIVE | REVOKED
+  revokedAt     DateTime?
+  revokedReason String?
+
+  // Last-used tracking for audit
+  lastUsedAt DateTime?
+  lastUsedIp String?
+
+  createdBy String // cognitoSub
+  createdAt DateTime @default(now())
+
+  @@index([financialInstitutionId])
+  @@index([keyId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Embossing Templates
+// ---------------------------------------------------------------------------
+//
+// An FI uploads templates describing the format of their embossing files.
+// One template can support multiple card schemes (Visa + Mastercard share
+// the same record layout but differ in BIN ranges / service codes).
+//
+// The template file itself is encrypted at rest (AES-256-GCM).  Ingestion
+// parses it at upload time to extract metadata (field count, record length)
+// for display, but the encrypted blob is the source of truth for the
+// batch parser at runtime.
+model EmbossingTemplate {
+  id                     String               @id @default(cuid())
+  financialInstitutionId String
+  financialInstitution   FinancialInstitution @relation(fields: [financialInstitutionId], references: [id], onDelete: Restrict)
+
+  name               String // human label e.g. "InComm Standard v2"
+  description        String?
+  // Supported schemes — a template can cover multiple
+  supportsVisa       Boolean @default(false)
+  supportsMastercard Boolean @default(false)
+  supportsAmex       Boolean @default(false)
+
+  // File format type — determines which parser plugin handles it
+  formatType String // "episode_six" | "fixed_width" | "csv" | "xml" | etc.
+
+  // Encrypted template file (AES-256-GCM via KMS envelope encryption).
+  // Stored inline in DB because templates are small (<10MB) and rarely
+  // accessed — keeps ops simple vs S3 for such small files.
+  templateEncrypted  Bytes
+  templateKeyVersion Int
+  templateSha256     String // plaintext SHA-256 for integrity
+  templateFileName   String // original file name
+
+  // Extracted metadata (non-sensitive, for display only)
+  recordLength Int?
+  fieldCount   Int?
+  parserMeta   Json? // format-specific metadata
+
+  uploadedBy String // cognitoSub
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  programs Program[]
+  batches  EmbossingBatch[]
+
+  @@index([financialInstitutionId])
+}
+
+// ---------------------------------------------------------------------------
+// Embossing Batches
+// ---------------------------------------------------------------------------
+//
+// A batch IS an actual card-data file following a template.  Uploaded
+// via admin UI, SFTP, or API.  The raw file is encrypted at rest (KMS SSE)
+// in a dedicated S3 bucket.  A background processor parses records and
+// routes each to the vault via the existing registerCard flow.
+//
+// The raw file is retained (encrypted) for audit/reprocessing, NOT for
+// future lookups — once processed, PANs live only in the vault.
+model EmbossingBatch {
+  id         String            @id @default(cuid())
+  templateId String
+  template   EmbossingTemplate @relation(fields: [templateId], references: [id])
+  programId  String
+  program    Program           @relation(fields: [programId], references: [id])
+
+  // Original upload metadata
+  fileName String
+  fileSize Int
+  sha256   String // integrity hash of raw file
+
+  // S3 pointer — file encrypted at rest via SSE-KMS on the bucket.
+  s3Bucket String
+  s3Key    String
+
+  // Processing status + counters
+  status          String  @default("RECEIVED") // RECEIVED | PROCESSING | PROCESSED | FAILED
+  recordCount     Int? // total records parsed
+  recordsSuccess  Int     @default(0)
+  recordsFailed   Int     @default(0)
+  processingError String?
+
+  // Provenance
+  uploadedVia String // "UI" | "SFTP" | "API"
+  uploadedBy  String? // cognitoSub or partner keyId
+  uploadedAt  DateTime  @default(now())
+  processedAt DateTime?
+
+  @@index([programId])
+  @@index([templateId])
+  @@index([status])
+  @@index([uploadedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Programs
+// ---------------------------------------------------------------------------
+//
+// A Program is an issuer-scoped card product (e.g. Bank A's Platinum AUD
+// Mastercard).  The Palisade programId string (e.g. "prog_mc_plat_01") is the
+// primary key — it's the stable identifier the provisioning-agent already
+// hands us, so we use it verbatim rather than translating to a cuid.
+//
+// `tierRules` is a JSON array of TierRule objects (schema enforced at write
+// time by src/programs/tier-rules.ts).  Rules map amount ranges to the set of
+// CredentialKinds acceptable for authentication — e.g. Bank A may say
+// "under AUD 200: PLATFORM only; AUD 200+: CROSS_PLATFORM only", while
+// Bank B can configure its own thresholds without code changes.
+//
+// A card with no linked Program (programId NULL, or pointing to a deleted
+// program) falls back to DEFAULT_TIER_RULES.
+
+model Program {
+  id        String @id // Palisade programId, e.g. "prog_mc_plat_01"
+  name      String
+  currency  String @db.VarChar(3) // ISO 4217 — all rules and card txns in this currency
+  tierRules Json // TierRule[] — shape validated by Zod on write
+
+  // Product classification.  Drives UI, reporting, and behaviour at tap
+  // (e.g. RETAIL cards gate the activation flow on the SHIPPED → SOLD
+  // transition; non-retail programs let a PERSONALISED card activate on
+  // first tap).  Stored as String rather than a Prisma enum so we can add
+  // new types without a schema migration; write-path Zod enforces the set.
+  //
+  // Allowed values: RETAIL | PREPAID_NON_RELOADABLE | PREPAID_RELOADABLE |
+  //                 DEBIT | CREDIT
+  programType String @default("PREPAID_RELOADABLE")
+
+  // --- NDEF URL templates --------------------------------------------------
+  // Palisade writes these into the card's NDEF file at two moments:
+  //
+  //  preActivationNdefUrlTemplate  — baked at personalisation.  Hits the
+  //                                  SUN-tap activation handler on first tap.
+  //  postActivationNdefUrlTemplate — written to the card after successful
+  //                                  WebAuthn registration so subsequent
+  //                                  taps route to the payment-initiation
+  //                                  flow instead of activation.
+  //
+  // Templates may contain three classes of placeholder:
+  //   {cardRef}  — substituted server-side by Vera (stable per-card slug)
+  //   {urlCode}  — substituted server-side by Vera (this program's `urlCode`)
+  //                used by the post-activation `mobile.karta.cards/t/<code>`
+  //                URL shape so the mobile app + tap-verify endpoint can
+  //                pick the right per-program key set without leaking
+  //                cardRef in the URL.
+  //   {PICCData}, {CMAC} — literal markers the NXP SDM engine substitutes
+  //                        on-card at tap time; Vera passes them through
+  //                        verbatim.
+  //
+  // Nullable so partial program definitions (name + rules only) still work;
+  // callers fall back to Vera-wide defaults via config.
+  preActivationNdefUrlTemplate  String?
+  postActivationNdefUrlTemplate String?
+
+  // Short opaque program identifier baked into post-activation chip URLs
+  // (https://mobile.karta.cards/t/<urlCode>?e=&m=).  Lets the mobile app +
+  // tap-verify endpoint resolve which program's per-card SDM keys to try
+  // without having {cardRef} in the URL.  Public — same leak surface as the
+  // PAN BIN.  Globally unique so the URL fully identifies the program.
+  // 2–8 chars, [a-z0-9] only.  Nullable for legacy programs created before
+  // this column existed; new programs MUST set it.
+  urlCode String? @unique @db.VarChar(8)
+
+  // --- Microsite ---------------------------------------------------------
+  // Per-program static website served from S3+CloudFront.  When enabled,
+  // successful card activation redirects the cardholder to
+  // microsite.karta.cards/programs/<programId>/ which serves the currently
+  // active MicrositeVersion.  See MicrositeVersion for the versioning model.
+  micrositeEnabled       Boolean @default(false)
+  micrositeActiveVersion String? // current active MicrositeVersion.id
+
+  // Financial institution that owns this program.
+  // Nullable during migration; will be required after backfill.
+  financialInstitutionId String?
+  financialInstitution   FinancialInstitution? @relation(fields: [financialInstitutionId], references: [id], onDelete: Restrict)
+
+  // Embossing template this program uses for batch card ingestion.
+  embossingTemplateId String?
+  embossingTemplate   EmbossingTemplate? @relation(fields: [embossingTemplateId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  cards             Card[]
+  issuerProfile     IssuerProfile?
+  micrositeVersions MicrositeVersion[]
+  embossingBatches  EmbossingBatch[]
+
+  // Program-scoped chip profiles (nullable FK on ChipProfile.programId)
+  scopedChipProfiles ChipProfile[] @relation("ProgramChipProfiles")
+}
+
+// ---------------------------------------------------------------------------
+// Cards
+// ---------------------------------------------------------------------------
+
+enum CardStatus {
+  BLANK // placeholder — JCOP not yet personalised (rare in prototype)
+  SHIPPED // applets + SDM keys loaded at perso; card registered + ready to tap
+  PERSONALISED // EMV data (SAD, iCVV, MKAC/SMI/SMC) written to the chip by the
+  // provisioning agent via APDU.  Happens AFTER ACTIVATED in the mobile app
+  // provisioning flow — NOT the initial state.
+  ACTIVATED // SUN-tap verified + WebAuthn ceremony completed
+  PROVISIONED // Provisioning session closed; card fully ready for payments
+  SUSPENDED
+  REVOKED
+}
+
+model Card {
+  id      String     @id @default(cuid())
+  // Opaque URL slug embedded in the SDM-emitted URL path
+  // (`/activate/:cardRef?e=...&m=...`).  Generated server-side at
+  // `POST /api/cards/register` time; not derived from any card-side material.
+  cardRef String     @unique
+  status  CardStatus @default(SHIPPED)
+
+  // --- PICC UID (NEVER plaintext on any HTTP boundary) ---------------------
+  // AES-256-GCM ciphertext of the 7-byte PICC UID.  Decrypt is gated by the
+  // SUN verify path only — the UID never leaves the backend in cleartext.
+  uidEncrypted   String
+  // Deterministic HMAC-SHA256(UID_FP_KEY, uid) — lets us look the card up by
+  // UID after PICC decryption without ever storing plaintext UID.  Unique so
+  // a duplicate card insert from the provisioning-agent fails loudly.
+  uidFingerprint String  @unique
+  // JCOP-side serial from the data-prep package (e.g. "JCOP5_00A1B2C3").
+  // Useful for audit; non-secret, but still optional since not every card
+  // batch will surface it.
+  chipSerial     String?
+
+  // Retail sale status — only meaningful when the parent Program has
+  // programType='RETAIL'.  A shipped card sits on the retailer's shelf and
+  // MUST NOT activate on tap (microsite shows info only).  Once the card
+  // is purchased the status flips to SOLD (via admin UI / partner API /
+  // POS integration) and subsequent taps follow the normal activation
+  // path.  Null for non-retail cards — their "sold" equivalent is implicit
+  // from the moment they reach the cardholder.
+  //
+  // Allowed values: SHIPPED | SOLD
+  retailSaleStatus String?
+  retailSoldAt     DateTime?
+
+  // --- SDM keys (NXP AN12196 / AN14683) ------------------------------------
+  // AES-128 keys written into the card during personalisation.  Both kept
+  // ciphertext-at-rest under the same vault key version.  `metaRead` decrypts
+  // PICC; `fileRead` is the master from which per-tap session keys derive.
+  sdmMetaReadKeyEncrypted String
+  sdmFileReadKeyEncrypted String
+  keyVersion              Int // VaultEncryptionKey.version used above
+
+  // Monotonic SDM read counter.  Each successful SUN-tap must present a
+  // counter strictly greater than this; the verify path advances atomically
+  // via `updateMany where lastReadCounter < newCounter`.  Replay defence.
+  lastReadCounter Int @default(0)
+
+  // --- Provisioning provenance --------------------------------------------
+  // FK → Program.id.  Null-safe so dev cards and the prototype's
+  // "Create blank card" admin flow keep working without a seeded program;
+  // createTransaction falls back to DEFAULT_TIER_RULES in that case.
+  programId String?
+  program   Program? @relation(fields: [programId], references: [id], onDelete: SetNull)
+  batchId   String? // e.g. "batch_2026Q2_001" — Palisade perso batch
+
+  // Linked vault entry (one card = one card in the vault, 1:1 once vaulted).
+  // Always populated by the provisioning-agent path; nullable for the rare
+  // admin-only flows that may exist in dev/test.
+  vaultEntryId String?     @unique
+  vaultEntry   VaultEntry? @relation(fields: [vaultEntryId], references: [id])
+
+  // --- Provisioning ----------------------------------------------------------
+  // Stable identifier used by the data-prep and RCA services to reference
+  // this card without exposing internal IDs.  Set when SAD is staged.
+  proxyCardId   String?   @unique
+  provisionedAt DateTime?
+
+  // AWS Cognito user sub — set when card is provisioned via mobile app.
+  // Links a card to the cardholder's mobile identity for /api/cards/mine.
+  cognitoSub String?
+
+  // ATC (application transaction counter) for OBO ARQC generation.  Monotonic.
+  atc Int @default(0)
+
+  credentials          WebAuthnCredential[]
+  transactions         Transaction[]
+  activationSessions   ActivationSession[]
+  sadRecords           SadRecord[]
+  provisioningSessions ProvisioningSession[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([cognitoSub])
+}
+
+// Short-lived, single-use server-side session minted when the cardholder taps
+// their card and the SUN URL passes verification.  The session id IS the
+// opaque token handed to the frontend (`/activate?session=<id>`); the
+// frontend uses it as the only handle for the WebAuthn registration ceremony
+// — no card identifiers or PII are exposed to the page.
+model ActivationSession {
+  id                  String    @id @default(cuid())
+  cardId              String
+  card                Card      @relation(fields: [cardId], references: [id], onDelete: Cascade)
+  // 60s TTL — the user has to complete WebAuthn registration in that window.
+  expiresAt           DateTime
+  consumedAt          DateTime?
+  consumedDeviceLabel String?
+  // WebAuthn registration challenge bound to this session.  Set when the
+  // browser calls .../begin; verified + cleared when it calls .../finish.
+  // Null between sessions and after consumption.
+  challenge           String?   @unique
+  // Which SDM read counter opened this session (audit + correlation).
+  readCounter         Int
+  createdIp           String?
+  createdUa           String?
+  createdAt           DateTime  @default(now())
+
+  @@index([cardId])
+  @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------------------
+// Vault
+// ---------------------------------------------------------------------------
+
+model VaultEncryptionKey {
+  id               String    @id @default(cuid())
+  version          Int       @unique
+  // Wrapped data-encryption key.  For v0 keys live in env; blob is the
+  // wrapped form we would store if using KMS.  Present for rotation machinery.
+  encryptedDekBlob String
+  createdAt        DateTime  @default(now())
+  retiredAt        DateTime?
+}
+
+model VaultEntry {
+  id String @id @default(cuid())
+
+  // --- plaintext metadata (safe for display, never needs decrypt) ----------
+  panLast4       String
+  panBin         String // first 6 of PAN
+  cardholderName String
+  panExpiryMonth String
+  panExpiryYear  String
+
+  // --- ciphertext ----------------------------------------------------------
+  // AES-256-GCM ciphertext of the full PAN (+ CVC if present).  The payload
+  // format is versioned by keyVersion.
+  encryptedPan String // base64 of iv||ciphertext||tag (JSON for multi-field)
+  keyVersion   Int
+
+  // --- deterministic fingerprint for dedup (HMAC-SHA256 of normalised PAN) -
+  panFingerprint String @unique
+
+  // --- card back-reference -------------------------------------------------
+  card Card?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  retrievalTokens RetrievalToken[]
+  accessLogs      VaultAccessLog[]
+
+  @@index([panBin])
+  @@index([panLast4])
+}
+
+model RetrievalToken {
+  id          String   @id @default(cuid())
+  // Opaque token returned to the caller.  nanoid(32).
+  token       String   @unique
+  // Single-use guard.
+  used        Boolean  @default(false)
+  // Bound to an intended amount/currency so a stolen token can't be redirected.
+  amount      Int
+  currency    String
+  // Expiry (typically createdAt + 60s).
+  expiresAt   DateTime
+  // Creator (for audit).
+  purpose     String
+  createdByIp String?
+
+  vaultEntryId String
+  vaultEntry   VaultEntry @relation(fields: [vaultEntryId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime  @default(now())
+  usedAt    DateTime?
+
+  accessLogs VaultAccessLog[]
+
+  @@index([vaultEntryId])
+  @@index([expiresAt])
+}
+
+enum VaultEventType {
+  CREATE
+  DUPLICATE_REJECTED
+  TOKEN_MINTED
+  TOKEN_CONSUMED
+  PROXY_FORWARDED
+  PROVIDER_TOKENISED
+}
+
+enum VaultEventResult {
+  SUCCESS
+  FAILURE
+}
+
+model VaultAccessLog {
+  id           String           @id @default(cuid())
+  eventType    VaultEventType
+  result       VaultEventResult
+  // Who/what initiated the event (e.g. "admin", "transaction:<rlid>",
+  // "provider:stripe", "provisioning-agent").
+  actor        String
+  // Why (free-form, e.g. "admin store", "payment orchestration step 5").
+  purpose      String
+  ipAddress    String?
+  userAgent    String?
+  errorMessage String?
+
+  vaultEntryId String?
+  vaultEntry   VaultEntry? @relation(fields: [vaultEntryId], references: [id], onDelete: SetNull)
+
+  retrievalTokenId String?
+  retrievalToken   RetrievalToken? @relation(fields: [retrievalTokenId], references: [id], onDelete: SetNull)
+
+  transactionId String?
+  transaction   Transaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([eventType])
+  @@index([vaultEntryId])
+}
+
+// ---------------------------------------------------------------------------
+// WebAuthn credentials
+// ---------------------------------------------------------------------------
+
+enum CredentialKind {
+  PLATFORM // Face ID / Touch ID / Windows Hello  — Tier 1/3
+  CROSS_PLATFORM // NFC card tap (CTAP1 on Android)     — Tier 2
+}
+
+model WebAuthnCredential {
+  id String @id @default(cuid())
+
+  // Credential ID as raw bytes, stored base64url.  For NFC/CTAP1 this is
+  // the 112-byte key handle the applet produces.
+  credentialId String @unique
+
+  // Public key (COSE-encoded), stored base64url.
+  publicKey String
+
+  // Signature counter.  CTAP1 NFC may not increment this reliably; the
+  // verifier must tolerate sig_count == 0 throughout for NFC creds.
+  counter BigInt @default(0)
+
+  kind       CredentialKind
+  transports String[] // ['nfc'] or ['internal','hybrid'] etc.
+
+  // The device a passkey was registered from.  For display / debugging.
+  deviceName String?
+
+  // True if this credential was injected by the perso/admin path before any
+  // user-side WebAuthn ceremony — i.e., the FIDO applet was scripted to
+  // generate it during personalisation and the public key was POSTed to
+  // /api/admin/cards/:cardRef/credentials.  When true, activation /begin
+  // short-circuits the runtime ceremony: the SUN-verified tap + the
+  // pre-existing cred is enough to flip the card to ACTIVATED.  Only one
+  // preregistered credential per card.
+  preregistered Boolean @default(false)
+
+  // Back-reference to the card this credential authenticates.
+  cardId String
+  card   Card   @relation(fields: [cardId], references: [id], onDelete: Cascade)
+
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+
+  @@index([cardId])
+}
+
+model RegistrationChallenge {
+  id        String         @id @default(cuid())
+  challenge String         @unique
+  // The card the challenge was issued for.  userHandle / userLabel are
+  // derived server-side from the card's opaque cuid (see beginRegistration);
+  // the PICC UID never appears in any WebAuthn payload.
+  cardId    String
+  kind      CredentialKind
+  expiresAt DateTime
+  createdAt DateTime       @default(now())
+
+  @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------------------
+// Transactions
+// ---------------------------------------------------------------------------
+
+enum TransactionStatus {
+  PENDING
+  AUTHN_STARTED
+  AUTHN_COMPLETE
+  ARQC_VALID
+  VAULT_RETRIEVED
+  STRIPE_CHARGED // provider-agnostic despite the name; kept for log clarity
+  COMPLETED
+  FAILED
+  EXPIRED
+}
+
+enum Tier {
+  TIER_1 // Low value — platform biometric (Face ID / Touch ID)
+  TIER_2 // Mid value — NFC card tap (CTAP1 over NFC)
+  TIER_3 // High value — platform biometric + stepped-up checks
+}
+
+model Transaction {
+  id String @id @default(cuid())
+
+  // Retrieval link ID — short, URL-safe, embedded in the QR.
+  rlid String @unique
+
+  cardId String
+  card   Card   @relation(fields: [cardId], references: [id])
+
+  amount       Int // minor units (cents)
+  currency     String @default("USD")
+  merchantRef  String
+  merchantName String @default("Demo Merchant")
+
+  status     TransactionStatus @default(PENDING)
+  tier       Tier
+  actualTier Tier? // which ceremony actually completed
+
+  // Credential kinds acceptable for this transaction, computed from the
+  // program's tier rules + amount at create time.  Persisted so auth verify
+  // enforces the same set that was advertised at /authenticate/options, even
+  // if rules change mid-flight.  Non-empty by construction.
+  allowedCredentialKinds CredentialKind[]
+
+  // Server-side bound WebAuthn challenge (32 random bytes, base64url).
+  challengeNonce String @unique
+
+  // Which credential was used for this authn (set after authn_complete).
+  usedCredentialId String?
+
+  // Provider fields (renamed from Stripe-specific — see plan).
+  providerName            String?
+  providerPaymentMethodId String?
+  providerTxnId           String?
+
+  // OBO ARQC that we generated + self-validated, stored for audit.
+  arqc    String?
+  atcUsed Int?
+
+  expiresAt     DateTime
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  completedAt   DateTime?
+  failedAt      DateTime?
+  failureReason String?
+
+  accessLogs VaultAccessLog[]
+
+  @@index([rlid])
+  @@index([status])
+  @@index([cardId])
+}
+
+// ---------------------------------------------------------------------------
+// Provisioning — Chip Profiles, Issuer Profiles, SAD, Sessions
+// ---------------------------------------------------------------------------
+
+// A ChipProfile defines the DGI mapping for a specific applet vendor and
+// payment scheme.  Uploaded via the admin UI in JSON, Mastercard .profile
+// (ZIP), or Visa VPA (XML/ZIP) format.  The profile_parser normalises all
+// formats to ChipProfile rows.
+model ChipProfile {
+  id               String  @id @default(cuid())
+  name             String
+  // "mchip_advance" | "vsdc"
+  scheme           String
+  // "nxp" | "infineon"
+  vendor           String
+  // Cryptogram Version Number: 10, 17, 18, 22
+  cvn              Int
+  // Full DGI definition array (JSON) — see packages/emv/src/chip-profile.ts
+  dgiDefinitions   Json
+  // AIDs for the applet stack
+  elfAid           String?
+  moduleAid        String?
+  paAid            String  @default("D276000085504100")
+  fidoAid          String  @default("A0000006472F0001")
+  // Special DGI references the PA needs
+  iccPrivateKeyDgi Int     @default(32769) // 0x8001
+  iccPrivateKeyTag Int     @default(40776) // 0x9F48
+  mkAcDgi          Int     @default(2048) // 0x0800
+  mkSmiDgi         Int     @default(2049) // 0x0801
+  mkSmcDgi         Int     @default(2050) // 0x0802
+
+  // Optional scoping — when set, this profile is only visible to this program.
+  // Null means the profile is global/catalog (shared across all programs).
+  programId String?
+  program   Program? @relation("ProgramChipProfiles", fields: [programId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  issuerProfiles IssuerProfile[]
+
+  @@index([programId])
+}
+
+// An IssuerProfile links a Program to its AWS Payment Cryptography key ARNs
+// and EMV application configuration.  One per program — the issuer's key
+// hierarchy, CA enrollment certificates, and per-scheme constants.
+model IssuerProfile {
+  id        String  @id @default(cuid())
+  programId String  @unique
+  program   Program @relation(fields: [programId], references: [id])
+
+  chipProfileId String
+  chipProfile   ChipProfile @relation(fields: [chipProfileId], references: [id])
+
+  // Payment scheme & CVN
+  scheme           String // "mchip_advance" | "vsdc"
+  cvn              Int // 10, 17, 18, 22
+  imkAlgorithm     String @default("TDES_2KEY")
+  derivationMethod String @default("METHOD_A")
+
+  // AWS Payment Cryptography key ARNs
+  tmkKeyArn      String @default("") // Token Master Key (iCVV)
+  imkAcKeyArn    String @default("") // Issuer Master Key - AC (ARQC)
+  imkSmiKeyArn   String @default("") // Issuer Master Key - SMI (MAC)
+  imkSmcKeyArn   String @default("") // Issuer Master Key - SMC (encryption)
+  imkIdnKeyArn   String @default("") // Optional: ICC Dynamic Number
+  issuerPkKeyArn String @default("") // Signs ICC PK Certificates (RSA)
+
+  // Pre-computed certificates from CA enrollment
+  caPkIndex           String @default("")
+  issuerPkCertificate String @default("") // Hex, Tag 90
+  issuerPkRemainder   String @default("") // Hex, Tag 92
+  issuerPkExponent    String @default("") // Hex, Tag 9F32
+
+  // EMV application parameters (constants per profile)
+  aid              String @default("") // Tag 9F06 hex
+  appLabel         String @default("") // Tag 50
+  appPreferredName String @default("") // Tag 9F12
+  appPriority      String @default("") // Tag 87 hex
+  appVersionNumber String @default("") // Tag 9F08 hex
+  aip              String @default("") // Tag 82 hex
+  afl              String @default("") // Tag 94 hex
+  cvmList          String @default("") // Tag 8E hex
+  pdol             String @default("") // Tag 9F38 hex
+  cdol1            String @default("") // Tag 8C hex
+  cdol2            String @default("") // Tag 8D hex
+  iacDefault       String @default("") // Tag 9F0D hex
+  iacDenial        String @default("") // Tag 9F0E hex
+  iacOnline        String @default("") // Tag 9F0F hex
+  appUsageControl  String @default("") // Tag 9F07 hex
+  currencyCode     String @default("") // Tag 9F42 hex
+  currencyExponent String @default("") // Tag 9F44 hex
+  countryCode      String @default("") // Tag 5F28 hex
+  sdaTagList       String @default("") // Tag 9F4A hex
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Encrypted SAD (Static Authority Data) blob pre-built by the data-prep
+// service.  Consumed once by the RCA during provisioning.  30-day TTL.
+model SadRecord {
+  id            String   @id @default(cuid())
+  proxyCardId   String   @unique
+  cardId        String
+  card          Card     @relation(fields: [cardId], references: [id])
+  // AES-256-GCM encrypted SAD blob
+  sadEncrypted  Bytes
+  sadKeyVersion Int
+  chipSerial    String?
+  // READY → CONSUMED (provisioning used it) | EXPIRED | REVOKED
+  status        String   @default("READY")
+  expiresAt     DateTime
+  createdAt     DateTime @default(now())
+
+  provisioningSessions ProvisioningSession[]
+
+  @@index([status])
+  @@index([expiresAt])
+}
+
+// Real-time provisioning session — short-lived (~30 seconds).
+// Tracks the 6-phase state machine as the RCA relays APDUs between
+// the mobile app and the card's Provisioning Agent.
+model ProvisioningSession {
+  id          String    @id @default(cuid())
+  cardId      String
+  card        Card      @relation(fields: [cardId], references: [id])
+  sadRecordId String    @default("")
+  sadRecord   SadRecord @relation(fields: [sadRecordId], references: [id])
+
+  // Stable proxy card identifier — used by the RCA / data-prep services
+  proxyCardId  String  @default("")
+  // Session ID returned by the RCA when starting a mobile provisioning flow
+  rcaSessionId String? @unique
+
+  // INIT → PA_FCI → SCP11 → KEYGEN → SAD_TRANSFER → AWAITING_FINAL → CONFIRMING → COMPLETE | FAILED
+  phase String @default("INIT")
+
+  // ICC public key received during KEYGEN phase (uncompressed, 65 bytes)
+  iccPublicKey Bytes?
+  // Provenance hash from FINAL_STATUS
+  provenance   String?
+  // FIDO credential data from FINAL_STATUS
+  fidoCredData String?
+
+  completedAt   DateTime?
+  failedAt      DateTime?
+  failureReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([cardId])
+  @@index([phase])
+}
+
+// ---------------------------------------------------------------------------
+// Microsites
+// ---------------------------------------------------------------------------
+//
+// A MicrositeVersion is an immutable snapshot of a program's static website,
+// uploaded by an admin as a zip archive.  The zip is extracted and each file
+// is pushed to S3 under the `s3Prefix` (e.g. "programs/prog_mc_plat_01/v_...").
+// CloudFront (microsite.karta.cards) serves the files; a CloudFront function
+// rewrites incoming requests for /programs/<programId>/... to the currently
+// active version's prefix, using Program.micrositeActiveVersion as the
+// pointer.  Swapping versions is a single DB UPDATE — no re-upload needed.
+//
+// Versions are never mutated after creation; to publish a change, admin
+// uploads a new version and activates it.  Old versions stick around so
+// rollback is a one-click operation.
+
+model MicrositeVersion {
+  id        String  @id @default(cuid())
+  programId String
+  program   Program @relation(fields: [programId], references: [id])
+
+  // Human-readable version label (e.g. "v1", "2026-04-17-build-3").  Unique
+  // per program.
+  version String
+
+  // S3 prefix under the microsites bucket.  All files for this version live
+  // under this prefix; deleting the version wipes every object under it.
+  // Example: "programs/prog_mc_plat_01/v_1713340000000_abc123/"
+  s3Prefix String
+
+  // Cognito sub of the admin who uploaded the zip.
+  uploadedBy String
+
+  // File count + total size in bytes, for display in the admin UI.
+  fileCount  Int
+  totalBytes Int
+
+  createdAt DateTime @default(now())
+
+  @@unique([programId, version])
+  @@index([programId])
+}
