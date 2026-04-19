@@ -1,0 +1,3 @@
+# JavaCard applet source — reference code, not built by CI.
+# Mark as vendored so it doesn't skew language stats.
+applets/** linguist-vendored

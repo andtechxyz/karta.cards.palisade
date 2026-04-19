@@ -1,0 +1,36 @@
+{
+  "name": "palisade",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Palisade — card issuance, personalisation, SUN-tap, activation, data-prep, RCA. Calls Vera's vault for PAN tokenisation.",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "services/*",
+    "services/*/frontend",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n tap,activation,data-prep,rca,batch,sftp,activation-ui -c magenta,cyan,blue,yellow,green,red,cyan.dim \"npm run dev -w services/tap\" \"npm run dev -w services/activation\" \"npm run dev -w services/data-prep\" \"npm run dev -w services/rca\" \"npm run dev -w services/batch-processor\" \"npm run dev -w services/sftp\" \"npm run dev -w @palisade/activation-frontend\"",
+    "build": "npm run build --workspaces --if-present",
+    "test": "vitest run",
+    "typecheck": "tsc -b --verbose",
+    "prisma:generate": "npm run prisma:generate -w @palisade/db",
+    "prisma:migrate": "npm run prisma:migrate -w @palisade/db"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/react": "^18.3.28",
+    "@types/react-dom": "^18.3.7",
+    "@types/supertest": "^7.2.0",
+    "@vitejs/plugin-react": "^4.7.0",
+    "concurrently": "^9.1.2",
+    "supertest": "^7.2.2",
+    "typescript": "^5.7.2",
+    "vitest": "^3.2.4"
+  },
+  "dependencies": {
+    "helmet": "^8.1.0",
+    "vite": "^6.4.2"
+  }
+}

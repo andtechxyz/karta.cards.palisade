@@ -1,0 +1,21 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/cognito-auth" },
+    { "path": "./packages/db" },
+    { "path": "./packages/core" },
+    { "path": "./packages/webauthn" },
+    { "path": "./packages/card-programs" },
+    { "path": "./packages/service-auth" },
+    { "path": "./packages/retention" },
+    { "path": "./packages/emv" },
+    { "path": "./packages/provisioning-client" },
+    { "path": "./packages/vault-client" },
+    { "path": "./services/tap" },
+    { "path": "./services/activation" },
+    { "path": "./services/data-prep" },
+    { "path": "./services/rca" },
+    { "path": "./services/batch-processor" },
+    { "path": "./services/sftp" }
+  ]
+}

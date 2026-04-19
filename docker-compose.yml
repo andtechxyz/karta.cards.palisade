@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: palisade
+      POSTGRES_PASSWORD: palisade
+      POSTGRES_DB: palisade
+    ports:
+      - "5433:5432"
+    volumes:
+      - palisade-pg:/var/lib/postgresql/data
+
+volumes:
+  palisade-pg:
