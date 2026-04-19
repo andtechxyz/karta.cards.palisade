@@ -40,7 +40,7 @@ export interface RegisterCardResult {
   cardId: string;
   cardRef: string;
   status: CardStatus;
-  vaultEntryId: string;
+  vaultToken: string;
   panLast4: string;
 }
 
@@ -114,14 +114,16 @@ export async function registerCard(input: RegisterCardInput): Promise<RegisterCa
 
   let vaulted;
   try {
-    vaulted = await getVaultClient().storeCard({
+    // cardRef as the idempotency key — already unique per Card row.  Retries
+    // of registerCard for the same cardRef converge on the same vaultToken
+    // without creating a duplicate vault entry.
+    vaulted = await getVaultClient().registerCard({
       pan: input.card.pan,
       cvc: input.card.cvc,
       expiryMonth: input.card.expiryMonth,
       expiryYear: input.card.expiryYear,
       cardholderName: input.card.cardholderName,
-      purpose: `card register ${input.cardRef}`,
-      onDuplicate: 'error',
+      idempotencyKey: input.cardRef,
       ip: input.ip,
       ua: input.ua,
     });
@@ -135,6 +137,12 @@ export async function registerCard(input: RegisterCardInput): Promise<RegisterCa
     throw err;
   }
 
+  const panBin = input.card.pan.replace(/[\s-]/g, '').slice(0, 6);
+  const expYear =
+    input.card.expiryYear.length === 4
+      ? input.card.expiryYear.slice(2)
+      : input.card.expiryYear;
+
   const card = await prisma.card.create({
     data: {
       cardRef: input.cardRef,
@@ -147,7 +155,12 @@ export async function registerCard(input: RegisterCardInput): Promise<RegisterCa
       keyVersion: uidEnc.keyVersion,
       programId: input.programId,
       batchId: input.batchId,
-      vaultEntryId: vaulted.vaultEntryId,
+      vaultToken: vaulted.vaultToken,
+      panLast4: vaulted.panLast4,
+      panBin,
+      cardholderName: input.card.cardholderName,
+      panExpiryMonth: input.card.expiryMonth,
+      panExpiryYear: expYear,
       retailSaleStatus,
     },
     select: { id: true, cardRef: true, status: true },
@@ -176,7 +189,7 @@ export async function registerCard(input: RegisterCardInput): Promise<RegisterCa
     cardId: card.id,
     cardRef: card.cardRef,
     status: card.status,
-    vaultEntryId: vaulted.vaultEntryId,
+    vaultToken: vaulted.vaultToken,
     panLast4: vaulted.panLast4,
   };
 }

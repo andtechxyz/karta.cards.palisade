@@ -35,6 +35,27 @@ export interface StoreCardResult {
   deduped: boolean;
 }
 
+// Palisade's preferred entry point post-split: the vault returns an opaque
+// `vaultToken` we persist on Card.vaultToken.  No FK back into Vera.
+// `idempotencyKey` is caller-supplied (we pass `cardRef`) so retries collapse
+// onto the same token.  Vera runs fingerprint dedup underneath — two cards
+// with the same PAN converge on one vaultToken.
+export interface RegisterCardInput {
+  pan: string;
+  cvc?: string;
+  expiryMonth: string;
+  expiryYear: string;
+  cardholderName: string;
+  idempotencyKey: string;
+  ip?: string;
+  ua?: string;
+}
+
+export interface RegisterCardResult {
+  vaultToken: string;
+  panLast4: string;
+}
+
 export interface MintTokenInput {
   vaultEntryId: string;
   amount: number;
@@ -218,6 +239,16 @@ export function createVaultClient(baseUrl: string, auth: VaultClientOptions) {
     /** Vault a PAN.  The verified caller identity (HMAC keyId) is the audit actor. */
     async storeCard(input: StoreCardInput): Promise<StoreCardResult> {
       return vaultPost<StoreCardResult>(baseUrl, '/api/vault/store', input, auth);
+    },
+
+    /**
+     * Register a PAN at card-issue time and receive an opaque vaultToken.
+     * Idempotent on `idempotencyKey` — retries return the same token without
+     * creating a duplicate entry.  This is the cross-service boundary: Vera
+     * does not know about Palisade's Card rows.
+     */
+    async registerCard(input: RegisterCardInput): Promise<RegisterCardResult> {
+      return vaultPost<RegisterCardResult>(baseUrl, '/api/vault/register', input, auth);
     },
 
     /** Mint a single-use retrieval token for a vaulted entry. */

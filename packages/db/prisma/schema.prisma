@@ -374,11 +374,22 @@ model Card {
   program   Program? @relation(fields: [programId], references: [id], onDelete: SetNull)
   batchId   String? // e.g. "batch_2026Q2_001" — Palisade perso batch
 
-  // Linked vault entry (one card = one card in the vault, 1:1 once vaulted).
-  // Always populated by the provisioning-agent path; nullable for the rare
-  // admin-only flows that may exist in dev/test.
-  vaultEntryId String?     @unique
-  vaultEntry   VaultEntry? @relation(fields: [vaultEntryId], references: [id])
+  // Opaque vault token from Vera's POST /api/vault/register.  Cross-repo —
+  // there is no FK: Vera's database doesn't know about Cards.  Non-unique
+  // because Vera's fingerprint dedup may return the same token for two
+  // Palisade cards that somehow share a PAN (unusual, but allowed so the
+  // insert doesn't fail).  Pay reaches the vault via this token.
+  vaultToken String?
+
+  // --- Display-safe PAN metadata ------------------------------------------
+  // Mirrored from the registerCard caller — NOT secrets (PCI-DSS allows full
+  // last4 + BIN display and expiry).  Kept on the Card row so /cards/mine
+  // can render card tiles without a cross-service roundtrip to Vera.
+  panLast4       String?
+  panBin         String?
+  cardholderName String?
+  panExpiryMonth String?
+  panExpiryYear  String?
 
   // --- Provisioning ----------------------------------------------------------
   // Stable identifier used by the data-prep and RCA services to reference
@@ -465,8 +476,14 @@ model VaultEntry {
   // --- deterministic fingerprint for dedup (HMAC-SHA256 of normalised PAN) -
   panFingerprint String @unique
 
-  // --- card back-reference -------------------------------------------------
-  card Card?
+  // Caller-supplied idempotency key from POST /api/vault/register.  Mirrors
+  // the Vera-side schema; kept here until Phase 3 removes VaultEntry from
+  // Palisade's side entirely.
+  idempotencyKey String? @unique
+
+  // Card back-reference dropped in Phase 2 — Card.vaultEntryId FK is gone;
+  // Palisade now holds an opaque vaultToken string instead.  VaultEntry stays
+  // until Phase 3 splits the schemas, but nothing here links back to Card.
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

@@ -13,6 +13,9 @@ export function createCardsMineRouter(): Router {
     clientId: config.COGNITO_CLIENT_ID,
   });
 
+  // PAN metadata (last4, expiry, cardholderName) now lives directly on the
+  // Card row after the Phase 2 FK cut — no vault join at read time.
+
   // GET /api/cards/mine — list cards belonging to authenticated mobile user
   router.get('/', cognitoAuth, async (req, res) => {
     const sub = req.cognitoUser!.sub;
@@ -23,9 +26,10 @@ export function createCardsMineRouter(): Router {
         id: true,
         cardRef: true,
         status: true,
-        vaultEntry: {
-          select: { panLast4: true, cardholderName: true, panExpiryMonth: true, panExpiryYear: true },
-        },
+        panLast4: true,
+        cardholderName: true,
+        panExpiryMonth: true,
+        panExpiryYear: true,
         program: { select: { name: true } },
         credentials: {
           select: { id: true, kind: true, deviceName: true, createdAt: true },
@@ -39,10 +43,10 @@ export function createCardsMineRouter(): Router {
         id: c.id,
         cardRef: c.cardRef,
         status: c.status,
-        panLast4: c.vaultEntry?.panLast4 ?? null,
-        cardholderName: c.vaultEntry?.cardholderName ?? null,
-        panExpiryMonth: c.vaultEntry?.panExpiryMonth ?? null,
-        panExpiryYear: c.vaultEntry?.panExpiryYear ?? null,
+        panLast4: c.panLast4 ?? null,
+        cardholderName: c.cardholderName ?? null,
+        panExpiryMonth: c.panExpiryMonth ?? null,
+        panExpiryYear: c.panExpiryYear ?? null,
         programName: c.program?.name ?? null,
         credentials: c.credentials,
       })),
@@ -58,9 +62,10 @@ export function createCardsMineRouter(): Router {
         id: true,
         cardRef: true,
         status: true,
-        vaultEntry: {
-          select: { panLast4: true, cardholderName: true, panExpiryMonth: true, panExpiryYear: true },
-        },
+        panLast4: true,
+        cardholderName: true,
+        panExpiryMonth: true,
+        panExpiryYear: true,
         program: { select: { name: true } },
         credentials: {
           select: { id: true, kind: true, deviceName: true, createdAt: true },
@@ -73,10 +78,10 @@ export function createCardsMineRouter(): Router {
       id: card.id,
       cardRef: card.cardRef,
       status: card.status,
-      panLast4: card.vaultEntry?.panLast4 ?? null,
-      cardholderName: card.vaultEntry?.cardholderName ?? null,
-      panExpiryMonth: card.vaultEntry?.panExpiryMonth ?? null,
-      panExpiryYear: card.vaultEntry?.panExpiryYear ?? null,
+      panLast4: card.panLast4 ?? null,
+      cardholderName: card.cardholderName ?? null,
+      panExpiryMonth: card.panExpiryMonth ?? null,
+      panExpiryYear: card.panExpiryYear ?? null,
       programName: card.program?.name ?? null,
       credentials: card.credentials,
     });

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { CardStatus } from '@prisma/client';
-import type { StoreCardInput, StoreCardResult, VaultClient } from '@palisade/vault-client';
+import type { RegisterCardInput, RegisterCardResult, VaultClient } from '@palisade/vault-client';
 
 vi.mock('@palisade/db', () => ({
   prisma: {
@@ -37,9 +37,10 @@ const findCard = () =>
 const createCard = () =>
   prisma.card.create as unknown as Mocked<typeof prisma.card.create>;
 
-const storeCardMock = vi.fn<(input: StoreCardInput) => Promise<StoreCardResult>>();
+const registerCardMock = vi.fn<(input: RegisterCardInput) => Promise<RegisterCardResult>>();
 const fakeVaultClient: VaultClient = {
-  storeCard: storeCardMock,
+  storeCard: vi.fn(),
+  registerCard: registerCardMock,
   mintToken: vi.fn(),
   consumeToken: vi.fn(),
   proxy: vi.fn(),
@@ -67,10 +68,9 @@ const VALID_INPUT = {
 beforeEach(() => {
   vi.mocked(findCard()).mockReset();
   vi.mocked(createCard()).mockReset();
-  storeCardMock.mockReset().mockResolvedValue({
-    vaultEntryId: 've_1',
+  registerCardMock.mockReset().mockResolvedValue({
+    vaultToken: 've_1',
     panLast4: '4242',
-    deduped: false,
   });
   vi.mocked(encrypt).mockReset().mockImplementation((plaintext: string) => ({
     ciphertext: `enc(${plaintext})`,
@@ -90,7 +90,7 @@ describe('registerCard — conflict checks (fail before vault writes)', () => {
       status: 409,
       code: 'card_ref_taken',
     });
-    expect(storeCardMock).not.toHaveBeenCalled();
+    expect(registerCardMock).not.toHaveBeenCalled();
     expect(createCard()).not.toHaveBeenCalled();
   });
 
@@ -104,7 +104,7 @@ describe('registerCard — conflict checks (fail before vault writes)', () => {
       status: 409,
       code: 'card_uid_taken',
     });
-    expect(storeCardMock).not.toHaveBeenCalled();
+    expect(registerCardMock).not.toHaveBeenCalled();
     expect(createCard()).not.toHaveBeenCalled();
   });
 
@@ -126,7 +126,7 @@ describe('registerCard — conflict checks (fail before vault writes)', () => {
 });
 
 describe('registerCard — happy path', () => {
-  it('vaults the PAN with onDuplicate=error and the registration purpose', async () => {
+  it('calls vault.registerCard with cardRef as the idempotency key', async () => {
     vi.mocked(findCard()).mockResolvedValue(null);
     vi.mocked(createCard()).mockResolvedValue({
       id: 'card_new',
@@ -136,20 +136,24 @@ describe('registerCard — happy path', () => {
 
     await registerCard({ ...VALID_INPUT, ip: '1.2.3.4', ua: 'test-agent' });
 
-    expect(storeCardMock).toHaveBeenCalledWith(
+    expect(registerCardMock).toHaveBeenCalledWith(
       expect.objectContaining({
         pan: VALID_INPUT.card.pan,
         cvc: VALID_INPUT.card.cvc,
         expiryMonth: VALID_INPUT.card.expiryMonth,
         expiryYear: VALID_INPUT.card.expiryYear,
         cardholderName: VALID_INPUT.card.cardholderName,
-        purpose: `card register ${VALID_INPUT.cardRef}`,
-        onDuplicate: 'error',
+        idempotencyKey: VALID_INPUT.cardRef,
         ip: '1.2.3.4',
         ua: 'test-agent',
       }),
     );
-    expect(storeCardMock.mock.calls[0][0]).not.toHaveProperty('actor');
+    // Register surface is deliberately narrow — the legacy storeCard params
+    // (actor, purpose, onDuplicate, cardId) are NOT part of it.
+    expect(registerCardMock.mock.calls[0][0]).not.toHaveProperty('actor');
+    expect(registerCardMock.mock.calls[0][0]).not.toHaveProperty('purpose');
+    expect(registerCardMock.mock.calls[0][0]).not.toHaveProperty('onDuplicate');
+    expect(registerCardMock.mock.calls[0][0]).not.toHaveProperty('cardId');
   });
 
   it('encrypts UID and both SDM keys in lowercase', async () => {
@@ -169,7 +173,7 @@ describe('registerCard — happy path', () => {
     expect(plaintexts).toContain(VALID_INPUT.sdmFileReadKey.toLowerCase());
   });
 
-  it('creates a SHIPPED Card linked to the vault entry', async () => {
+  it('creates a SHIPPED Card with the opaque vaultToken and mirrored PAN metadata', async () => {
     vi.mocked(findCard()).mockResolvedValue(null);
     vi.mocked(createCard()).mockResolvedValue({
       id: 'card_new',
@@ -183,14 +187,20 @@ describe('registerCard — happy path', () => {
       cardId: 'card_new',
       cardRef: VALID_INPUT.cardRef,
       status: CardStatus.SHIPPED,
-      vaultEntryId: 've_1',
+      vaultToken: 've_1',
       panLast4: '4242',
     });
 
     const data = vi.mocked(createCard()).mock.calls[0]![0]!.data as Record<string, unknown>;
     expect(data.cardRef).toBe(VALID_INPUT.cardRef);
     expect(data.status).toBe(CardStatus.SHIPPED);
-    expect(data.vaultEntryId).toBe('ve_1');
+    expect(data.vaultToken).toBe('ve_1');
+    // Mirrored PAN metadata so /cards/mine doesn't need to join the vault.
+    expect(data.panLast4).toBe('4242');
+    expect(data.panBin).toBe('424242');
+    expect(data.cardholderName).toBe(VALID_INPUT.card.cardholderName);
+    expect(data.panExpiryMonth).toBe(VALID_INPUT.card.expiryMonth);
+    expect(data.panExpiryYear).toBe(VALID_INPUT.card.expiryYear);
     expect(data.uidEncrypted).toBe(`enc(${VALID_INPUT.uid.toLowerCase()})`);
     expect(data.sdmMetaReadKeyEncrypted).toBe(`enc(${VALID_INPUT.sdmMetaReadKey.toLowerCase()})`);
     expect(data.sdmFileReadKeyEncrypted).toBe(`enc(${VALID_INPUT.sdmFileReadKey.toLowerCase()})`);
@@ -198,6 +208,8 @@ describe('registerCard — happy path', () => {
     expect(data.programId).toBe(VALID_INPUT.programId);
     expect(data.batchId).toBe(VALID_INPUT.batchId);
     expect(data.uidFingerprint).toBe(fingerprintUid(VALID_INPUT.uid));
+    // FK is gone — the old vaultEntryId field must not be written.
+    expect(data).not.toHaveProperty('vaultEntryId');
   });
 });
 

@@ -11,6 +11,7 @@
     { "path": "./packages/emv" },
     { "path": "./packages/provisioning-client" },
     { "path": "./packages/vault-client" },
+    { "path": "./packages/handoff" },
     { "path": "./services/tap" },
     { "path": "./services/activation" },
     { "path": "./services/data-prep" },
