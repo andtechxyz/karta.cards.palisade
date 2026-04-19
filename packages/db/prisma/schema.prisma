@@ -551,6 +551,20 @@ model IssuerProfile {
   imkAlgorithm     String @default("TDES_2KEY")
   derivationMethod String @default("METHOD_A")
 
+  // --- PA TRANSFER_SAD metadata tail ---------------------------------------
+  // Real per-FI identifiers the PA applet writes to NVM during
+  // processTransferSad.  `bankId` and `progId` are 4-byte unsigned ints
+  // stored as plain DB integers (PA wire format: 4-byte big-endian).
+  // `postProvisionUrl` is the hostname (no protocol) the chip bakes into
+  // its post-activation NDEF URL so subsequent taps route straight at the
+  // mobile app deep link instead of the activation flow.  Nullable because
+  // legacy IssuerProfile rows predate these columns; new rows must set
+  // them or RCA refuses to ship the plan (unless
+  // RCA_ALLOW_MINIMAL_SAD=1 is set for dev).
+  bankId           Int?
+  progId           Int?
+  postProvisionUrl String?
+
   // AWS Payment Cryptography key ARNs
   tmkKeyArn      String @default("") // Token Master Key (iCVV)
   imkAcKeyArn    String @default("") // Issuer Master Key - AC (ARQC)
@@ -632,6 +646,15 @@ model ProvisioningSession {
 
   // ICC public key received during KEYGEN phase (uncompressed, 65 bytes)
   iccPublicKey Bytes?
+  // Vendor-signed chip attestation bytes received during KEYGEN phase.
+  // For NXP JCOP 5 / Infineon Secora this is the raw ECDSA-SHA-256 DER
+  // signature the PA applet emitted after the 65-byte uncompressed public
+  // key and before the 42-byte CPLC trailer.  Captured for offline
+  // analysis today; cert-chain verification lives in
+  // AttestationVerifier.verify() (stub mode — always ok=true) until
+  // mobile supports the protocol checkpoint needed to reject before
+  // TRANSFER_SAD.
+  attestation  Bytes?
   // Provenance hash from FINAL_STATUS
   provenance   String?
   // FIDO credential data from FINAL_STATUS

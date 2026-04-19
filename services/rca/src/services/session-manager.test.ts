@@ -1,7 +1,11 @@
-import { vi, describe, it, expect, beforeEach } from 'vitest';
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 // ---------------------------------------------------------------------------
 // Mocks
+//
+// NOTE: vi.mock() runs before imports.  DataPrepService is mocked so we can
+// control the decrypted SAD bytes without standing up AWS KMS.  prisma is
+// mocked for the same reason as before — no DB in unit tests.
 // ---------------------------------------------------------------------------
 
 vi.mock('@palisade/db', () => ({
@@ -29,12 +33,23 @@ vi.mock('undici', () => ({
   request: vi.fn().mockResolvedValue({ statusCode: 200 }),
 }));
 
+const { mockDecryptSad } = vi.hoisted(() => ({
+  mockDecryptSad: vi.fn(),
+}));
+
+vi.mock('@palisade/data-prep/services/data-prep.service', () => ({
+  DataPrepService: {
+    decryptSad: mockDecryptSad,
+  },
+}));
+
 // ---------------------------------------------------------------------------
 // Imports (after mocks)
 // ---------------------------------------------------------------------------
 
 import { prisma } from '@palisade/db';
 import { SessionManager, type WSMessage } from './session-manager.js';
+import { _resetRcaConfig } from '../env.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -49,6 +64,30 @@ const FAKE_SAD_RECORD = {
   status: 'READY',
 };
 
+/**
+ * Fully-populated IssuerProfile shape — matches the happy path where
+ * every field the PA's TRANSFER_SAD parser reads is set.  Tests that
+ * want to exercise the fallback/error paths pass a null or a
+ * partial object instead.
+ */
+const FULL_ISSUER_PROFILE = {
+  scheme: 'mchip_advance',
+  bankId: 0xAABBCCDD,
+  progId: 0x11223344,
+  postProvisionUrl: 'issuer.example.com',
+  chipProfile: {
+    iccPrivateKeyDgi: 0x8001,
+    iccPrivateKeyTag: 0x9F48,
+  },
+};
+
+/** Plaintext SAD bytes the decrypt mock returns when called. */
+const FAKE_PLAINTEXT_SAD = Buffer.from(
+  '0202' + '0A' + '50085041' + '4C495341' + '4445' + // DGI 0x0202 with App Label
+  'CAFEBABE',
+  'hex',
+);
+
 
 
 function makeSession(phase: string, overrides: Record<string, unknown> = {}) {
@@ -58,7 +97,19 @@ function makeSession(phase: string, overrides: Record<string, unknown> = {}) {
     sadRecordId: 'sad_01',
     phase,
     iccPublicKey: null,
+    attestation: null,
     ...overrides,
+  };
+}
+
+function makeSessionWithFullProfile(
+  phase: string,
+  overrides: Record<string, unknown> = {},
+) {
+  return {
+    ...makeSession(phase, overrides),
+    sadRecord: FAKE_SAD_RECORD,
+    card: { program: { issuerProfile: FULL_ISSUER_PROFILE } },
   };
 }
 
@@ -68,10 +119,25 @@ function makeSession(phase: string, overrides: Record<string, unknown> = {}) {
 
 describe('SessionManager', () => {
   let mgr: SessionManager;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  let logSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     vi.clearAllMocks();
+    _resetRcaConfig();
+    delete process.env.RCA_ALLOW_MINIMAL_SAD;
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     mgr = new SessionManager();
+    // Decrypt returns our canned plaintext on every call unless a test
+    // overrides it.  Matches what DataPrepService.decryptSad would do
+    // with a sadKeyVersion=1 ciphertext in dev.
+    mockDecryptSad.mockResolvedValue(FAKE_PLAINTEXT_SAD);
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+    logSpy.mockRestore();
   });
 
   // -------------------------------------------------------------------------
@@ -147,27 +213,16 @@ describe('SessionManager', () => {
   // -------------------------------------------------------------------------
 
   describe('handleMessage — response in KEYGEN phase', () => {
-    it('returns TRANSFER_SAD APDU and stores iccPublicKey', async () => {
+    it('returns TRANSFER_SAD APDU, stores iccPublicKey + attestation', async () => {
       // 65 bytes of fake ICC public key + 72 bytes attestation + 42 CPLC
       const fakeIccPub = Buffer.alloc(65, 0x04);
       const fakeAttest = Buffer.alloc(72, 0xAA);
       const fakeCplc = Buffer.alloc(42, 0xBB);
       const responseData = Buffer.concat([fakeIccPub, fakeAttest, fakeCplc]);
 
-      (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-        ...makeSession('KEYGEN'),
-        sadRecord: FAKE_SAD_RECORD,
-        card: {
-          program: {
-            issuerProfile: {
-              chipProfile: {
-                iccPrivateKeyDgi: 0x8001,
-                iccPrivateKeyTag: 0x9F48,
-              },
-            },
-          },
-        },
-      });
+      (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSessionWithFullProfile('KEYGEN'),
+      );
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
         makeSession('SAD_TRANSFER'),
       );
@@ -183,9 +238,51 @@ describe('SessionManager', () => {
           data: expect.objectContaining({
             phase: 'SAD_TRANSFER',
             iccPublicKey: expect.any(Buffer),
+            attestation: expect.any(Buffer),
           }),
         }),
       );
+      // Real SAD was decrypted.
+      expect(mockDecryptSad).toHaveBeenCalledWith(
+        expect.any(Buffer),
+        '',
+        1,
+      );
+      // Attestation verify stub warning fired.
+      expect(
+        warnSpy.mock.calls.some((args) =>
+          typeof args[0] === 'string' && args[0].includes('STUB MODE'),
+        ),
+      ).toBe(true);
+    });
+
+    it('encodes real issuer profile metadata (not placeholders) in the TRANSFER_SAD APDU', async () => {
+      const fakeIccPub = Buffer.alloc(65, 0x04);
+      const fakeAttest = Buffer.alloc(72, 0xAA);
+      const fakeCplc = Buffer.alloc(42, 0xBB);
+      const responseData = Buffer.concat([fakeIccPub, fakeAttest, fakeCplc]);
+
+      (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSessionWithFullProfile('KEYGEN'),
+      );
+      (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSession('SAD_TRANSFER'),
+      );
+
+      const msg: WSMessage = { type: 'response', hex: responseData.toString('hex'), sw: '9000' };
+      const responses = await mgr.handleMessage('session_01', msg);
+
+      const apduHex = (responses[0].hex ?? '').toUpperCase();
+      // bankId (0xAABBCCDD) and progId (0x11223344) must appear somewhere
+      // in the TRANSFER_SAD payload — exact offset depends on the SAD
+      // payload size so we just check for presence.
+      expect(apduHex).toContain('AABBCCDD');
+      expect(apduHex).toContain('11223344');
+      // postProvisionUrl hostname
+      const urlHex = Buffer.from('issuer.example.com', 'ascii').toString('hex').toUpperCase();
+      expect(apduHex).toContain(urlHex);
+      // dgi+emvTag tail is always the last 4 bytes
+      expect(apduHex.slice(-8)).toBe('80019F48');
     });
   });
 
@@ -342,46 +439,169 @@ describe('SessionManager', () => {
   // -------------------------------------------------------------------------
   // Plan mode — buildPlanForSession
   //
-  // Pure delegation to buildProvisioningPlan after a DB lookup.  We verify
-  // the shape is right and the chipProfile values flow through.
+  // Happy path + fallback + error path.  Verifies that the session's
+  // SadRecord gets decrypted (mocked), the real IssuerProfile fields land
+  // in the plan's TRANSFER_SAD APDU, and that the
+  // `issuer_profile_incomplete` error throws when metadata is missing
+  // unless RCA_ALLOW_MINIMAL_SAD=1.
   // -------------------------------------------------------------------------
 
-  describe('buildPlanForSession', () => {
-    it('assembles a 5-step plan using chipProfile DGI/tag from the session', async () => {
-      (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-        ...makeSession('INIT'),
-        card: {
-          program: {
-            issuerProfile: {
-              chipProfile: {
-                iccPrivateKeyDgi: 0x8001,
-                iccPrivateKeyTag: 0x9F48,
-              },
-            },
-          },
-        },
-      });
+  describe('buildPlanForSession — happy path', () => {
+    it('decrypts the SAD, plumbs IssuerProfile fields, and emits a 5-step plan', async () => {
+      (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSessionWithFullProfile('INIT'),
+      );
 
       const plan = await mgr.buildPlanForSession('session_01');
 
       expect(plan.type).toBe('plan');
       expect(plan.version).toBe(1);
       expect(plan.steps).toHaveLength(5);
-      expect(plan.steps[0].apdu).toBe('00A4040008A00000006250414C');
-      expect(plan.steps[1].apdu).toBe('80E000000101');
-      // TRANSFER_SAD tail should encode dgi+tag
-      expect(plan.steps[2].apdu.slice(-8).toUpperCase()).toBe('80019F48');
+
+      // Decrypt was called with the session's ciphertext + sadKeyVersion=1.
+      expect(mockDecryptSad).toHaveBeenCalledOnce();
+      expect(mockDecryptSad).toHaveBeenCalledWith(
+        FAKE_SAD_RECORD.sadEncrypted,
+        '',
+        FAKE_SAD_RECORD.sadKeyVersion,
+      );
+
+      // Step 2 (TRANSFER_SAD) must contain the real bankId/progId bytes
+      // and the postProvisionUrl string — not the old placeholders.
+      const transfer = plan.steps[2].apdu.toUpperCase();
+      expect(transfer).toContain('AABBCCDD');    // bankId
+      expect(transfer).toContain('11223344');    // progId
+      const urlHex = Buffer.from('issuer.example.com', 'ascii').toString('hex').toUpperCase();
+      expect(transfer).toContain(urlHex);
+      // Tail dgi/emvTag
+      expect(transfer.slice(-8)).toBe('80019F48');
+
+      // And the plaintext SAD bytes must appear at the start of the
+      // TRANSFER_SAD payload body (after the 5-byte APDU header).
+      const body = transfer.slice(10);
+      expect(body.startsWith(FAKE_PLAINTEXT_SAD.toString('hex').toUpperCase())).toBe(true);
     });
 
-    it('falls back to M/Chip-CVN18 defaults when chipProfile is missing', async () => {
+    it('maps IssuerProfile.scheme="vsdc" to 0x02 in the APDU', async () => {
       (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
         ...makeSession('INIT'),
+        sadRecord: FAKE_SAD_RECORD,
+        card: {
+          program: {
+            issuerProfile: { ...FULL_ISSUER_PROFILE, scheme: 'vsdc' },
+          },
+        },
+      });
+
+      const plan = await mgr.buildPlanForSession('session_01');
+      const transfer = plan.steps[2].apdu.toUpperCase();
+      // scheme sits between progId(4) and timestamp(4).  Look for the
+      // exact metadata sequence: progId || scheme || ts ... ; we know
+      // progId = 0x11223344 and scheme should now be 0x02.
+      expect(transfer).toContain('1122334402');
+    });
+  });
+
+  describe('buildPlanForSession — RCA_ALLOW_MINIMAL_SAD=1 dev fallback', () => {
+    it('uses placeholders + minimal "PALISADE" SAD when issuer profile is empty', async () => {
+      process.env.RCA_ALLOW_MINIMAL_SAD = '1';
+      _resetRcaConfig();
+
+      (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...makeSession('INIT'),
+        sadRecord: FAKE_SAD_RECORD,
         card: { program: { issuerProfile: null } },
       });
 
       const plan = await mgr.buildPlanForSession('session_01');
-      // Defaults are 0x8001 / 0x9F48.
-      expect(plan.steps[2].apdu.slice(-8).toUpperCase()).toBe('80019F48');
+
+      // Plan shape is unchanged.
+      expect(plan.steps).toHaveLength(5);
+
+      // Minimal-SAD fallback produces the old placeholder bankId (0x00000001)
+      // and progId (0x00000001), with scheme=0x01.  PA parses from the end
+      // so we check explicit offsets after the SAD.  Minimal SAD = 13 bytes.
+      const transfer = plan.steps[2].apdu.toUpperCase();
+      const body = transfer.slice(10); // strip header
+      const tail = body.slice(26); // strip 13-byte minimal SAD
+      expect(tail.slice(0, 8)).toBe('00000001'); // bankId
+      expect(tail.slice(8, 16)).toBe('00000001'); // progId
+      expect(tail.slice(16, 18)).toBe('01'); // scheme
+
+      // The decrypt path is NOT hit in fallback mode.
+      expect(mockDecryptSad).not.toHaveBeenCalled();
+
+      // Loud warning must have been emitted.
+      expect(
+        warnSpy.mock.calls.some((args) =>
+          typeof args[0] === 'string' && args[0].includes('RCA_ALLOW_MINIMAL_SAD'),
+        ),
+      ).toBe(true);
+    });
+
+    it('still falls back even if only one required IssuerProfile field is missing', async () => {
+      process.env.RCA_ALLOW_MINIMAL_SAD = '1';
+      _resetRcaConfig();
+
+      (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...makeSession('INIT'),
+        sadRecord: FAKE_SAD_RECORD,
+        card: {
+          program: {
+            issuerProfile: { ...FULL_ISSUER_PROFILE, bankId: null },
+          },
+        },
+      });
+
+      const plan = await mgr.buildPlanForSession('session_01');
+      expect(plan.steps).toHaveLength(5);
+      expect(mockDecryptSad).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('buildPlanForSession — issuer_profile_incomplete error path', () => {
+    it('throws badRequest when IssuerProfile is null and fallback flag is off', async () => {
+      (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...makeSession('INIT'),
+        sadRecord: FAKE_SAD_RECORD,
+        card: { program: { issuerProfile: null } },
+      });
+
+      await expect(mgr.buildPlanForSession('session_01')).rejects.toThrow(
+        /issuer_profile_incomplete|IssuerProfile is missing/,
+      );
+    });
+
+    it('throws badRequest when a required field (progId) is null and flag is off', async () => {
+      (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...makeSession('INIT'),
+        sadRecord: FAKE_SAD_RECORD,
+        card: {
+          program: {
+            issuerProfile: { ...FULL_ISSUER_PROFILE, progId: null },
+          },
+        },
+      });
+
+      await expect(mgr.buildPlanForSession('session_01')).rejects.toThrow(
+        /issuer_profile_incomplete|IssuerProfile is missing/,
+      );
+    });
+
+    it('throws when postProvisionUrl is empty string and flag is off', async () => {
+      (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...makeSession('INIT'),
+        sadRecord: FAKE_SAD_RECORD,
+        card: {
+          program: {
+            issuerProfile: { ...FULL_ISSUER_PROFILE, postProvisionUrl: '' },
+          },
+        },
+      });
+
+      await expect(mgr.buildPlanForSession('session_01')).rejects.toThrow(
+        /issuer_profile_incomplete|IssuerProfile is missing/,
+      );
     });
 
     it('throws when the session does not exist', async () => {
@@ -399,7 +619,7 @@ describe('SessionManager', () => {
   // -------------------------------------------------------------------------
 
   describe('handleMessage — plan-mode response routing', () => {
-    it('routes step 1 (keygen) response to iccPublicKey capture', async () => {
+    it('routes step 1 (keygen) response to iccPublicKey + attestation capture', async () => {
       const fakeIccPub = Buffer.alloc(65, 0x04);
       const fakeAttest = Buffer.alloc(72, 0xAA);
       const fakeCplc = Buffer.alloc(42, 0xBB);
@@ -420,9 +640,47 @@ describe('SessionManager', () => {
       expect(responses).toHaveLength(0); // no outbound on step 1 — phone keeps going
       expect(prisma.provisioningSession.update).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: expect.objectContaining({ iccPublicKey: expect.any(Buffer) }),
+          data: expect.objectContaining({
+            iccPublicKey: expect.any(Buffer),
+            attestation: expect.any(Buffer),
+          }),
         }),
       );
+
+      // Attestation stub banner must have fired exactly once for this
+      // keygen response.
+      expect(
+        warnSpy.mock.calls.some((args) =>
+          typeof args[0] === 'string' && args[0].includes('STUB MODE'),
+        ),
+      ).toBe(true);
+    });
+
+    it('persists the attestation bytes on the session row', async () => {
+      // Distinctive attestation payload so we can verify it was saved
+      // verbatim (byte-for-byte) rather than truncated or reshaped.
+      const pub = Buffer.alloc(65, 0x04);
+      const sig = Buffer.from(
+        '3045022100' + '11'.repeat(32) + '022000' + '22'.repeat(30),
+        'hex',
+      );
+      const cplc = Buffer.alloc(42, 0xCC);
+      const full = Buffer.concat([pub, sig, cplc]);
+
+      (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSession('PLAN_SENT'),
+      );
+
+      await mgr.handleMessage('session_01', {
+        type: 'response',
+        i: 1,
+        hex: full.toString('hex'),
+        sw: '9000',
+      });
+
+      const updateCall = (prisma.provisioningSession.update as ReturnType<typeof vi.fn>)
+        .mock.calls[0][0] as { data: { attestation: Buffer } };
+      expect(updateCall.data.attestation.equals(sig)).toBe(true);
     });
 
     it('step 3 success transitions to AWAITING_CONFIRM and emits no response', async () => {

@@ -14,9 +14,20 @@
 
 import { prisma } from '@palisade/db';
 import { APDUBuilder } from '@palisade/emv';
+import { badRequest } from '@palisade/core';
+import { DataPrepService } from '@palisade/data-prep/services/data-prep.service';
 
 import { getRcaConfig } from '../env.js';
-import { buildProvisioningPlan, type Plan, type PlanStep } from './plan-builder.js';
+import {
+  buildProvisioningPlan,
+  buildMinimalSadPayload,
+  buildTransferSadApdu,
+  schemeByteForIssuer,
+  type Plan,
+  type PlanContext,
+  type PlanStep,
+} from './plan-builder.js';
+import { AttestationVerifier } from './attestation-verifier.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -55,6 +66,32 @@ interface SessionState {
   cardId: string;
   sadRecordId: string;
   phase: string;
+}
+
+// ---------------------------------------------------------------------------
+// Minimal shapes for building the PlanContext + TRANSFER_SAD APDU.
+//
+// These are intentionally narrower than Prisma's generated types so the
+// assembly code can be unit-tested with plain objects without importing
+// @prisma/client.
+// ---------------------------------------------------------------------------
+
+interface ChipProfileShape {
+  iccPrivateKeyDgi: number;
+  iccPrivateKeyTag: number;
+}
+
+interface IssuerProfileShape {
+  scheme: string;
+  bankId: number | null;
+  progId: number | null;
+  postProvisionUrl: string | null;
+  chipProfile: ChipProfileShape | null;
+}
+
+interface SadRecordShape {
+  sadEncrypted: Buffer | Uint8Array;
+  sadKeyVersion: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -138,21 +175,33 @@ export class SessionManager {
   }
 
   /**
-   * Plan-mode entry point: load the session's chip-profile inputs and
-   * assemble the full APDU plan.
+   * Plan-mode entry point: load the session's chip-profile + issuer-profile
+   * + SAD-record inputs, decrypt the SAD blob, and assemble the full APDU
+   * plan.
    *
    * Called from the WebSocket relay handler on connection open when the
    * client requested `?mode=plan`.  The relay sends the returned plan
    * over the wire and transitions the session's phase to PLAN_SENT.
    *
-   * Falls back to the M/Chip-CVN18 defaults when the chipProfile isn't
-   * wired on the session's card — matches the classical-path tolerance in
-   * handleKeygenResponse where unset values read as 0x8001/0x9F48.
+   * Failure modes:
+   *   - Session missing: throws a plain Error (caller maps to
+   *     PLAN_BUILD_FAILED on the wire).
+   *   - IssuerProfile missing any of bankId/progId/scheme/postProvisionUrl:
+   *     throws badRequest('issuer_profile_incomplete', ...) UNLESS
+   *     RCA_ALLOW_MINIMAL_SAD=1 — then falls back to the minimal
+   *     "PALISADE" payload + placeholder metadata, with a loud warning.
+   *   - SadRecord decrypt fails: propagates the underlying error.
+   *
+   * No chipProfile defaults here anymore — the IssuerProfile must point
+   * at a real ChipProfile.  The old 0x8001/0x9F48 fallback is retained
+   * ONLY in the minimal-SAD dev path where the entire IssuerProfile is
+   * allowed to be missing.
    */
   async buildPlanForSession(sessionId: string): Promise<Plan> {
     const session = await prisma.provisioningSession.findUnique({
       where: { id: sessionId },
       include: {
+        sadRecord: true,
         card: {
           include: {
             program: {
@@ -166,11 +215,100 @@ export class SessionManager {
       throw new Error(`Unknown session: ${sessionId}`);
     }
 
-    const chipProfile = session.card?.program?.issuerProfile?.chipProfile;
-    return buildProvisioningPlan({
-      iccPrivateKeyDgi: chipProfile?.iccPrivateKeyDgi ?? 0x8001,
-      iccPrivateKeyTag: chipProfile?.iccPrivateKeyTag ?? 0x9F48,
-    });
+    const issuerProfile = session.card?.program?.issuerProfile ?? null;
+    const ctx = await this.buildPlanContext(issuerProfile, session.sadRecord);
+    return buildProvisioningPlan(ctx);
+  }
+
+  /**
+   * Resolve a PlanContext from a session's IssuerProfile + SadRecord.
+   *
+   * Path A (happy): IssuerProfile has bankId/progId/postProvisionUrl/scheme
+   * and chipProfile.  Real SAD bytes are decrypted from SadRecord.
+   *
+   * Path B (RCA_ALLOW_MINIMAL_SAD=1 fallback): any of the required
+   * IssuerProfile fields are missing.  We log a prominent warning and
+   * synthesize a context using the minimal "PALISADE" SAD plus the old
+   * placeholder metadata.  Dev only.
+   *
+   * Path C (neither): throw badRequest('issuer_profile_incomplete', ...).
+   */
+  private async buildPlanContext(
+    issuerProfile: IssuerProfileShape | null,
+    sadRecord: SadRecordShape | null,
+  ): Promise<PlanContext> {
+    const complete =
+      issuerProfile !== null &&
+      issuerProfile.bankId !== null &&
+      issuerProfile.progId !== null &&
+      issuerProfile.postProvisionUrl !== null &&
+      issuerProfile.postProvisionUrl.length > 0 &&
+      issuerProfile.chipProfile !== null;
+
+    if (complete) {
+      // Path A — all IssuerProfile fields populated; decrypt real SAD.
+      if (!sadRecord) {
+        throw badRequest(
+          'sad_record_missing',
+          'Session has no SAD record to decrypt',
+        );
+      }
+
+      const config = getRcaConfig();
+      const encryptedBuf = Buffer.isBuffer(sadRecord.sadEncrypted)
+        ? sadRecord.sadEncrypted
+        : Buffer.from(sadRecord.sadEncrypted);
+      const sadPayload = await DataPrepService.decryptSad(
+        encryptedBuf,
+        config.KMS_SAD_KEY_ARN ?? '',
+        sadRecord.sadKeyVersion,
+      );
+
+      const ip = issuerProfile as IssuerProfileShape & {
+        bankId: number;
+        progId: number;
+        postProvisionUrl: string;
+        chipProfile: ChipProfileShape;
+      };
+
+      return {
+        iccPrivateKeyDgi: ip.chipProfile.iccPrivateKeyDgi,
+        iccPrivateKeyTag: ip.chipProfile.iccPrivateKeyTag,
+        bankId:            ip.bankId,
+        progId:            ip.progId,
+        scheme:            schemeByteForIssuer(ip.scheme),
+        postProvisionUrl:  ip.postProvisionUrl,
+        sadPayload,
+      };
+    }
+
+    // Path B/C: IssuerProfile incomplete.  Check the dev flag.
+    const config = getRcaConfig();
+    if (config.RCA_ALLOW_MINIMAL_SAD !== '1') {
+      throw badRequest(
+        'issuer_profile_incomplete',
+        'IssuerProfile is missing one or more required fields ' +
+        '(bankId, progId, postProvisionUrl, chipProfile).  Set ' +
+        'RCA_ALLOW_MINIMAL_SAD=1 for dev fallback.',
+      );
+    }
+
+    console.warn(
+      '[rca] RCA_ALLOW_MINIMAL_SAD=1: falling back to minimal "PALISADE" ' +
+      'SAD with placeholder metadata — this corrupts per-FI identity on ' +
+      'the chip and must NOT be enabled in prod.  Populate IssuerProfile ' +
+      '(bankId/progId/postProvisionUrl/scheme/chipProfile) to use real SAD.',
+    );
+
+    return {
+      iccPrivateKeyDgi: issuerProfile?.chipProfile?.iccPrivateKeyDgi ?? 0x8001,
+      iccPrivateKeyTag: issuerProfile?.chipProfile?.iccPrivateKeyTag ?? 0x9F48,
+      bankId:           0x00000001,
+      progId:           0x00000001,
+      scheme:           0x01,
+      postProvisionUrl: 'mobile.karta.cards',
+      sadPayload:       buildMinimalSadPayload(),
+    };
   }
 
   // -----------------------------------------------------------------------
@@ -294,14 +432,20 @@ export class SessionManager {
   }
 
   /**
-   * Phase 2: Process keygen response, store ICC public key, send TRANSFER_SAD.
-   * Response: ICC_PubKey(65) || Attest_Sig(~72) || CPLC(42)
+   * Phase 2: Process keygen response, store ICC public key + attestation,
+   * run the stub attestation verify, then send TRANSFER_SAD.
+   *
+   * Response layout: ICC_PubKey(65) || Attest_Sig(var, ~70-72) || CPLC(42)
+   *
+   * The pubkey capture + TRANSFER_SAD assembly used to live inline here
+   * as 40 lines of hand-sliced Buffer math and placeholder metadata.
+   * Both responsibilities now route through dedicated helpers so the
+   * classical path matches plan mode byte-for-byte.
    */
   private async handleKeygenResponse(sessionId: string, msg: WSMessage): Promise<WSMessage[]> {
     const respData = Buffer.from(msg.hex ?? '', 'hex');
-    const iccPubkey = respData.subarray(0, Math.min(65, respData.length));
 
-    // Load session with SAD record and card's program/chip profile
+    // Load session with SAD record and card's program/issuer/chip profile
     const session = await prisma.provisioningSession.findUnique({
       where: { id: sessionId },
       include: {
@@ -318,85 +462,26 @@ export class SessionManager {
 
     if (!session) return [];
 
+    // Extract pubkey + attestation + CPLC from the GENERATE_KEYS response.
+    const { iccPubkey, attestation } = AttestationVerifier.extract(respData);
+    // Stub-mode verify — always ok=true today; logs a warning banner every
+    // call so we can't accidentally ship this path as production.
+    AttestationVerifier.verify(attestation, 'unknown');
+
     await prisma.provisioningSession.update({
       where: { id: sessionId },
-      data: { phase: 'SAD_TRANSFER', iccPublicKey: iccPubkey },
+      data: {
+        phase: 'SAD_TRANSFER',
+        iccPublicKey: iccPubkey,
+        attestation,
+      },
     });
 
-    // Build TRANSFER_SAD payload in the exact layout the PA applet's
-    // processTransferSad() parses (palisade-pa/src/com/palisade/pa/
-    // ProvisioningAgent.java:481).  PA parses from the END of the buffer:
-    //
-    //   [SAD_DGIs:var] [bank_id:4] [prog_id:4] [scheme:1] [ts:4]
-    //     [url:var] [url_len:1] [iccPrivDgi:2] [iccPrivEmvTag:2]
-    //
-    // The "SAD_DGIs" portion here is a minimal in-applet-consumable record
-    // list — [dgi_tag:2][len:1][data]* — NOT the full EMV-structured SAD
-    // that @palisade/emv's SAD builder produces (that heavier format is for
-    // the payment applet's own STORE DATA and is built separately by
-    // data-prep; it's not what the PA's processTransferSad consumes).
-    //
-    // Mirror palisade-rca/app/services/session_manager.py:227 — a single
-    // DGI 0x0101 with TLV tag 0x50 (App Label) is enough to get the PA
-    // to 9000 on TRANSFER_SAD and advance state to PERSO_IN_PROGRESS.
-    // Replace the minimal SAD with real DGIs sourced from data-prep once
-    // we need the payment applet to actually hold per-card EMV data.
-    const chipProfile = session.card?.program?.issuerProfile?.chipProfile;
-    const iccPrivDgi = chipProfile?.iccPrivateKeyDgi ?? 0x8001;
-    const iccPrivTag = chipProfile?.iccPrivateKeyTag ?? 0x9F48;
-
-    // Minimal SAD — one DGI 0x0101 carrying TLV 0x50 (App Label) "PALISADE"
-    const appLabel = Buffer.from('PALISADE', 'ascii');
-    const tlv50 = Buffer.concat([Buffer.from([0x50, appLabel.length]), appLabel]);
-    const dgi0101 = Buffer.concat([Buffer.from([0x01, 0x01, tlv50.length]), tlv50]);
-    const sadPayload = dgi0101;
-
-    // Metadata tail — keep these as placeholders until data-prep starts
-    // sourcing real per-FI values from IssuerProfile.  PA only writes the
-    // bytes to NVM; it doesn't enforce structure on bank_id / prog_id /
-    // scheme / url beyond length.
-    const bankId = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-    const progId = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-    const scheme = Buffer.from([0x01]); // 0x01 = Mastercard, 0x02 = Visa
-    const timestamp = Math.floor(Date.now() / 1000);
-    const tsBuf = Buffer.alloc(4);
-    tsBuf.writeUInt32BE(timestamp, 0);
-    const bankUrl = Buffer.from('mobile.karta.cards', 'ascii');
-    const urlLen = Buffer.from([bankUrl.length]);
-    const dgiTag = Buffer.alloc(2);
-    dgiTag.writeUInt16BE(iccPrivDgi, 0);
-    const emvTag = Buffer.alloc(2);
-    emvTag.writeUInt16BE(iccPrivTag, 0);
-
-    const transferData = Buffer.concat([
-      sadPayload,
-      bankId,
-      progId,
-      scheme,
-      tsBuf,
-      bankUrl,
-      urlLen,
-      dgiTag,
-      emvTag,
-    ]);
-
-    const lc = transferData.length;
-    let transferApdu: Buffer;
-    if (lc <= 255) {
-      transferApdu = Buffer.concat([
-        Buffer.from([0x80, 0xE2, 0x00, 0x00, lc]),
-        transferData,
-      ]);
-    } else {
-      // Extended APDU for large SAD
-      const lcBuf = Buffer.alloc(2);
-      lcBuf.writeUInt16BE(lc, 0);
-      transferApdu = Buffer.concat([
-        Buffer.from([0x80, 0xE2, 0x00, 0x00, 0x00]),
-        lcBuf,
-        transferData,
-      ]);
-    }
+    const ctx = await this.buildPlanContext(
+      session.card?.program?.issuerProfile ?? null,
+      session.sadRecord,
+    );
+    const transferApdu = buildTransferSadApdu(ctx);
 
     return [{
       type: 'apdu',
@@ -576,19 +661,29 @@ export class SessionManager {
 
   /**
    * Step 1: GENERATE_KEYS response — capture the chip's ECC P-256 public
-   * key.  In the classical path this is handleKeygenResponse; plan mode
-   * skips the state-machine transitions (no phase updates) because the
-   * phone is already executing subsequent steps.
+   * key AND the vendor-signed attestation bytes.  In the classical path
+   * this is handleKeygenResponse; plan mode skips the state-machine
+   * transitions (no phase updates) because the phone is already executing
+   * subsequent steps.
    *
    * Response body: ICC_PubKey(65) || Attest_Sig(~72) || CPLC(42).  We
-   * store the first 65 bytes (uncompressed SEC1 pubkey 0x04 || X || Y)
-   * for audit and future attestation verification.
+   * store the pubkey and the raw attestation bytes for audit + offline
+   * analysis.  AttestationVerifier.verify() is currently STUB MODE —
+   * always returns ok=true while logging a prominent warning banner so
+   * we can't accidentally ship this path as production.  We'll gate plan
+   * execution on the real verdict once the mobile client supports the
+   * protocol checkpoint mechanism (plan field {checkpointAfter: 1}).
    */
   private async handlePlanKeygen(sessionId: string, data: Buffer): Promise<WSMessage[]> {
-    const iccPubkey = data.subarray(0, Math.min(65, data.length));
+    const { iccPubkey, attestation } = AttestationVerifier.extract(data);
+    AttestationVerifier.verify(attestation, 'unknown');
+
     await prisma.provisioningSession.update({
       where: { id: sessionId },
-      data: { iccPublicKey: iccPubkey },
+      data: {
+        iccPublicKey: iccPubkey,
+        attestation,
+      },
     });
     return [];
   }

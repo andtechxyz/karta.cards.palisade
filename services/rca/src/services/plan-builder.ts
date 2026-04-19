@@ -19,9 +19,10 @@
  *
  *   - SELECT PA: constant (AID A00000006250414C)
  *   - GENERATE_KEYS: constant (80E000000101 — no session-ID payload)
- *   - TRANSFER_SAD: computed from chipProfile.iccPrivateKeyDgi/Tag plus a
- *     static minimal SAD blob (App Label "PALISADE" inside DGI 0x0101).
- *     Does NOT depend on the chip's keygen response.
+ *   - TRANSFER_SAD: computed from PlanContext (chipProfile DGI/tag, the
+ *     IssuerProfile's bankId/progId/scheme/postProvisionUrl, plus the
+ *     plaintext SAD bytes decrypted from SadRecord.sadEncrypted).  Does
+ *     NOT depend on the chip's keygen response.
  *   - FINAL_STATUS: constant (80E6000000)
  *   - CONFIRM: constant (80E8000000)
  *
@@ -69,15 +70,42 @@ export interface Plan {
 
 /**
  * Per-card inputs needed to assemble the TRANSFER_SAD APDU.  Sourced from
- * the session's linked ChipProfile; values here are the Palisade defaults
- * for M/Chip CVN 18 and are used as fallbacks when a chip profile isn't
- * wired yet.
+ * the session's linked ChipProfile, IssuerProfile, and decrypted SadRecord.
+ *
+ * All fields are required — callers that can't populate one should either
+ * throw `issuer_profile_incomplete` before reaching this layer or fall
+ * back to {@link minimalSadContext} behind the RCA_ALLOW_MINIMAL_SAD dev
+ * flag.  We no longer tolerate hardcoded defaults here because the PA
+ * writes these bytes to chip NVM verbatim; incorrect values silently
+ * corrupt the card's post-personalisation state.
  */
 export interface PlanContext {
   /** DGI tag the PA uses to address the ICC private key slot. */
   iccPrivateKeyDgi: number;
   /** EMV tag for the ICC private key (e.g. 0x9F48). */
   iccPrivateKeyTag: number;
+  /** 4-byte big-endian bank identifier.  From IssuerProfile.bankId. */
+  bankId: number;
+  /** 4-byte big-endian program identifier.  From IssuerProfile.progId. */
+  progId: number;
+  /**
+   * 1-byte scheme code the PA applet stores in NVM.
+   *   0x01 = Mastercard (mchip_advance)
+   *   0x02 = Visa (vsdc)
+   * Resolve from IssuerProfile.scheme via {@link schemeByteForIssuer}.
+   */
+  scheme: number;
+  /** Hostname (no protocol) the chip bakes into post-activation NDEF URLs. */
+  postProvisionUrl: string;
+  /**
+   * Real plaintext SAD bytes.  Decrypted from SadRecord.sadEncrypted by
+   * {@link SessionManager.buildPlanForSession} via
+   * `DataPrepService.decryptSad`.  In dev-fallback mode this instead holds
+   * the minimal in-applet-consumable [DGI(2)|len(1)|TLV 0x50 "PALISADE"]
+   * blob.  Layout at the wire level is opaque to this module — we just
+   * bolt the bytes in front of the metadata tail and let the PA parse.
+   */
+  sadPayload: Buffer;
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +135,40 @@ const FINAL_STATUS_APDU = '80E6000000';
 /** CONFIRM — zero-data commit. */
 const CONFIRM_APDU = '80E8000000';
 
+/**
+ * Minimal "PALISADE" SAD blob — one DGI 0x0101 carrying TLV 0x50
+ * (App Label).  Structurally enough to get the PA to SW=9000 on
+ * TRANSFER_SAD but writes no real EMV content; only used behind
+ * RCA_ALLOW_MINIMAL_SAD=1 when the IssuerProfile is incomplete.
+ */
+export function buildMinimalSadPayload(): Buffer {
+  const appLabel = Buffer.from('PALISADE', 'ascii');
+  const tlv50 = Buffer.concat([Buffer.from([0x50, appLabel.length]), appLabel]);
+  return Buffer.concat([Buffer.from([0x01, 0x01, tlv50.length]), tlv50]);
+}
+
+/**
+ * Map an IssuerProfile.scheme string to the 1-byte scheme code the PA
+ * applet's processTransferSad() records in chip NVM.
+ *
+ *   "mchip_advance" → 0x01 (Mastercard)
+ *   "vsdc"          → 0x02 (Visa)
+ *
+ * Throws for any other value so a misconfigured profile fails loudly at
+ * plan build time rather than writing 0x00 into the chip.
+ */
+export function schemeByteForIssuer(scheme: string): number {
+  switch (scheme) {
+    case 'mchip_advance': return 0x01;
+    case 'vsdc':          return 0x02;
+    default:
+      throw new Error(
+        `plan-builder: unknown IssuerProfile.scheme='${scheme}' ` +
+        `(expected 'mchip_advance' or 'vsdc')`,
+      );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -114,7 +176,7 @@ const CONFIRM_APDU = '80E8000000';
 /**
  * Build the full 5-step provisioning plan for a session.
  *
- * Pure function — takes only the chipProfile-derived context.  Callers
+ * Pure function — takes only the context assembled by the caller.  Callers
  * that need a session-scoped plan (e.g. {@link buildPlanForSession}) load
  * the context from the database first and then delegate here.  This split
  * keeps the APDU-assembly code unit-testable without a DB.
@@ -134,7 +196,7 @@ export function buildProvisioningPlan(ctx: PlanContext): Plan {
 }
 
 // ---------------------------------------------------------------------------
-// TRANSFER_SAD assembly — lifted verbatim from SessionManager.handleKeygenResponse.
+// TRANSFER_SAD assembly
 // ---------------------------------------------------------------------------
 
 /**
@@ -146,34 +208,37 @@ export function buildProvisioningPlan(ctx: PlanContext): Plan {
  *   [SAD_DGIs:var] [bank_id:4] [prog_id:4] [scheme:1] [ts:4]
  *     [url:var] [url_len:1] [iccPrivDgi:2] [iccPrivEmvTag:2]
  *
- * The SAD_DGIs here is the applet-consumable minimal form — a single DGI
- * 0x0101 with TLV 0x50 (App Label "PALISADE") — NOT the richer EMV-
- * structured SAD that @palisade/emv's SADBuilder produces for the payment
- * applet's STORE DATA.  This minimal payload is enough to get the PA to
- * 9000 on TRANSFER_SAD and advance state to PERSO_IN_PROGRESS.  When
- * data-prep is wired to stream real per-FI SAD bytes, replace `sadPayload`
- * with the decrypted data-prep output.
+ * The SAD_DGIs here can be either:
+ *   - real plaintext SAD bytes decrypted from SadRecord.sadEncrypted
+ *     (production / e2e once the IssuerProfile is fully populated), or
+ *   - the minimal DGI 0x0101 + TLV 0x50 "PALISADE" stub
+ *     (dev-fallback under RCA_ALLOW_MINIMAL_SAD=1).
  *
- * bank_id / prog_id / scheme / url are placeholders today — the PA writes
- * the bytes to NVM without enforcing structure.  Source from IssuerProfile
- * once the downstream reads care about them.
+ * bank_id / prog_id / scheme / url are now sourced from the IssuerProfile
+ * row — they land in chip NVM verbatim, so passing placeholders here
+ * would corrupt the card's post-personalisation identity.
  */
-function buildTransferSadApdu(ctx: PlanContext): Buffer {
-  // Minimal SAD: one DGI 0x0101 carrying TLV 0x50 (App Label "PALISADE").
-  const appLabel = Buffer.from('PALISADE', 'ascii');
-  const tlv50 = Buffer.concat([Buffer.from([0x50, appLabel.length]), appLabel]);
-  const dgi0101 = Buffer.concat([Buffer.from([0x01, 0x01, tlv50.length]), tlv50]);
-  const sadPayload = dgi0101;
+export function buildTransferSadApdu(ctx: PlanContext): Buffer {
+  const sadPayload = ctx.sadPayload;
 
-  // Placeholder metadata tail — structure-free from PA's perspective.
-  const bankId = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-  const progId = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-  const scheme = Buffer.from([0x01]); // 0x01 = Mastercard, 0x02 = Visa
+  const bankId = Buffer.alloc(4);
+  bankId.writeUInt32BE(ctx.bankId >>> 0, 0);
+  const progId = Buffer.alloc(4);
+  progId.writeUInt32BE(ctx.progId >>> 0, 0);
+  const scheme = Buffer.from([ctx.scheme & 0xff]);
+
   const timestamp = Math.floor(Date.now() / 1000);
   const tsBuf = Buffer.alloc(4);
   tsBuf.writeUInt32BE(timestamp, 0);
-  const bankUrl = Buffer.from('mobile.karta.cards', 'ascii');
+
+  const bankUrl = Buffer.from(ctx.postProvisionUrl, 'ascii');
+  if (bankUrl.length > 0xff) {
+    throw new Error(
+      `plan-builder: postProvisionUrl too long (${bankUrl.length} bytes, max 255)`,
+    );
+  }
   const urlLen = Buffer.from([bankUrl.length]);
+
   const dgiTag = Buffer.alloc(2);
   dgiTag.writeUInt16BE(ctx.iccPrivateKeyDgi, 0);
   const emvTag = Buffer.alloc(2);
@@ -199,9 +264,8 @@ function buildTransferSadApdu(ctx: PlanContext): Buffer {
     ]);
   }
 
-  // Extended-length APDU path — not expected for the current minimal SAD
-  // (transferData runs ~50 bytes) but preserved for parity with the
-  // SessionManager path in case a fatter payload lands here later.
+  // Extended-length APDU path — kicks in once real SAD bytes push the
+  // payload past 255.  Header becomes 80 E2 00 00 00 Lc-hi Lc-lo.
   const lcBuf = Buffer.alloc(2);
   lcBuf.writeUInt16BE(lc, 0);
   return Buffer.concat([

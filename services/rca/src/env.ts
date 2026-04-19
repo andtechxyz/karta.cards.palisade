@@ -27,6 +27,30 @@ const { get: getRcaConfig, reset: _resetRcaConfig } = defineEnv({
   // /api/provision/*).  When unset, fall back to the inbound request host —
   // OK for local dev, would hand the phone an unreachable URL in prod.
   RCA_PUBLIC_WS_BASE: z.string().url().optional(),
+
+  // --- SAD decryption ------------------------------------------------------
+  // RCA reads SadRecord.sadEncrypted and passes the decrypted bytes to the
+  // PA applet as part of TRANSFER_SAD.  Must match what the data-prep
+  // service used to encrypt the blob — different sadKeyVersion values
+  // select between regimes:
+  //   0 → KMS CiphertextBlob, decrypted via KMS_SAD_KEY_ARN
+  //   1 → AES-128-ECB under DEV_SAD_MASTER_KEY (dev/e2e)
+  //
+  // KMS_SAD_KEY_ARN is optional; when empty, only dev-mode ciphertexts
+  // (sadKeyVersion=1) can be decrypted — which is the case for the
+  // e2e_fi_2590 fixture today.
+  KMS_SAD_KEY_ARN: z.string().default(''),
+  AWS_REGION: z.string().default('ap-southeast-2'),
+
+  // --- Dev-only fallback ---------------------------------------------------
+  // When set to "1", buildPlanForSession allows the minimal-SAD path
+  // (one DGI 0x0101 / TLV 0x50 "PALISADE" + placeholder metadata) when
+  // the IssuerProfile is incomplete.  Intended solely for the e2e_fi_2590
+  // skeleton profile that still exists in the dev DB.  Emits a prominent
+  // warning every time it fires so it never goes unnoticed.  Prod
+  // deployments MUST leave this unset — RCA throws
+  // issuer_profile_incomplete if it is.
+  RCA_ALLOW_MINIMAL_SAD: z.enum(['0', '1']).default('0'),
 });
 
 export { getRcaConfig, _resetRcaConfig };
