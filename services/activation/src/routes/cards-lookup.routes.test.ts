@@ -148,6 +148,7 @@ describe('GET /api/cards/lookup/:cardId', () => {
         panLast4: true,
         panBin: true,
         cardholderName: true,
+        vaultToken: true,
       });
     } finally {
       await close();

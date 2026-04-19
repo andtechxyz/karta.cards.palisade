@@ -55,6 +55,11 @@ export function createCardsPayRouter(payGate: RequestHandler): Router {
         panLast4: true,
         panBin: true,
         cardholderName: true,
+        // vaultToken = opaque Vera VaultEntry id (the cross-repo FK
+        // surrogate from Phase 2 FK cut).  Pay stamps this onto
+        // Transaction.vaultEntryId at create time so the payment-auth
+        // path can mint retrieval tokens without a second round-trip.
+        vaultToken: true,
       },
     });
     if (!card) throw notFound('card_not_found', 'Card not found');
