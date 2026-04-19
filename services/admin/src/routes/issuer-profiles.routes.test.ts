@@ -364,3 +364,149 @@ describe('PATCH /api/issuer-profiles/:id', () => {
     expect(body.tmkKeyArn).toBe('arn:aws:pc::999:key/new');
   });
 });
+
+// ---------------------------------------------------------------------------
+// PA TRANSFER_SAD metadata tail: bankId + progId + postProvisionUrl
+// ---------------------------------------------------------------------------
+
+describe('bankId / progId / postProvisionUrl', () => {
+  it('create accepts all three fields and patch round-trips them', async () => {
+    // --- create ---
+    const created = {
+      id: 'ip_new',
+      programId: 'prog_1',
+      chipProfileId: 'cp_1',
+      scheme: 'mchip_advance',
+      cvn: 18,
+      bankId: 0x00112233,
+      progId: 0x0000ABCD,
+      postProvisionUrl: 'tap.karta.cards',
+    };
+    create().mockResolvedValue(created);
+    const app = buildApp();
+    const post = await inject(app, 'POST', '/api/issuer-profiles', {
+      programId: 'prog_1',
+      chipProfileId: 'cp_1',
+      scheme: 'mchip_advance',
+      cvn: 18,
+      bankId: 0x00112233,
+      progId: 0x0000ABCD,
+      postProvisionUrl: 'tap.karta.cards',
+    });
+    expect(post.status).toBe(201);
+    expect(create()).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          bankId: 0x00112233,
+          progId: 0x0000ABCD,
+          postProvisionUrl: 'tap.karta.cards',
+        }),
+      }),
+    );
+
+    // --- patch them back ---
+    update().mockResolvedValue({
+      ...created,
+      bankId: 0x44556677,
+      progId: 0x0000CAFE,
+      postProvisionUrl: 'activate.new-fi.example',
+    });
+    const patch = await inject(app, 'PATCH', '/api/issuer-profiles/ip_new', {
+      bankId: 0x44556677,
+      progId: 0x0000CAFE,
+      postProvisionUrl: 'activate.new-fi.example',
+    });
+    expect(patch.status).toBe(200);
+    expect(patch.body.bankId).toBe(0x44556677);
+    expect(patch.body.progId).toBe(0x0000CAFE);
+    expect(patch.body.postProvisionUrl).toBe('activate.new-fi.example');
+  });
+
+  it('accepts null to clear any of the three (legacy rows)', async () => {
+    update().mockResolvedValue({ id: 'ip_1', bankId: null, progId: null, postProvisionUrl: null });
+    const app = buildApp();
+    const { status } = await inject(app, 'PATCH', '/api/issuer-profiles/ip_1', {
+      bankId: null,
+      progId: null,
+      postProvisionUrl: null,
+    });
+    expect(status).toBe(200);
+    expect(update()).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          bankId: null,
+          progId: null,
+          postProvisionUrl: null,
+        }),
+      }),
+    );
+  });
+
+  it('rejects bankId above the 4-byte range', async () => {
+    const app = buildApp();
+    const { status, body } = await inject(app, 'POST', '/api/issuer-profiles', {
+      programId: 'prog_1',
+      chipProfileId: 'cp_1',
+      scheme: 'mchip_advance',
+      cvn: 18,
+      bankId: 0x1_0000_0000, // one past 0xFFFFFFFF
+    });
+    expect(status).toBe(400);
+    expect(body.error.code).toBe('validation_failed');
+  });
+
+  it('rejects postProvisionUrl longer than 255 bytes (PA applet cap)', async () => {
+    const app = buildApp();
+    const { status, body } = await inject(app, 'POST', '/api/issuer-profiles', {
+      programId: 'prog_1',
+      chipProfileId: 'cp_1',
+      scheme: 'mchip_advance',
+      cvn: 18,
+      postProvisionUrl: 'x'.repeat(256),
+    });
+    expect(status).toBe(400);
+    expect(body.error.code).toBe('validation_failed');
+  });
+
+  it('list endpoint includes bankId + progId but strips postProvisionUrl', async () => {
+    findMany().mockResolvedValue([
+      {
+        id: 'ip_1',
+        programId: 'prog_1',
+        chipProfileId: 'cp_1',
+        scheme: 'mchip_advance',
+        cvn: 18,
+        bankId: 0x12345678,
+        progId: 0x00000042,
+        postProvisionUrl: 'tap.karta.cards',
+        tmkKeyArn: 'arn:aws:pc::123:key/abcd1234',
+        imkAcKeyArn: '',
+        imkSmiKeyArn: '',
+        imkSmcKeyArn: '',
+        imkIdnKeyArn: '',
+        issuerPkKeyArn: '',
+      },
+    ]);
+    const app = buildApp();
+    const { status, body } = await inject(app, 'GET', '/api/issuer-profiles');
+    expect(status).toBe(200);
+    expect(body[0].bankId).toBe(0x12345678);
+    expect(body[0].progId).toBe(0x00000042);
+    expect(body[0].postProvisionUrl).toBeUndefined();
+  });
+
+  it('detail endpoint returns postProvisionUrl unmasked', async () => {
+    findUnique().mockResolvedValue({
+      id: 'ip_1',
+      bankId: 0x00112233,
+      progId: 0x00000001,
+      postProvisionUrl: 'tap.karta.cards',
+    });
+    const app = buildApp();
+    const { status, body } = await inject(app, 'GET', '/api/issuer-profiles/ip_1');
+    expect(status).toBe(200);
+    expect(body.bankId).toBe(0x00112233);
+    expect(body.progId).toBe(0x00000001);
+    expect(body.postProvisionUrl).toBe('tap.karta.cards');
+  });
+});
