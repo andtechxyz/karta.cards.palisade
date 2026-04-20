@@ -53,14 +53,31 @@ export interface PrepareResult {
 // Service
 // ---------------------------------------------------------------------------
 
+/**
+ * Module-level KMSClient singleton.  Constructing a fresh client on every
+ * decrypt (latency audit opt #5) cost ~10-20 ms on TLS + DNS warm-up; the
+ * persistent client reuses keep-alive connections for every call after
+ * the first.  Region resolves lazily from AWS_REGION at first construction.
+ */
+let _moduleKms: KMSClient | null = null;
+function kmsClient(): KMSClient {
+  if (!_moduleKms) {
+    const region = process.env.AWS_REGION ?? 'ap-southeast-2';
+    _moduleKms = new KMSClient({ region });
+  }
+  return _moduleKms;
+}
+
+/** Test hook: reset the singleton so tests can swap regions / mocks. */
+export function _resetKmsSingleton(): void {
+  _moduleKms = null;
+}
+
 export class DataPrepService {
   private readonly emv: EmvDerivationService;
-  private readonly kms: KMSClient;
 
   constructor() {
-    const config = getDataPrepConfig();
     this.emv = EmvDerivationService.fromEnv();
-    this.kms = new KMSClient({ region: config.AWS_REGION });
   }
 
   async prepareCard(input: PrepareInput): Promise<PrepareResult> {
@@ -260,8 +277,8 @@ export class DataPrepService {
     kmsKeyArn: string,
   ): Promise<{ encrypted: Buffer; keyVersion: number }> {
     if (kmsKeyArn) {
-      // Production: KMS encrypt
-      const resp = await this.kms.send(
+      // Production: KMS encrypt via shared singleton (keeps TLS keep-alive).
+      const resp = await kmsClient().send(
         new EncryptCommand({ KeyId: kmsKeyArn, Plaintext: sadBytes }),
       );
       if (!resp.CiphertextBlob) {
@@ -297,10 +314,11 @@ export class DataPrepService {
     sadKeyVersion = 0,
   ): Promise<Buffer> {
     if (sadKeyVersion === 0 && kmsKeyArn) {
-      // Production: KMS decrypt — CiphertextBlob is self-describing
-      const config = getDataPrepConfig();
-      const kms = new KMSClient({ region: config.AWS_REGION });
-      const resp = await kms.send(
+      // Production: KMS decrypt — CiphertextBlob is self-describing.
+      // Use the module-level KMSClient singleton; constructing a fresh
+      // client on every call adds ~10-20 ms of TLS + DNS warm-up on the
+      // first request after process start (latency audit, opt #5).
+      const resp = await kmsClient().send(
         new DecryptCommand({ CiphertextBlob: encrypted }),
       );
       if (!resp.Plaintext) {

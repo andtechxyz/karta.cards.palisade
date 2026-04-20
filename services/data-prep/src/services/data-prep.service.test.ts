@@ -191,9 +191,15 @@ describe('DataPrepService', () => {
   describe('encryptSad — KMS mode', () => {
     it('calls KMSClient.send with EncryptCommand and returns CiphertextBlob', async () => {
       const fakeCiphertext = new Uint8Array([0xaa, 0xbb, 0xcc]);
+
+      // The service now uses a module-level KMSClient singleton (latency
+      // audit opt #5) — reset + re-mock the constructor so the first
+      // send() in this test goes through our mock.
+      const { _resetKmsSingleton } = await import('./data-prep.service.js');
+      _resetKmsSingleton();
+      const MockKMS = KMSClient as unknown as ReturnType<typeof vi.fn>;
       const mockSend = vi.fn().mockResolvedValue({ CiphertextBlob: fakeCiphertext });
-      // Replace the KMS client's send with our mock
-      (service as any).kms = { send: mockSend };
+      MockKMS.mockImplementation(() => ({ send: mockSend }));
 
       const plaintext = Buffer.from('encrypted SAD');
       const result = await (service as any).encryptSad(plaintext, 'arn:aws:kms:us-east-1:000:key/test');
@@ -224,7 +230,11 @@ describe('DataPrepService', () => {
     it('calls KMSClient.decrypt and returns Plaintext', async () => {
       const fakePlaintext = new Uint8Array([0x01, 0x02, 0x03]);
 
-      // Mock the KMSClient constructor for the static method
+      // decryptSad uses the module-level KMSClient singleton — reset so
+      // the constructor mock we install here is what actually runs on
+      // first use.
+      const { _resetKmsSingleton } = await import('./data-prep.service.js');
+      _resetKmsSingleton();
       const MockKMS = KMSClient as unknown as ReturnType<typeof vi.fn>;
       MockKMS.mockImplementation(() => ({
         send: vi.fn().mockResolvedValue({ Plaintext: fakePlaintext }),

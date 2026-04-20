@@ -113,25 +113,28 @@ export function createProvisioningRouter(): Router {
       );
     }
 
-    // Create local provisioning session
-    await prisma.provisioningSession.create({
-      data: {
-        cardId: card.id,
-        sadRecordId: sadRecord.id,
-        proxyCardId: card.proxyCardId,
-        rcaSessionId: sessionId,
-        phase: 'INIT',
-      },
-    });
-
-    // Link card to mobile user on first provisioning
+    // Create local provisioning session + link cognitoSub in parallel.
+    // Both are writes the caller doesn't need to wait for individually;
+    // Promise.all cuts the two sequential round-trips to one (~20-40 ms
+    // saved on DB-RTT-bound hot path — latency audit opts #10 + partial #4).
     const cognitoUser = req.cognitoUser!;
-    if (!card.cognitoSub) {
-      await prisma.card.update({
-        where: { id: card.id },
-        data: { cognitoSub: cognitoUser.sub },
-      });
-    }
+    await Promise.all([
+      prisma.provisioningSession.create({
+        data: {
+          cardId: card.id,
+          sadRecordId: sadRecord.id,
+          proxyCardId: card.proxyCardId,
+          rcaSessionId: sessionId,
+          phase: 'INIT',
+        },
+      }),
+      card.cognitoSub
+        ? Promise.resolve()
+        : prisma.card.update({
+            where: { id: card.id },
+            data: { cognitoSub: cognitoUser.sub },
+          }),
+    ]);
 
     res.status(201).json({
       sessionId,
