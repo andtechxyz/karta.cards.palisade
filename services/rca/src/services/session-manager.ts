@@ -135,23 +135,38 @@ const SAD_CACHE_MAX_TTL_MS = 120_000;
  * Fetch a cached plaintext SAD, deleting + scrubbing the entry on hit.
  * Returns `null` if the cache entry is missing or expired (in which
  * case the caller decrypts inline as a fallback).
+ *
+ * Emits `rca.sad_cache.{hit,miss,expired}` so operators can validate
+ * the hit rate of the pre-decrypt optimization on the real traffic
+ * mix.  Target is >95% hit on steady-state; a dropping hit rate
+ * suggests mobiles are taking longer between /start and WS open than
+ * the prime path's KMS latency budget.
  */
 function consumeSadFromCache(sessionId: string): Buffer | null {
   const entry = sadCache.get(sessionId);
-  if (!entry) return null;
+  if (!entry) {
+    metrics().counter('rca.sad_cache.miss', 1);
+    return null;
+  }
   sadCache.delete(sessionId);
   if (entry.expiresAt < Date.now()) {
     // Expired — still zero it before returning null so a later core
     // dump doesn't leak the plaintext.
     entry.payload.fill(0);
+    metrics().counter('rca.sad_cache.expired', 1);
     return null;
   }
+  metrics().counter('rca.sad_cache.hit', 1);
   return entry.payload;
 }
 
 /**
  * Store a pre-decrypted SAD in the cache.  TTL is clamped to
  * `SAD_CACHE_MAX_TTL_MS` to prevent config-driven long-lived plaintext.
+ *
+ * Emits a `rca.sad_cache.size` gauge post-insert so operators can alert
+ * on unbounded growth (indicates mobiles abandoning sessions faster
+ * than the sweep TTL reclaims them).
  */
 function storeSadInCache(
   sessionId: string,
@@ -163,6 +178,7 @@ function storeSadInCache(
     payload,
     expiresAt: Date.now() + clamped,
   });
+  metrics().gauge('rca.sad_cache.size', sadCache.size);
 }
 
 /**

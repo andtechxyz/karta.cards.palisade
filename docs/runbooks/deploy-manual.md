@@ -220,6 +220,10 @@ Emitted metrics (CloudWatch namespace `rca`):
 | `rca.provisioning.complete` | `mode` ∈ {plan,classical} | Atomic commit succeeds |
 | `rca.attestation.verify` | `mode` ∈ {strict,permissive}, `result` ∈ {ok,fail}, `path` ∈ {plan,classical} | Every attestation check |
 | `rca.plan_step.rejected` | `reason` ∈ {plan_step_state_missing, plan_step_state_expired, plan_step_out_of_range, plan_step_replay, plan_step_skip} | Plan-mode step cursor rejects a response |
+| `rca.sad_cache.hit` | — | Pre-decrypted SAD was ready on WS open |
+| `rca.sad_cache.miss` | — | Fell back to inline KMS decrypt (startSession pre-decrypt didn't complete in time, or server restarted between /start and WS open) |
+| `rca.sad_cache.expired` | — | Cache entry sat past TTL (WS never opened) |
+| `rca.sad_cache.size` | — GAUGE | Active cache entries (should stay small) |
 
 Emitted metrics (CloudWatch namespace `card-ops`):
 
@@ -293,6 +297,11 @@ Useful CloudWatch alarms to wire up:
 - `rca.attestation.verify{result=fail}` > 0 in strict mode → real chip rejection
 - `rca.provisioning.complete` drops to 0 over a 15 min window when
   `rca.session.started` > 0 → provisioning stuck
+- `rca.sad_cache.miss` / `rca.sad_cache.hit` ratio > 0.2 → pre-decrypt
+  optimization is underperforming (KMS slow, mobile too fast, or
+  frequent restarts)
+- `rca.sad_cache.size` gauge > 50 → sessions piling up (sweep TTL not
+  reclaiming; mobiles abandoning)
 - `card-ops.operation.failed{code=*}` per-op rates — detect regressions
   after a PA/applet update
 - `card-ops.operation.duration_ms` p95 > 30 s → NFC / reader issue
