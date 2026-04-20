@@ -314,6 +314,27 @@ Useful admin alarms:
 - `admin.batch.received{result=fi_mismatch|program_mismatch}` > 0 →
   partner misconfigured their template/program IDs
 
+Emitted metrics (CloudWatch namespace `batch-processor`):
+
+| Metric | Dimensions | When |
+|---|---|---|
+| `batch-processor.batch.processed` | `result` ∈ {ok, partial, failed} | Every batch lifecycle terminal |
+| `batch-processor.batch.duration_ms` | — TIMING | Wall-clock batch processing time |
+| `batch-processor.card.registered` | — | Per-card `registerCard` succeeded |
+| `batch-processor.card.failed` | `reason` ∈ {duplicate, vault_error, data_prep_error, register_error, other} | Per-card register threw |
+| `batch-processor.cards.in_batch` | — GAUGE | Last batch's record count |
+
+Set `METRICS_BACKEND=cloudwatch` on `vera-batch-processor` task def the same way.
+
+Useful batch-processor alarms:
+- `batch-processor.batch.processed{result=failed}` > 0 → whole batch
+  bombed; check processingError in EmbossingBatch row
+- `batch-processor.card.failed{reason=vault_error}` rate > 5 /min →
+  Vera vault is unhealthy during ingest
+- `batch-processor.batch.duration_ms` p95 > 10 min → ingest is
+  bottlenecked (typically vault RTT or data-prep latency); bump
+  `REGISTER_CONCURRENCY` env
+
 Useful CloudWatch alarms to wire up:
 - `rca.plan_step.rejected` > 5 in 5 min → mobile bug or attack
 - `rca.attestation.verify{result=fail}` > 0 in strict mode → real chip rejection

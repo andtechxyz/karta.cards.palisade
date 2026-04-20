@@ -22,6 +22,7 @@ import { signRequest } from '@palisade/service-auth';
 import { request } from 'undici';
 
 import { getBatchConfig } from './env.js';
+import { metrics } from './metrics.js';
 
 const s3 = new S3Client({ region: process.env.AWS_REGION ?? 'ap-southeast-2' });
 
@@ -50,6 +51,7 @@ export async function pollOnce(): Promise<void> {
 
 async function processBatch(batchId: string): Promise<void> {
   console.log(`[processor] picking up batch ${batchId}`);
+  const batchStartedAt = Date.now();
 
   // Claim the batch atomically — flip RECEIVED → PROCESSING.  updateMany
   // returns a count; if 0, another worker raced us and we skip.
@@ -129,6 +131,8 @@ async function processBatch(batchId: string): Promise<void> {
     let succeeded = 0;
     let failed = parseResult.errors.length; // parser errors count as failures
 
+    metrics().gauge('batch-processor.cards.in_batch', parseResult.records.length);
+
     for (let i = 0; i < parseResult.records.length; i += concurrency) {
       const chunk = parseResult.records.slice(i, i + concurrency);
       const results = await Promise.allSettled(
@@ -137,9 +141,18 @@ async function processBatch(batchId: string): Promise<void> {
       for (const r of results) {
         if (r.status === 'fulfilled') {
           succeeded++;
+          metrics().counter('batch-processor.card.registered', 1);
         } else {
           failed++;
           const err = r.reason;
+          const msg = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+          const reason =
+            msg.includes('duplicate') || msg.includes('already') ? 'duplicate'
+            : msg.includes('vault') ? 'vault_error'
+            : msg.includes('data_prep') || msg.includes('data-prep') ? 'data_prep_error'
+            : msg.includes('register') ? 'register_error'
+            : 'other';
+          metrics().counter('batch-processor.card.failed', 1, { reason });
           console.warn(
             `[processor] registerCard failed for batch=${batchId}: ` +
               (err instanceof Error ? err.message : String(err)),
@@ -159,8 +172,13 @@ async function processBatch(batchId: string): Promise<void> {
         processedAt: new Date(),
       },
     });
+    const batchResult = failed === 0 ? 'ok' : (succeeded === 0 ? 'failed' : 'partial');
+    metrics().counter('batch-processor.batch.processed', 1, { result: batchResult });
+    metrics().timing('batch-processor.batch.duration_ms', Date.now() - batchStartedAt);
     console.log(`[processor] batch ${batchId} done: ${succeeded} ok, ${failed} failed`);
   } catch (err) {
+    metrics().counter('batch-processor.batch.processed', 1, { result: 'failed' });
+    metrics().timing('batch-processor.batch.duration_ms', Date.now() - batchStartedAt);
     await markFailed(batchId, err instanceof Error ? err.message : String(err));
   }
 }
