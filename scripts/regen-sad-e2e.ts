@@ -243,7 +243,10 @@ async function main(): Promise<void> {
 
     // Mock-mode EMV derivation — deterministic iCVV from PAN+expiry, no
     // AWS calls.  Structurally valid; not cryptographically meaningful.
-    const emv = new EmvDerivationService('ap-southeast-2', /* mockMode */ true);
+    // The constructor took (region, mockMode: boolean) in the old API;
+    // now it takes a UdkDeriver directly.  Use the mock backend via
+    // the static fromBackend() helper.
+    const emv = EmvDerivationService.fromBackend('mock');
     const icvv = await emv.deriveIcvv('unused-arn', pan, expiryYymm);
 
     const cardData: CardData = {
