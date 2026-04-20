@@ -221,11 +221,27 @@ Emitted metrics (CloudWatch namespace `rca`):
 | `rca.attestation.verify` | `mode` ∈ {strict,permissive}, `result` ∈ {ok,fail}, `path` ∈ {plan,classical} | Every attestation check |
 | `rca.plan_step.rejected` | `reason` ∈ {plan_step_state_missing, plan_step_state_expired, plan_step_out_of_range, plan_step_replay, plan_step_skip} | Plan-mode step cursor rejects a response |
 
+Emitted metrics (CloudWatch namespace `card-ops`):
+
+| Metric | Dimensions | When |
+|---|---|---|
+| `card-ops.operation.started` | `op` ∈ {install_pa,list_applets,…} | Every runOperation() entry |
+| `card-ops.operation.completed` | `op` | Terminal `{type:'complete'}` |
+| `card-ops.operation.failed` | `op`, `code` (e.g. `CAP_FILE_MISSING`, `SAD_RECORD_MISSING`) | Terminal `{type:'error'}` or throw |
+| `card-ops.operation.duration_ms` | `op` — TIMING sample | Every op terminal (success or fail) |
+
+Also set `METRICS_BACKEND=cloudwatch` on `vera-card-ops` task def
+(same jq patch as vera-rca above) to turn it on.
+
 Useful CloudWatch alarms to wire up:
 - `rca.plan_step.rejected` > 5 in 5 min → mobile bug or attack
 - `rca.attestation.verify{result=fail}` > 0 in strict mode → real chip rejection
 - `rca.provisioning.complete` drops to 0 over a 15 min window when
   `rca.session.started` > 0 → provisioning stuck
+- `card-ops.operation.failed{code=*}` per-op rates — detect regressions
+  after a PA/applet update
+- `card-ops.operation.duration_ms` p95 > 30 s → NFC / reader issue
+  (normal install_pa finishes in 5-8 s)
 
 ## Gotchas encountered
 

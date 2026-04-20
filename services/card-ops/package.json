@@ -14,6 +14,7 @@
     "@palisade/db": "*",
     "@palisade/emv": "*",
     "@palisade/handoff": "*",
+    "@palisade/metrics": "^0.0.1",
     "@palisade/retention": "*",
     "@palisade/service-auth": "*",
     "adm-zip": "^0.5.17",

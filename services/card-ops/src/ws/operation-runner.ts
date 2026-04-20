@@ -22,6 +22,7 @@ import { prisma } from '@palisade/db';
 import { Prisma } from '@prisma/client';
 import type { WSMessage } from './messages.js';
 import { isOperation, notImplemented, type Operation } from '../operations/index.js';
+import { metrics } from '../metrics.js';
 import { runListApplets } from '../operations/list-applets.js';
 import { runInstallPa } from '../operations/install-pa.js';
 import { runInstallPaymentApplet } from '../operations/install-payment-applet.js';
@@ -57,12 +58,18 @@ export async function runOperation(ctx: OperationContext): Promise<void> {
 
   if (!isOperation(session.operation)) {
     send({ type: 'error', code: 'UNKNOWN_OP', message: session.operation });
+    metrics().counter('card-ops.operation.failed', 1, {
+      op: session.operation || 'unknown',
+      code: 'UNKNOWN_OP',
+    });
     await audit.flush();
     await markFailed(session.id, `unknown_op:${session.operation}`);
     return;
   }
 
   const op = session.operation as Operation;
+  const opStartedAt = Date.now();
+  metrics().counter('card-ops.operation.started', 1, { op });
 
   let terminal: WSMessage;
   try {
@@ -119,6 +126,20 @@ export async function runOperation(ctx: OperationContext): Promise<void> {
   }
 
   send(terminal);
+
+  // Terminal counters fire here (after send() so the WS response is
+  // already out).  Duration covers op-body + scrub; a large p95 gap
+  // from p50 usually means LOAD block retries.
+  const durMs = Date.now() - opStartedAt;
+  metrics().timing('card-ops.operation.duration_ms', durMs, { op });
+  if (terminal.type === 'complete') {
+    metrics().counter('card-ops.operation.completed', 1, { op });
+  } else if (terminal.type === 'error') {
+    metrics().counter('card-ops.operation.failed', 1, {
+      op,
+      code: terminal.code ?? 'unknown_error',
+    });
+  }
 
   // Flush the audit trail BEFORE the terminal update so apduLog is in
   // place if somebody queries the row right as phase flips.  The
