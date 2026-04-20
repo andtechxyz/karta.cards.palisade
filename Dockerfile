@@ -116,10 +116,31 @@ COPY --from=builder /app/packages/admin-config/package.json  packages/admin-conf
 COPY --from=builder /app/packages/metrics/dist/              packages/metrics/dist/
 COPY --from=builder /app/packages/metrics/package.json       packages/metrics/
 
-# Copy the target service's compiled output
+# Copy ALL services' compiled dist/ + package.json — cross-service imports
+# (e.g. rca imports @palisade/data-prep/services/data-prep.service) resolve
+# via npm-workspace symlinks in node_modules, and those symlinks point at
+# services/<name>/ which must exist at runtime or node throws ERR_MODULE_NOT_FOUND.
+# Each service's image still only *runs* its own entrypoint (see CMD), but
+# the full compiled set is available for import resolution.
+COPY --from=builder /app/services/tap/dist/                       services/tap/dist/
+COPY --from=builder /app/services/tap/package.json                services/tap/
+COPY --from=builder /app/services/activation/dist/                services/activation/dist/
+COPY --from=builder /app/services/activation/package.json         services/activation/
+COPY --from=builder /app/services/data-prep/dist/                 services/data-prep/dist/
+COPY --from=builder /app/services/data-prep/package.json          services/data-prep/
+COPY --from=builder /app/services/rca/dist/                       services/rca/dist/
+COPY --from=builder /app/services/rca/package.json                services/rca/
+COPY --from=builder /app/services/batch-processor/dist/           services/batch-processor/dist/
+COPY --from=builder /app/services/batch-processor/package.json    services/batch-processor/
+COPY --from=builder /app/services/admin/dist/                     services/admin/dist/
+COPY --from=builder /app/services/admin/package.json              services/admin/
+COPY --from=builder /app/services/card-ops/dist/                  services/card-ops/dist/
+COPY --from=builder /app/services/card-ops/package.json           services/card-ops/
+COPY --from=builder /app/services/sftp/dist/                      services/sftp/dist/
+COPY --from=builder /app/services/sftp/package.json               services/sftp/
+
+# The SERVICE arg still selects which one runs at container start (see CMD).
 ARG SERVICE
-COPY --from=builder /app/services/${SERVICE}/dist/          services/${SERVICE}/dist/
-COPY --from=builder /app/services/${SERVICE}/package.json   services/${SERVICE}/
 
 # Copy built frontend (may be empty for tap/admin/data-prep/rca/batch-processor
 # — builder ensures dir exists)
