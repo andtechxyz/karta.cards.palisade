@@ -30,7 +30,12 @@ export function createCardsMineRouter(): Router {
         cardholderName: true,
         panExpiryMonth: true,
         panExpiryYear: true,
-        program: { select: { name: true } },
+        program: {
+          select: {
+            name: true,
+            financialInstitution: { select: { name: true } },
+          },
+        },
         credentials: {
           select: { id: true, kind: true, deviceName: true, createdAt: true },
         },
@@ -48,6 +53,8 @@ export function createCardsMineRouter(): Router {
         panExpiryMonth: c.panExpiryMonth ?? null,
         panExpiryYear: c.panExpiryYear ?? null,
         programName: c.program?.name ?? null,
+        financialInstitutionName:
+          c.program?.financialInstitution?.name ?? null,
         credentials: c.credentials,
       })),
     );
@@ -66,7 +73,12 @@ export function createCardsMineRouter(): Router {
         cardholderName: true,
         panExpiryMonth: true,
         panExpiryYear: true,
-        program: { select: { name: true } },
+        program: {
+          select: {
+            name: true,
+            financialInstitution: { select: { name: true } },
+          },
+        },
         credentials: {
           select: { id: true, kind: true, deviceName: true, createdAt: true },
         },
@@ -83,6 +95,8 @@ export function createCardsMineRouter(): Router {
       panExpiryMonth: card.panExpiryMonth ?? null,
       panExpiryYear: card.panExpiryYear ?? null,
       programName: card.program?.name ?? null,
+      financialInstitutionName:
+        card.program?.financialInstitution?.name ?? null,
       credentials: card.credentials,
     });
   });
