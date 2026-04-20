@@ -50,6 +50,13 @@ router.post('/register', validateBody(registerSchema), async (req, res) => {
   }
 });
 
+// RCA fires this callback after its $transaction has ALREADY flipped
+// Card.status to PROVISIONED, so by the time we land here the expected
+// state is usually PROVISIONED, not ACTIVATED.  Idempotent on both:
+// - ACTIVATED → we do the flip (rare path: RCA's async commit hadn't
+//   landed yet, we're racing ahead of it)
+// - PROVISIONED → no-op success (normal case post-RCA-commit)
+// - anything else → genuine invalid state, reject
 router.post('/:cardRef/provision-complete', async (req, res) => {
   const { chipSerial } = req.body as { chipSerial?: string };
   const card = await prisma.card.findUnique({ where: { cardRef: req.params.cardRef } });
@@ -57,23 +64,44 @@ router.post('/:cardRef/provision-complete', async (req, res) => {
     metrics().counter('activation.provision_complete.fail', 1, { reason: 'card_not_found' });
     throw notFound('card_not_found', 'Unknown cardRef');
   }
+
+  // Already PROVISIONED — common case (RCA's $transaction committed
+  // before fireCallback ran).  Echo success; maybe fill in chipSerial
+  // if the callback carries fresher info than what's on the row.
+  if (card.status === 'PROVISIONED') {
+    if (chipSerial && chipSerial !== card.chipSerial) {
+      await prisma.card.update({
+        where: { id: card.id },
+        data: { chipSerial },
+      });
+    }
+    metrics().counter('activation.provision_complete.ok', 1, { path: 'idempotent' });
+    res.json({ cardRef: card.cardRef, status: 'PROVISIONED' });
+    return;
+  }
+
   if (card.status !== 'ACTIVATED') {
     metrics().counter('activation.provision_complete.fail', 1, {
       reason: 'invalid_status',
       status: card.status,
     });
-    throw badRequest('invalid_status', `Card is ${card.status}, expected ACTIVATED`);
+    throw badRequest('invalid_status', `Card is ${card.status}, expected ACTIVATED or PROVISIONED`);
   }
 
-  await prisma.card.update({
-    where: { id: card.id },
+  // ACTIVATED — we race RCA's commit.  updateMany with status guard so
+  // we don't overwrite if RCA beats us to the row between findUnique
+  // and update.
+  const { count } = await prisma.card.updateMany({
+    where: { id: card.id, status: 'ACTIVATED' },
     data: {
       status: 'PROVISIONED',
       provisionedAt: new Date(),
       chipSerial: chipSerial ?? card.chipSerial,
     },
   });
-  metrics().counter('activation.provision_complete.ok', 1);
+  metrics().counter('activation.provision_complete.ok', 1, {
+    path: count === 1 ? 'fresh' : 'raced',
+  });
 
   res.json({ cardRef: card.cardRef, status: 'PROVISIONED' });
 });
