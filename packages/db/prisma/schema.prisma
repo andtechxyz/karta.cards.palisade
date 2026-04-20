@@ -84,11 +84,20 @@ model PartnerCredential {
 
   // Partner-supplied identifier (e.g. "incomm-embossing-prod")
   keyId      String @unique
-  // Hashed secret — constant-time comparable.  scrypt with a per-record
-  // salt; the secret itself is 256-bit random (not a user password) so
-  // we keep scrypt's default cost for rate-limiting at verify time.
+  // scrypt(secret, salt) — one-way.  Was previously DOUBLE-DUTY as the
+  // HMAC signing key, which made a DB dump = partner impersonation
+  // (PCI H-6 audit finding).  Now it's ONLY a one-way hash for audit
+  // "was this our secret" verification; the actual HMAC key lives in
+  // Secrets Manager under `secretArn`.
   secretHash String
   salt       String
+  // AWS Secrets Manager ARN holding the plaintext HMAC key for THIS
+  // partner credential.  Created at credential issuance; rotated or
+  // deleted on revoke.  Nullable so existing pre-migration rows don't
+  // break — but verifiers refuse to authenticate any partner whose
+  // `secretArn` is still null (forces operator-driven rotation).  PCI
+  // 3.5 / 3.6.
+  secretArn  String?
 
   // Optional description for audit
   description String?

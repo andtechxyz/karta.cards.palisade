@@ -8,6 +8,9 @@
 
 import 'dotenv/config';
 import 'express-async-errors';
+import { resolveSecretRefs } from '@palisade/core';
+await resolveSecretRefs();
+
 import express from 'express';
 
 import { getBatchConfig } from './env.js';

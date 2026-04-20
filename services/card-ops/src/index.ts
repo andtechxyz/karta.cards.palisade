@@ -14,6 +14,9 @@
 
 import 'dotenv/config';
 import 'express-async-errors';
+import { resolveSecretRefs } from '@palisade/core';
+await resolveSecretRefs();
+
 import { createServer } from 'node:http';
 import express from 'express';
 import { WebSocketServer } from 'ws';

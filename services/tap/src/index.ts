@@ -1,4 +1,10 @@
 import 'express-async-errors';
+import { resolveSecretRefs } from '@palisade/core';
+// PCI 3.5.1 / 3.6.1 — resolve any Secrets Manager references in env
+// before env.ts consumers read process.env.  See packages/core/src/
+// secrets-resolver.ts for the contract.
+await resolveSecretRefs();
+
 import express from 'express';
 import { errorMiddleware, authRateLimit } from '@palisade/core';
 import { getTapConfig } from './env.js';

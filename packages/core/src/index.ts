@@ -28,3 +28,5 @@ export type { KeyProvider, EnvKeyProviderInput } from './key-provider.js';
 export { serveFrontend } from './serve-frontend.js';
 export { authRateLimit, apiRateLimit } from './rate-limit.js';
 export { aesCmac } from './cmac.js';
+export { resolveSecretRefs } from './secrets-resolver.js';
+export type { ResolveOptions } from './secrets-resolver.js';

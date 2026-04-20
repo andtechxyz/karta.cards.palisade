@@ -1,5 +1,20 @@
 import { Router } from 'express';
 import { randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
+import {
+  SecretsManagerClient,
+  CreateSecretCommand,
+  DeleteSecretCommand,
+} from '@aws-sdk/client-secrets-manager';
+
+// One SM client per process.  Region from env; credentials from the ECS
+// task role (which has palisade/partner-hmac/* create/delete/read
+// permissions granted at IAM time).
+const smClient = new SecretsManagerClient({
+  region: process.env.AWS_REGION ?? 'ap-southeast-2',
+});
+
+/** Partner HMAC key SM namespace.  Keep per-cred so revoke = delete one. */
+const PARTNER_HMAC_SECRET_PREFIX = 'palisade/partner-hmac/';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import { prisma } from '@palisade/db';
@@ -101,25 +116,56 @@ router.post('/:fiId/credentials', validateBody(createSchema), async (req, res) =
   if (existing) throw badRequest('key_id_taken', `keyId "${keyId}" already in use`);
 
   // 32-byte random secret.  Hex-encoded so partners can stash it in a
-  // single string env var without base64 padding surprises.
+  // single string env var without base64 padding surprises.  Partner
+  // signs with this secret as the HMAC key.
   const secret = randomBytes(32).toString('hex');
   const salt = randomBytes(16).toString('hex');
   const secretHash = await hashSecret(secret, salt);
 
   const cognitoUser = req.cognitoUser;
   try {
-    const cred = await prisma.partnerCredential.create({
-      data: {
-        financialInstitutionId: fiId,
-        keyId,
-        secretHash,
-        salt,
-        description: parsed.description,
-        createdBy: cognitoUser?.sub ?? 'unknown',
-      },
-      select: { id: true, keyId: true },
-    });
-    // Plaintext secret only appears here — never persisted.
+    // H-6: store the HMAC key in Secrets Manager first, then stamp its
+    // ARN on the credential row.  secretHash stays as a one-way
+    // "was-this-our-key" hash for audit but is NOT used for signature
+    // verification any more.
+    //
+    // SM name format: palisade/partner-hmac/<keyId>.  Uses keyId (which
+    // is already unique-indexed) so operators can see the mapping
+    // directly in the SM console.
+    const smName = `${PARTNER_HMAC_SECRET_PREFIX}${keyId}`;
+    const sm = await smClient.send(new CreateSecretCommand({
+      Name: smName,
+      Description: `HMAC signing key for partner credential ${keyId} (FI=${fi.slug}). H-6 remediation.`,
+      SecretString: secret,
+    }));
+    const secretArn = sm.ARN;
+    if (!secretArn) {
+      throw new Error('SM CreateSecret returned no ARN');
+    }
+
+    let cred;
+    try {
+      cred = await prisma.partnerCredential.create({
+        data: {
+          financialInstitutionId: fiId,
+          keyId,
+          secretHash,
+          salt,
+          secretArn,
+          description: parsed.description,
+          createdBy: cognitoUser?.sub ?? 'unknown',
+        },
+        select: { id: true, keyId: true },
+      });
+    } catch (dbErr) {
+      // DB create failed after SM create succeeded — delete the orphan
+      // SM entry so we don't leak quota + avoid dangling secrets.
+      await smClient
+        .send(new DeleteSecretCommand({ SecretId: secretArn, ForceDeleteWithoutRecovery: true }))
+        .catch(() => { /* best-effort */ });
+      throw dbErr;
+    }
+    // Plaintext secret only appears here — never persisted plaintext.
     res.status(201).json({ id: cred.id, keyId: cred.keyId, secret, secretHash, salt });
   } catch (err: unknown) {
     if (err && typeof err === 'object' && 'code' in err && (err as { code?: string }).code === 'P2002') {
@@ -152,9 +198,33 @@ router.post('/:fiId/credentials/:id/revoke', validateBody(revokeSchema), async (
       revokedAt: new Date(),
       revokedReason: (req.body as z.infer<typeof revokeSchema>).reason ?? null,
     },
-    select: { id: true, status: true, revokedAt: true, revokedReason: true },
+    select: { id: true, status: true, revokedAt: true, revokedReason: true, secretArn: true },
   });
-  res.json(updated);
+
+  // H-6 — delete the plaintext HMAC key from Secrets Manager.  We use
+  // ForceDeleteWithoutRecovery because a revoked partner credential
+  // should be permanently unrecoverable — SM's 7-30 day grace period is
+  // the wrong behavior for a revocation event.
+  if (updated.secretArn) {
+    await smClient
+      .send(new DeleteSecretCommand({ SecretId: updated.secretArn, ForceDeleteWithoutRecovery: true }))
+      .catch((err) => {
+        // Non-fatal: the DB row is already marked REVOKED, so the
+        // credential can't be used even if SM deletion fails.  Log
+        // loudly so ops can clean up the orphan secret.
+        // eslint-disable-next-line no-console
+        console.error(
+          `[partner-credentials] SM delete failed for ${id} (${updated.secretArn}): ${err instanceof Error ? err.message : err}. Manual cleanup required.`,
+        );
+      });
+  }
+
+  res.json({
+    id: updated.id,
+    status: updated.status,
+    revokedAt: updated.revokedAt,
+    revokedReason: updated.revokedReason,
+  });
 });
 
 export default router;

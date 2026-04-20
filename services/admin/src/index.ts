@@ -1,4 +1,7 @@
 import 'express-async-errors';
+import { resolveSecretRefs } from '@palisade/core';
+await resolveSecretRefs();
+
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';

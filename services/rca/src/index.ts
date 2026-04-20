@@ -10,6 +10,11 @@
 
 import 'dotenv/config';
 import 'express-async-errors';
+import { resolveSecretRefs } from '@palisade/core';
+// PCI 3.5.1 / 3.6.1 — resolve Secrets Manager refs in env before any
+// getConfig() reads process.env.  See packages/core/src/secrets-resolver.ts.
+await resolveSecretRefs();
+
 import { createServer } from 'node:http';
 import express from 'express';
 import { WebSocketServer } from 'ws';

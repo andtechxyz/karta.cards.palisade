@@ -9,6 +9,9 @@
 
 import 'dotenv/config';
 import 'express-async-errors';
+import { resolveSecretRefs } from '@palisade/core';
+await resolveSecretRefs();
+
 import express from 'express';
 import { requireSignedRequest, captureRawBody } from '@palisade/service-auth';
 import { errorMiddleware } from '@palisade/core';

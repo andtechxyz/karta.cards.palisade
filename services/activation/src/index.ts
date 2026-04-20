@@ -1,4 +1,13 @@
 import 'express-async-errors';
+import { resolveSecretRefs } from '@palisade/core';
+// PCI 3.5.1 / 3.6.1 — C-3 from the audit: resolve any env vars whose
+// values are Secrets Manager references (arn:aws:secretsmanager:... or
+// secretsmanager:<name>) to their plaintext BEFORE any getConfig() hits
+// process.env.  Values that aren't references are left alone so dev .env
+// files with plaintext still work.  TLA suspends module evaluation until
+// resolution completes.
+await resolveSecretRefs();
+
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';

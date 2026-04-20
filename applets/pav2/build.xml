@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Ant build for pav2.cap - Palisade T4T v2 with patent-compliant additions.
+
+  Changes vs v1 (PalisadeT4T.cap):
+    INS_ACTIVATE      (0x80 EB 00 00) - SHIPPED to ACTIVATED via APDU
+    INS_GET_CHALLENGE (0x80 EC 00 00) - 16-byte nonce for SAD replay
+                                        protection (patent C4)
+    INS_REVOKE        (0x80 ED 00 00) - hard revoke to STATE_BLOCKED
+                                        with AES key zeroization
+                                        (patent C11)
+
+  Package AID bumped from A0:00:00:06:47 to A0:00:00:06:47:02 so v1 and v2
+  can coexist during rollout (different package = distinct LOAD domain).
+  Version bumped from 0.4 to 2.0 for identification in gp list.
+
+  FIDO2Applet:  A0000006472F0002 (CTAP2 authenticator v2)
+  PalisadeT4T:  Module AID A0000006470102 (install with instance AID D2760000850101)
+
+  Usage:
+    ant -f build.xml build
+
+  Requires:
+    JC_HOME pointing to Java Card Classic API 3.0.5 SDK
+-->
+<project name="pav2" default="build" basedir=".">
+    <property environment="env"/>
+    <property name="JC_SDK" value="${env.JC_HOME}"/>
+
+    <taskdef name="javacard" classname="pro.javacard.ant.JavaCard" classpath="ant-javacard.jar"/>
+
+    <target name="build">
+        <javacard jckit="${JC_SDK}">
+            <cap aid="A0:00:00:06:47:02"
+                 package="us.q3q.fido2"
+                 version="2.0"
+                 output="build/pav2.cap"
+                 sources="src/main/java">
+                <applet class="us.q3q.fido2.FIDO2Applet"
+                        aid="A0:00:00:06:47:2F:00:02"/>
+                <applet class="us.q3q.fido2.PalisadeT4T"
+                        aid="A0:00:00:06:47:01:02"/>
+            </cap>
+        </javacard>
+    </target>
+</project>
