@@ -472,11 +472,31 @@ export class SessionManager {
 
     if (!session) return [];
 
-    // Extract pubkey + attestation + CPLC from the GENERATE_KEYS response.
-    const { iccPubkey, attestation } = AttestationVerifier.extract(respData);
-    // Stub-mode verify — always ok=true today; logs a warning banner every
-    // call so we can't accidentally ship this path as production.
-    AttestationVerifier.verify(attestation, 'unknown');
+    // Extract pubkey + attestation + CPLC + optional cert chain from the
+    // GENERATE_KEYS response.  Patent claim C23: verify attestation before
+    // encrypting SAD for this chip.  Strict mode refuses to continue if
+    // cert-chain validation fails; permissive mode (legacy) logs a warning
+    // and accepts.  See services/rca/src/services/attestation-verifier.ts.
+    const extracted = AttestationVerifier.extract(respData);
+    const { iccPubkey, attestation } = extracted;
+    const mode = getRcaConfig().PALISADE_ATTESTATION_MODE;
+    const verifyResult = AttestationVerifier.verify(extracted, mode);
+    if (!verifyResult.ok) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[rca] attestation verification FAILED (mode=${mode}): ${verifyResult.warning}`,
+      );
+      // Mark the session failed so the mobile app sees a clean error.
+      await prisma.provisioningSession.update({
+        where: { id: sessionId },
+        data: { phase: 'FAILED', iccPublicKey: iccPubkey, attestation },
+      });
+      return [{
+        type: 'error',
+        code: 'attestation_failed',
+        message: verifyResult.warning ?? 'attestation verification failed',
+      }];
+    }
 
     await prisma.provisioningSession.update({
       where: { id: sessionId },
@@ -685,8 +705,29 @@ export class SessionManager {
    * protocol checkpoint mechanism (plan field {checkpointAfter: 1}).
    */
   private async handlePlanKeygen(sessionId: string, data: Buffer): Promise<WSMessage[]> {
-    const { iccPubkey, attestation } = AttestationVerifier.extract(data);
-    AttestationVerifier.verify(attestation, 'unknown');
+    const extracted = AttestationVerifier.extract(data);
+    const { iccPubkey, attestation } = extracted;
+    // Patent C23 checkpoint: verify attestation before phone executes the
+    // next step of the plan.  In strict mode, a failing verdict aborts the
+    // session so TRANSFER_SAD never runs.  In permissive mode, we log a
+    // warning and continue — this is the legacy path until karta-se v1.
+    const mode = getRcaConfig().PALISADE_ATTESTATION_MODE;
+    const verifyResult = AttestationVerifier.verify(extracted, mode);
+    if (!verifyResult.ok) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[rca][plan] attestation verification FAILED (mode=${mode}): ${verifyResult.warning}`,
+      );
+      await prisma.provisioningSession.update({
+        where: { id: sessionId },
+        data: { phase: 'FAILED', iccPublicKey: iccPubkey, attestation },
+      });
+      return [{
+        type: 'error',
+        code: 'attestation_failed',
+        message: verifyResult.warning ?? 'attestation verification failed',
+      }];
+    }
 
     await prisma.provisioningSession.update({
       where: { id: sessionId },

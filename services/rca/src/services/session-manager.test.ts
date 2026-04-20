@@ -251,7 +251,7 @@ describe('SessionManager', () => {
       // Attestation verify stub warning fired.
       expect(
         warnSpy.mock.calls.some((args) =>
-          typeof args[0] === 'string' && args[0].includes('STUB MODE'),
+          typeof args[0] === 'string' && args[0].includes('PERMISSIVE MODE'),
         ),
       ).toBe(true);
     });
@@ -651,7 +651,7 @@ describe('SessionManager', () => {
       // keygen response.
       expect(
         warnSpy.mock.calls.some((args) =>
-          typeof args[0] === 'string' && args[0].includes('STUB MODE'),
+          typeof args[0] === 'string' && args[0].includes('PERMISSIVE MODE'),
         ),
       ).toBe(true);
     });

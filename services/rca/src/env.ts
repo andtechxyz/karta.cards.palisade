@@ -51,6 +51,17 @@ const { get: getRcaConfig, reset: _resetRcaConfig } = defineEnv({
   // deployments MUST leave this unset — RCA throws
   // issuer_profile_incomplete if it is.
   RCA_ALLOW_MINIMAL_SAD: z.enum(['0', '1']).default('0'),
+
+  // --- Attestation mode (patent claim C16/C23) ----------------------------
+  // strict     — require non-empty attestation cert chain from the PA that
+  //              validates to a pinned vendor root (NXP JCOP 5 or Infineon
+  //              Secora).  Refuse to ship TRANSFER_SAD if verification
+  //              fails.  Required for PCI/patent compliance.
+  // permissive — stub mode: accept everything, log a warning banner.  Used
+  //              until karta-se applet v1 ships real attestation output.
+  // Default is `permissive` for backward compatibility during rollout; a
+  // karta-se v1 deployment should flip this to `strict` via ECS task def.
+  PALISADE_ATTESTATION_MODE: z.enum(['strict', 'permissive']).default('permissive'),
 });
 
 export { getRcaConfig, _resetRcaConfig };
