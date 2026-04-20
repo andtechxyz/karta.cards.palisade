@@ -21,7 +21,7 @@ import { createServer } from 'node:http';
 import express from 'express';
 import { WebSocketServer } from 'ws';
 import { requireSignedRequest, captureRawBody } from '@palisade/service-auth';
-import { errorMiddleware } from '@palisade/core';
+import { errorMiddleware, apiRateLimit } from '@palisade/core';
 import { prisma } from '@palisade/db';
 import { startSweeper, scrubStaleCardOpScpState } from '@palisade/retention';
 import { verifyHandoff, HandoffError } from '@palisade/handoff';
@@ -40,10 +40,14 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'card-ops' });
 });
 
+// HMAC-gated REST: only the admin backend forwarding session starts
+// reaches this path.  apiRateLimit is defensive — same reasoning as
+// rca/index.ts — against hot-loop bugs or a compromised upstream.
 const authGate = requireSignedRequest({ keys: config.CARD_OPS_AUTH_KEYS });
 app.use(
   '/api/card-ops',
   express.json({ limit: '64kb', verify: captureRawBody }),
+  apiRateLimit,
   authGate,
   createRegisterRouter(),
 );

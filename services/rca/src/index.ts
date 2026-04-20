@@ -19,7 +19,7 @@ import { createServer } from 'node:http';
 import express from 'express';
 import { WebSocketServer } from 'ws';
 import { requireSignedRequest, captureRawBody } from '@palisade/service-auth';
-import { errorMiddleware } from '@palisade/core';
+import { errorMiddleware, apiRateLimit } from '@palisade/core';
 import { prisma } from '@palisade/db';
 import { verifyHandoff, HandoffError } from '@palisade/handoff';
 import { assertAttestationPinsForMode } from './services/attestation-verifier.js';
@@ -45,11 +45,18 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'rca' });
 });
 
-// HMAC-gated REST endpoint
+// HMAC-gated REST endpoint.  The only legitimate caller is the
+// activation service forwarding a /api/provisioning/start from the
+// mobile app; activation already throttles its upstream with
+// authRateLimit, but we defence-in-depth against hot-loop bugs or a
+// compromised upstream hammering this endpoint by layering
+// apiRateLimit here too (100 req/min per IP — activation is a
+// single ECS task IP, so that's the bound on legitimate traffic).
 const authGate = requireSignedRequest({ keys: config.PROVISION_AUTH_KEYS });
 app.use(
   '/api/provision',
   express.json({ limit: '64kb', verify: captureRawBody }),
+  apiRateLimit,
   authGate,
   createProvisionRouter(),
 );
