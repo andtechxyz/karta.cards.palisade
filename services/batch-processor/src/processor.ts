@@ -117,20 +117,34 @@ async function processBatch(batchId: string): Promise<void> {
         `${parseResult.errors.length} parse errors`,
     );
 
-    // 4. Route each record through registerCard (HMAC-signed)
+    // 4. Route each record through registerCard (HMAC-signed).
+    //
+    // Bounded-parallel: each record spawns a registerCard (which does
+    // 2-3 Prisma calls + 1 vault HTTP + 1 provisioning HTTP).  Fully
+    // serial is ~200-400 ms per record = 30-60 min for a 10K batch;
+    // at concurrency=16 it's minutes.  Bound is guarded to keep vault
+    // + DB pool within reasonable limits under load.  Override via env
+    // REGISTER_CONCURRENCY if needed.
+    const concurrency = Math.max(1, parseInt(process.env.REGISTER_CONCURRENCY ?? '16', 10));
     let succeeded = 0;
     let failed = parseResult.errors.length; // parser errors count as failures
 
-    for (const record of parseResult.records) {
-      try {
-        await registerCard(record, batch.programId);
-        succeeded++;
-      } catch (err) {
-        failed++;
-        console.warn(
-          `[processor] registerCard failed for batch=${batchId}: ` +
-            (err instanceof Error ? err.message : String(err)),
-        );
+    for (let i = 0; i < parseResult.records.length; i += concurrency) {
+      const chunk = parseResult.records.slice(i, i + concurrency);
+      const results = await Promise.allSettled(
+        chunk.map((record) => registerCard(record, batch.programId)),
+      );
+      for (const r of results) {
+        if (r.status === 'fulfilled') {
+          succeeded++;
+        } else {
+          failed++;
+          const err = r.reason;
+          console.warn(
+            `[processor] registerCard failed for batch=${batchId}: ` +
+              (err instanceof Error ? err.message : String(err)),
+          );
+        }
       }
     }
 

@@ -7,6 +7,44 @@ import { getActivationConfig } from '../env.js';
 import { fingerprintUid } from './fingerprint.js';
 import { getCardFieldKeyProvider } from './key-provider.js';
 
+// ---------------------------------------------------------------------------
+// programType cache
+// ---------------------------------------------------------------------------
+// Batch-processor calls registerCard once per CSV row with the same
+// programId across the whole batch.  Without caching that's one extra
+// Prisma hop per card returning the same row each time — ~5-10 ms * N on
+// a hot-path.  programType is effectively immutable after program
+// creation, so a 5-minute TTL is safe.
+
+const PROGRAM_TYPE_CACHE_TTL_MS = 5 * 60_000;
+interface ProgramTypeCacheEntry {
+  programType: string | null;
+  expiresAt: number;
+}
+const programTypeCache = new Map<string, ProgramTypeCacheEntry>();
+
+async function getProgramTypeCached(programId: string): Promise<string | null> {
+  const now = Date.now();
+  const cached = programTypeCache.get(programId);
+  if (cached && cached.expiresAt > now) return cached.programType;
+
+  const prog = await prisma.program.findUnique({
+    where: { id: programId },
+    select: { programType: true },
+  });
+  const programType = prog?.programType ?? null;
+  programTypeCache.set(programId, {
+    programType,
+    expiresAt: now + PROGRAM_TYPE_CACHE_TTL_MS,
+  });
+  return programType;
+}
+
+/** Test hook: clear cache between runs. */
+export function _resetProgramTypeCache(): void {
+  programTypeCache.clear();
+}
+
 // Card registration — entry point for Palisade's provisioning-agent.
 // Lands a Card in SHIPPED with a linked VaultEntry; first cardholder
 // SUN-tap (separate flow) flips it to ACTIVATED and registers the passkey.
@@ -88,13 +126,16 @@ export async function registerCard(input: RegisterCardInput): Promise<RegisterCa
   // Retail programs ship cards to retailers in an inactive state — the tap
   // flow routes to info-only until the card is marked SOLD.  All other
   // programs leave retailSaleStatus NULL (activation works on first tap).
+  //
+  // Small in-process TTL cache on programType lookups.  The batch-processor
+  // calls registerCard once per CSV row with the SAME programId for the
+  // whole batch — without a cache this is one extra Prisma hop per card
+  // that returns the same row every time.  TTL is short (5 min) since
+  // programType is effectively immutable after creation.
   let retailSaleStatus: 'SHIPPED' | null = null;
   if (input.programId) {
-    const prog = await prisma.program.findUnique({
-      where: { id: input.programId },
-      select: { programType: true },
-    });
-    if (prog?.programType === 'RETAIL') retailSaleStatus = 'SHIPPED';
+    const programType = await getProgramTypeCached(input.programId);
+    if (programType === 'RETAIL') retailSaleStatus = 'SHIPPED';
   }
 
   // Encrypt BEFORE the vault call so a key-version drift fails fast without
