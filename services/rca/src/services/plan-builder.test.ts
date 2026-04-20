@@ -141,17 +141,15 @@ describe('buildTransferSadApdu — real metadata plumbing', () => {
   });
 
   it('embeds the real decrypted SAD bytes at the head of the payload', () => {
-    // Minimal SADBuilder-format SAD: count(2)=1 + tag(2) + len(2) + data.
-    // The data itself is 11 bytes of distinctive content so we can grep it
-    // at the right offset.  Post-conversion the wire format is
-    // [tag(2) + BER-len(1) + data(11)] = 14 bytes.
-    const dataBytes = Buffer.from('DEADBEEFCAFEBABE' + '424242', 'hex'); // 11 bytes
-    const sadPayload = Buffer.concat([
-      Buffer.from([0x00, 0x01]),                // count = 1
-      Buffer.from([0x02, 0x02]),                // DGI tag 0x0202
-      Buffer.from([0x00, dataBytes.length]),    // len = 11 (2-byte BE)
-      dataBytes,
-    ]);
+    // A fake SAD payload with distinctive bytes so we can grep it at
+    // the right offset.  Not a real DGI structure — this module doesn't
+    // care; the PA parses from the end.
+    const sadPayload = Buffer.from(
+      '02020C50414C4953414445' +  // DGI 0x0202 len=12 + TLV 0x50 "PALISADE"
+      'DEADBEEFCAFEBABE' +         // trailing bytes to make it longer than the minimal stub
+      '42424242',
+      'hex',
+    );
 
     const ctx = makeCtx({
       bankId: 0xAABBCCDD,
@@ -213,19 +211,14 @@ describe('schemeByteForIssuer', () => {
 });
 
 describe('buildMinimalSadPayload', () => {
-  it('produces SADBuilder format: count(2)=1 + DGI 0x0101 carrying TLV 0x50 "PALISADE"', () => {
+  it('produces a single DGI 0x0101 carrying TLV 0x50 "PALISADE"', () => {
     const sad = buildMinimalSadPayload();
-    // SADBuilder.serialiseDgis format:
-    // [count_hi, count_lo, tag_hi, tag_lo, len_hi, len_lo, 0x50, 0x08, "PALISADE"]
-    // count=1, tag=0x0101, len=10, tlv(50|08|PALISADE)
-    expect(sad[0]).toBe(0x00);
-    expect(sad[1]).toBe(0x01); // count = 1
-    expect(sad[2]).toBe(0x01);
-    expect(sad[3]).toBe(0x01); // DGI tag = 0x0101
-    expect(sad[4]).toBe(0x00);
-    expect(sad[5]).toBe(0x0a); // DGI len = 10
-    expect(sad[6]).toBe(0x50); // TLV tag 0x50
-    expect(sad[7]).toBe(0x08); // TLV len = 8
-    expect(sad.subarray(8).toString('ascii')).toBe('PALISADE');
+    // [0x01, 0x01, len=10, 0x50, 0x08, "PALISADE"]
+    expect(sad[0]).toBe(0x01);
+    expect(sad[1]).toBe(0x01);
+    expect(sad[2]).toBe(0x0a); // 10 bytes of TLV
+    expect(sad[3]).toBe(0x50);
+    expect(sad[4]).toBe(0x08);
+    expect(sad.subarray(5).toString('ascii')).toBe('PALISADE');
   });
 });

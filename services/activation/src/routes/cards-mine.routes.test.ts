@@ -153,6 +153,7 @@ describe('GET /api/cards/mine', () => {
       panExpiryMonth: '12',
       panExpiryYear: '28',
       programName: 'Test Program',
+      financialInstitutionName: null,
       credentials: [],
     });
 

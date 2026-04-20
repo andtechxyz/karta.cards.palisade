@@ -144,14 +144,7 @@ const CONFIRM_APDU = '80E8000000';
 export function buildMinimalSadPayload(): Buffer {
   const appLabel = Buffer.from('PALISADE', 'ascii');
   const tlv50 = Buffer.concat([Buffer.from([0x50, appLabel.length]), appLabel]);
-  // Emit in SADBuilder.serialiseDgis format: count(2 BE) + tag(2) + len(2 BE) + data
-  // (buildTransferSadApdu's sadPayloadToPaWireFormat converts to PA wire
-  // format at the transmission boundary).
-  const count = Buffer.from([0x00, 0x01]);
-  const tag = Buffer.from([0x01, 0x01]);
-  const len = Buffer.alloc(2);
-  len.writeUInt16BE(tlv50.length, 0);
-  return Buffer.concat([count, tag, len, tlv50]);
+  return Buffer.concat([Buffer.from([0x01, 0x01, tlv50.length]), tlv50]);
 }
 
 /**
@@ -225,78 +218,8 @@ export function buildProvisioningPlan(ctx: PlanContext): Plan {
  * row — they land in chip NVM verbatim, so passing placeholders here
  * would corrupt the card's post-personalisation identity.
  */
-/**
- * Convert SADBuilder.serialiseDgis output to the PA applet's expected
- * wire format.
- *
- * SADBuilder emits:
- *   count(2 BE) || [ tag(2 BE) | dgiLen(2 BE) | data ] * count
- *
- * The PA applet (palisade-pa ProvisioningAgent.java, processTransferSad)
- * parses:
- *   [ tag(2 BE) | BER-TLV length | data ] *
- *
- * Without this conversion the PA reads the count header as a spurious
- * first DGI tag (0x0004 with BER length 0x7F = 127) and subsequently
- * trips on the first real DGI's 2-byte length field, throwing SW 6984
- * SW_DATA_INVALID at services/rca/src/services/session-manager.ts
- * TRANSFER_SAD step.
- *
- * We do the conversion HERE (at the wire boundary) rather than changing
- * SADBuilder so existing stored SADs (already in the SADBuilder format)
- * continue to decrypt + replay without a re-encrypt migration.
- */
-function sadPayloadToPaWireFormat(sadPayload: Buffer): Buffer {
-  if (sadPayload.length < 2) {
-    throw new Error(
-      `SAD payload too short for count-prefix layout: ${sadPayload.length} bytes`,
-    );
-  }
-  const count = sadPayload.readUInt16BE(0);
-  const out: Buffer[] = [];
-  let pos = 2;
-  for (let i = 0; i < count; i++) {
-    if (pos + 4 > sadPayload.length) {
-      throw new Error(`SAD payload truncated at DGI ${i} (pos=${pos})`);
-    }
-    const tag = sadPayload.subarray(pos, pos + 2);
-    pos += 2;
-    const dgiLen = sadPayload.readUInt16BE(pos);
-    pos += 2;
-    if (pos + dgiLen > sadPayload.length) {
-      throw new Error(
-        `SAD payload DGI ${i} data overruns buffer (tag=${tag.toString('hex')} len=${dgiLen} pos=${pos})`,
-      );
-    }
-    const data = sadPayload.subarray(pos, pos + dgiLen);
-    pos += dgiLen;
-
-    // Encode length in BER-TLV short/long form.
-    let lenField: Buffer;
-    if (dgiLen < 0x80) {
-      lenField = Buffer.from([dgiLen]);
-    } else if (dgiLen <= 0xff) {
-      lenField = Buffer.from([0x81, dgiLen]);
-    } else if (dgiLen <= 0xffff) {
-      lenField = Buffer.from([0x82, (dgiLen >> 8) & 0xff, dgiLen & 0xff]);
-    } else {
-      throw new Error(`DGI length ${dgiLen} exceeds 16-bit BER range`);
-    }
-    out.push(tag, lenField, data);
-  }
-  if (pos !== sadPayload.length) {
-    throw new Error(
-      `SAD payload has ${sadPayload.length - pos} trailing bytes after ${count} DGIs`,
-    );
-  }
-  return Buffer.concat(out);
-}
-
 export function buildTransferSadApdu(ctx: PlanContext): Buffer {
-  // Convert the stored SAD format (count-prefixed, fixed 2-byte lengths)
-  // to the PA applet's wire format (BER-TLV per DGI, no count header).
-  // See sadPayloadToPaWireFormat above for the rationale.
-  const sadPayload = sadPayloadToPaWireFormat(ctx.sadPayload);
+  const sadPayload = ctx.sadPayload;
 
   const bankId = Buffer.alloc(4);
   bankId.writeUInt32BE(ctx.bankId >>> 0, 0);
