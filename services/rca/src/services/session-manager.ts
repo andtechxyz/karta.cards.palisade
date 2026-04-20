@@ -18,6 +18,7 @@ import { badRequest, redactSid } from '@palisade/core';
 import { DataPrepService } from '@palisade/data-prep/services/data-prep.service';
 
 import { getRcaConfig } from '../env.js';
+import { metrics } from '../metrics.js';
 import {
   buildProvisioningPlan,
   buildMinimalSadPayload,
@@ -338,6 +339,7 @@ export class SessionManager {
     });
 
     console.log(`[rca] session created: ${session.id} for card ${sadRecord.cardId}`);
+    metrics().counter('rca.session.started', 1);
 
     // Fire-and-forget KMS decrypt so the plaintext is ready by the time
     // the mobile app finishes TLS + WS open + attestation.  On failure
@@ -745,6 +747,11 @@ export class SessionManager {
     const { iccPubkey, attestation } = extracted;
     const mode = getRcaConfig().PALISADE_ATTESTATION_MODE;
     const verifyResult = AttestationVerifier.verify(extracted, mode);
+    metrics().counter('rca.attestation.verify', 1, {
+      mode,
+      result: verifyResult.ok ? 'ok' : 'fail',
+      path: 'classical',
+    });
     if (!verifyResult.ok) {
       // eslint-disable-next-line no-console
       console.error(
@@ -909,6 +916,7 @@ export class SessionManager {
         console.log(
           `[rca] provisioning complete: session=${redactSid(sessionId)}, card=${redactSid(s.cardId)}`,
         );
+        metrics().counter('rca.provisioning.complete', 1, { mode: 'classical' });
         // Fire callback to activation service — best-effort, callback
         // retries live on activation's idempotency path.
         this.fireCallback(s.card.cardRef, s.card.chipSerial ?? '').catch((err) =>
@@ -970,6 +978,14 @@ export class SessionManager {
     // responses from the same WS are also rejected on the phase guard.
     const advance = advancePlanStep(sessionId, i);
     if (!advance.ok) {
+      // Emit a CloudWatch counter so dashboards can alarm on rejected
+      // step bursts — either a buggy mobile build or an attack probing
+      // the cursor.  Reason is a low-cardinality enum
+      // (missing/expired/out_of_range/replay/skip) so it's safe as a
+      // CloudWatch dimension.  Extract just the code, not the
+      // parenthesised numbers.
+      const reasonCode = advance.reason.split('(')[0];
+      metrics().counter('rca.plan_step.rejected', 1, { reason: reasonCode });
       console.warn(
         `[rca] plan-mode step rejected for session ${redactSid(sessionId)}: i=${i} reason=${advance.reason}`,
       );
@@ -1069,6 +1085,11 @@ export class SessionManager {
     // warning and continue — this is the legacy path until karta-se v1.
     const mode = getRcaConfig().PALISADE_ATTESTATION_MODE;
     const verifyResult = AttestationVerifier.verify(extracted, mode);
+    metrics().counter('rca.attestation.verify', 1, {
+      mode,
+      result: verifyResult.ok ? 'ok' : 'fail',
+      path: 'plan',
+    });
     if (!verifyResult.ok) {
       // eslint-disable-next-line no-console
       console.error(
@@ -1188,6 +1209,7 @@ export class SessionManager {
     console.log(
       `[rca] plan-mode provisioning complete: session=${redactSid(sessionId)}, card=${redactSid(session.cardId)}`,
     );
+    metrics().counter('rca.provisioning.complete', 1, { mode: 'plan' });
 
     // Release the step cursor — session is terminal, any further plan
     // responses for this sessionId must fail at advancePlanStep.

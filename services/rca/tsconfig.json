@@ -11,6 +11,7 @@
     { "path": "../../packages/db" },
     { "path": "../../packages/emv" },
     { "path": "../../packages/handoff" },
+    { "path": "../../packages/metrics" },
     { "path": "../../packages/service-auth" },
     { "path": "../data-prep" }
   ]

@@ -187,6 +187,46 @@ After CodeBuild completes, run step 3 + 4 of the one-shot flow above
 
 ---
 
+## Turning on CloudWatch metrics (EMF)
+
+`@palisade/metrics` is wired into `rca` (more services to follow).  It
+reads `METRICS_BACKEND` at startup — set it to `cloudwatch` on the ECS
+task definition and every `metrics.counter()/gauge()/timing()` call
+emits an EMF-formatted stdout line that CloudWatch Logs Insights parses
+into metrics.
+
+```bash
+# Patch the rca task def to add METRICS_BACKEND=cloudwatch.  Fetch,
+# mutate, re-register, point the service at the new revision.
+TASK_DEF=$(aws ecs describe-task-definition --region ap-southeast-2 \
+  --task-definition vera-rca --query 'taskDefinition')
+NEW_DEF=$(echo "$TASK_DEF" | jq '
+  .containerDefinitions[0].environment += [
+    { "name": "METRICS_BACKEND", "value": "cloudwatch" }
+  ]
+' | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+NEW_ARN=$(aws ecs register-task-definition --region ap-southeast-2 \
+  --cli-input-json "$NEW_DEF" \
+  --query 'taskDefinition.taskDefinitionArn' --output text)
+aws ecs update-service --region ap-southeast-2 --cluster vera \
+  --service vera-rca --task-definition "$NEW_ARN" --force-new-deployment
+```
+
+Emitted metrics (CloudWatch namespace `rca`):
+
+| Metric | Dimensions | When |
+|---|---|---|
+| `rca.session.started` | — | Every `POST /api/provision/start` |
+| `rca.provisioning.complete` | `mode` ∈ {plan,classical} | Atomic commit succeeds |
+| `rca.attestation.verify` | `mode` ∈ {strict,permissive}, `result` ∈ {ok,fail}, `path` ∈ {plan,classical} | Every attestation check |
+| `rca.plan_step.rejected` | `reason` ∈ {plan_step_state_missing, plan_step_state_expired, plan_step_out_of_range, plan_step_replay, plan_step_skip} | Plan-mode step cursor rejects a response |
+
+Useful CloudWatch alarms to wire up:
+- `rca.plan_step.rejected` > 5 in 5 min → mobile bug or attack
+- `rca.attestation.verify{result=fail}` > 0 in strict mode → real chip rejection
+- `rca.provisioning.complete` drops to 0 over a 15 min window when
+  `rca.session.started` > 0 → provisioning stuck
+
 ## Gotchas encountered
 
 - **Apple Silicon**: `docker buildx build` without `--platform linux/amd64`

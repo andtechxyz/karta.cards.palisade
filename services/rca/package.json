@@ -13,6 +13,7 @@
     "@palisade/db": "*",
     "@palisade/emv": "*",
     "@palisade/handoff": "*",
+    "@palisade/metrics": "^0.0.1",
     "@palisade/service-auth": "*",
     "dotenv": "^16.4.5",
     "express": "^4.21.2",
