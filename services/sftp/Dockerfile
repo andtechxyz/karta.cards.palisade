@@ -29,6 +29,8 @@ COPY packages/emv/package.json                  packages/emv/
 COPY packages/provisioning-client/package.json  packages/provisioning-client/
 COPY packages/cognito-auth/package.json         packages/cognito-auth/
 COPY packages/sdm-keys/package.json             packages/sdm-keys/
+COPY packages/admin-config/package.json         packages/admin-config/
+COPY packages/metrics/package.json              packages/metrics/
 COPY services/tap/package.json                  services/tap/
 COPY services/activation/package.json           services/activation/
 COPY services/admin/package.json                services/admin/
@@ -36,6 +38,7 @@ COPY services/data-prep/package.json            services/data-prep/
 COPY services/rca/package.json                  services/rca/
 COPY services/batch-processor/package.json      services/batch-processor/
 COPY services/sftp/package.json                 services/sftp/
+COPY services/card-ops/package.json             services/card-ops/
 COPY services/activation/frontend/package.json  services/activation/frontend/
 
 RUN npm ci
