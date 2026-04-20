@@ -49,6 +49,15 @@ const { get: getActivationConfig, reset: _resetActivationConfig } = defineEnv({
   // 'activation'.  Defaults to all-zero for local dev (test setup fills
   // the real value).
   SERVICE_AUTH_CARD_OPS_SECRET: hexKey(32).default('0'.repeat(64)),
+  // PCI 8.3.6 / H-8 — HMAC key for signing WS upgrade tokens handed to
+  // the mobile app / admin client.  card-ops + rca share this secret
+  // and verify on WS upgrade; activation is the sole signer for card-op
+  // tokens.  64-char hex.
+  WS_TOKEN_SECRET: hexKey(32),
+  // WS session timeout — upper bound on how long a minted wsUrl stays
+  // valid.  Matches card-ops' WS_TIMEOUT_SECONDS; both ends reject
+  // upgrades past this age.
+  WS_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(60),
   // AWS Cognito — mobile app JWT verification
   COGNITO_USER_POOL_ID: z.string().default('ap-southeast-2_Db4d1vpIV'),
   COGNITO_CLIENT_ID: z.string().default('7pj9230obhsa6h6vrvk9tru7do'),

@@ -71,6 +71,11 @@ const defaults: Record<string, string> = {
   // (DEV_UDK_ROOT_SEED below) before constructing EmvDerivationService.
   DATA_PREP_UDK_BACKEND: 'mock',
   DEV_UDK_ROOT_SEED: HEX32_A,
+  // H-8 WS upgrade auth token — shared across activation (signer) +
+  // rca/card-ops (verifiers).  Distinct hex so a leaked TAP_HANDOFF_SECRET
+  // can't also forge WS upgrades.
+  WS_TOKEN_SECRET: '1'.repeat(32) + '2'.repeat(32),
+  WS_TIMEOUT_SECONDS: '60',
 };
 
 for (const [k, v] of Object.entries(defaults)) {

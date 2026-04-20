@@ -55,6 +55,11 @@ const { get: _getCardOpsConfigRaw, reset: _resetCardOpsConfig } = defineEnv({
   // decryptSadDev).  Production sets this to the same ARN as
   // data-prep / rca so decrypts round-trip across services.
   KMS_SAD_KEY_ARN: z.string().default(''),
+
+  // Shared HMAC key for verifying the WS upgrade token minted by
+  // activation.  PCI 8.3.6 / H-8.  Activation signs with the same key.
+  // 64 hex chars (32 bytes).
+  WS_TOKEN_SECRET: z.string().regex(/^[0-9a-fA-F]{64}$/, 'WS_TOKEN_SECRET must be 64 hex chars (32 bytes)'),
 });
 
 // Wrap the raw config getter with a production guard that refuses to boot

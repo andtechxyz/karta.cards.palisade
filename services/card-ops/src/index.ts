@@ -21,6 +21,7 @@ import { requireSignedRequest, captureRawBody } from '@palisade/service-auth';
 import { errorMiddleware } from '@palisade/core';
 import { prisma } from '@palisade/db';
 import { startSweeper, scrubStaleCardOpScpState } from '@palisade/retention';
+import { verifyHandoff, HandoffError } from '@palisade/handoff';
 
 import { getCardOpsConfig } from './env.js';
 import { createRegisterRouter } from './routes/register.routes.js';
@@ -60,6 +61,34 @@ wss.on('connection', async (ws, req) => {
   }
 
   const sessionId = match[1];
+
+  // Parse `?tok=<signed>` from the query.  PCI 8.3.6 / H-8: cuid alone
+  // isn't enough auth for a full-auth GP relay channel.  Activation
+  // mints the token at card-op creation time; we verify here with the
+  // shared WS_TOKEN_SECRET.
+  const parsedUrl = new URL(req.url ?? '/', 'http://localhost');
+  const tok = parsedUrl.searchParams.get('tok');
+  if (!tok) {
+    ws.close(4001, 'Missing WS auth token');
+    return;
+  }
+  try {
+    const claims = verifyHandoff({
+      token: tok,
+      secretHex: config.WS_TOKEN_SECRET,
+      expectedPurpose: 'provisioning',
+      allowedIssuers: ['activation'],
+    });
+    if (claims.sub !== sessionId) {
+      ws.close(4001, 'Token bound to different session');
+      return;
+    }
+  } catch (err) {
+    const code = err instanceof HandoffError ? err.code : 'token_verify_failed';
+    console.warn(`[card-ops-ws] upgrade rejected for ${sessionId}: ${code}`);
+    ws.close(4001, `WS auth failed: ${code}`);
+    return;
+  }
 
   // Validate the session: exists, READY (or RUNNING on reconnect-retry),
   // and not expired.  The sessionId itself is the auth token — it's a

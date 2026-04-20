@@ -7,6 +7,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { badRequest } from '@palisade/core';
+import { signHandoff } from '@palisade/handoff';
 
 import { SessionManager } from '../services/session-manager.js';
 import { getRcaConfig } from '../env.js';
@@ -39,6 +40,24 @@ export function createProvisionRouter(): Router {
       const proto = req.secure ? 'wss' : 'ws';
       wsUrl = `${proto}://${host}/api/provision/relay/${session.sessionId}`;
     }
+
+    // PCI 8.3 — H-8 from the overnight audit: the cuid sessionId alone is
+    // not enough auth for the WS upgrade (any side-channel leak gives a
+    // short-lived but full-auth provisioning channel).  Mint a signed
+    // token bound to (sessionId, exp=WS_TIMEOUT_SECONDS) and append as
+    // `?tok=`.  The WS server verifies tok → sessionId + exp before
+    // accepting the upgrade.  Leaks after exp are useless; forgery
+    // requires the WS_TOKEN_SECRET (HSM-backed Secrets Manager).
+    const token = signHandoff(
+      {
+        sub: session.sessionId,
+        purpose: 'provisioning',
+        iss: 'rca',
+        ttlSeconds: config.WS_TIMEOUT_SECONDS,
+      },
+      config.WS_TOKEN_SECRET,
+    );
+    wsUrl = `${wsUrl}?tok=${encodeURIComponent(token)}`;
 
     res.status(201).json({
       sessionId: session.sessionId,

@@ -28,6 +28,7 @@ import { prisma } from '@palisade/db';
 import { badRequest, notFound, internal } from '@palisade/core';
 import { createCognitoAuthMiddleware } from '@palisade/cognito-auth';
 import { signRequest } from '@palisade/service-auth';
+import { signHandoff } from '@palisade/handoff';
 import { getAdminEmails } from '@palisade/admin-config';
 import { getActivationConfig } from '../env.js';
 
@@ -155,9 +156,25 @@ export function createCardOpRouter(): Router {
     // its response if given, otherwise build from our own config.
     const body = (await resp.body.json()) as { wsPath?: string } | null;
     const wsPath = body?.wsPath ?? `/api/card-ops/relay/${session.id}`;
-    const wsUrl = config.CARD_OPS_PUBLIC_WS_BASE
+    let wsUrl = config.CARD_OPS_PUBLIC_WS_BASE
       ? `${config.CARD_OPS_PUBLIC_WS_BASE.replace(/\/$/, '')}${wsPath}`
       : `${req.secure ? 'wss' : 'ws'}://${req.get('host') ?? 'localhost:3009'}${wsPath}`;
+
+    // PCI 8.3.6 / H-8: mint a short-lived WS auth token bound to the
+    // sessionId.  card-ops verifies on upgrade using the shared
+    // WS_TOKEN_SECRET.  TTL matches WS_TIMEOUT_SECONDS so a leaked wsUrl
+    // is only attackable inside the window card-ops would also reject on
+    // age grounds.
+    const token = signHandoff(
+      {
+        sub: session.id,
+        purpose: 'provisioning',
+        iss: 'activation',
+        ttlSeconds: config.WS_TIMEOUT_SECONDS ?? 60,
+      },
+      config.WS_TOKEN_SECRET,
+    );
+    wsUrl = `${wsUrl}?tok=${encodeURIComponent(token)}`;
 
     res.status(201).json({ sessionId: session.id, wsUrl });
   });

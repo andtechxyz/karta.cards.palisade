@@ -51,6 +51,8 @@ vi.mock('../env.js', () => ({
     CARD_OPS_URL: 'http://card-ops:3009',
     CARD_OPS_PUBLIC_WS_BASE: 'wss://manage.karta.cards',
     SERVICE_AUTH_CARD_OPS_SECRET: '0'.repeat(64),
+    WS_TOKEN_SECRET: '1'.repeat(32) + '2'.repeat(32),
+    WS_TIMEOUT_SECONDS: 60,
   }),
 }));
 
@@ -201,7 +203,12 @@ describe('POST /api/admin/card-op/start', () => {
 
     expect(status).toBe(201);
     expect(body.sessionId).toBe('cop_1');
-    expect(body.wsUrl).toBe('wss://manage.karta.cards/api/card-ops/relay/cop_1');
+    // PCI 8.3.6 / H-8: wsUrl now carries a signed `?tok=` HMAC token so
+    // the WS upgrade auth isn't solely the cuid.  Assert the PATH prefix
+    // is right and that the token parameter is present + structurally valid.
+    expect(body.wsUrl).toMatch(
+      /^wss:\/\/manage\.karta\.cards\/api\/card-ops\/relay\/cop_1\?tok=[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/,
+    );
 
     // Session row created with the right initiator + phase
     expect(sessionCreate()).toHaveBeenCalledWith(

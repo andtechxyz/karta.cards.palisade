@@ -16,6 +16,7 @@ import { WebSocketServer } from 'ws';
 import { requireSignedRequest, captureRawBody } from '@palisade/service-auth';
 import { errorMiddleware } from '@palisade/core';
 import { prisma } from '@palisade/db';
+import { verifyHandoff, HandoffError } from '@palisade/handoff';
 
 import { getRcaConfig } from './env.js';
 import { createProvisionRouter } from './routes/provision.routes.js';
@@ -63,18 +64,43 @@ wss.on('connection', async (ws, req) => {
   const sessionId = match[1];
 
   // Parse the query string once for all protocol-level feature flags.
-  // Today we only check `mode=plan` to enable plan-mode (pre-computed
-  // APDU sequence), but this is the hook-point if we add compression,
-  // attestation-gate checkpoints, etc.
+  // Today we check:
+  //   tok  — WS auth HMAC token (PCI 8.3.6 / H-8).  Mandatory; rejects
+  //          upgrade if missing, malformed, expired, or bound to a
+  //          different sessionId.
+  //   mode — plan-mode (pre-computed APDU sequence).  Optional.
   //
   // The URL constructor needs a base — we're only interested in the
   // query params, so any valid base works.
   const parsedUrl = new URL(req.url ?? '/', 'http://localhost');
   const planMode = parsedUrl.searchParams.get('mode') === 'plan';
+  const tok = parsedUrl.searchParams.get('tok');
+
+  // Verify the WS upgrade token BEFORE touching the DB.  Short-circuits
+  // DoS by rejecting unauth'd upgrades at the cheapest possible point.
+  if (!tok) {
+    ws.close(4001, 'Missing WS auth token');
+    return;
+  }
+  try {
+    const claims = verifyHandoff({
+      token: tok,
+      secretHex: config.WS_TOKEN_SECRET,
+      expectedPurpose: 'provisioning',
+      allowedIssuers: ['rca'],
+    });
+    if (claims.sub !== sessionId) {
+      ws.close(4001, 'Token bound to different session');
+      return;
+    }
+  } catch (err) {
+    const code = err instanceof HandoffError ? err.code : 'token_verify_failed';
+    console.warn(`[rca-ws] upgrade rejected for ${sessionId}: ${code}`);
+    ws.close(4001, `WS auth failed: ${code}`);
+    return;
+  }
 
   // Validate the session exists, is in INIT phase, and was created recently.
-  // The sessionId itself is the auth token — it's a cuid with 25+ chars of
-  // entropy, returned only via the HMAC-gated /api/provision/start endpoint.
   try {
     const session = await prisma.provisioningSession.findUnique({
       where: { id: sessionId },

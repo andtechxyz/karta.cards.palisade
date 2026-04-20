@@ -62,6 +62,17 @@ const { get: getRcaConfig, reset: _resetRcaConfig } = defineEnv({
   // Default is `permissive` for backward compatibility during rollout; a
   // karta-se v1 deployment should flip this to `strict` via ECS task def.
   PALISADE_ATTESTATION_MODE: z.enum(['strict', 'permissive']).default('permissive'),
+
+  // --- WS upgrade auth token (patent C3 / PCI 8.3.6) ---------------------
+  // HMAC-SHA256 key for the short-lived token appended to wsUrl.  Signer
+  // and verifier share the same key; mobile clients round-trip it
+  // verbatim from /api/provision/start to the WS upgrade.  64-char hex
+  // (32 bytes) — read from Secrets Manager (palisade/WS_TOKEN_SECRET).
+  //
+  // TTL matches WS_TIMEOUT_SECONDS so a leaked wsUrl is only attackable
+  // inside the same window the server would have accepted the cuid alone
+  // — after that, both the cuid-age check AND the token-exp check reject.
+  WS_TOKEN_SECRET: z.string().regex(/^[0-9a-fA-F]{64}$/, 'WS_TOKEN_SECRET must be 64 hex chars (32 bytes)'),
 });
 
 export { getRcaConfig, _resetRcaConfig };

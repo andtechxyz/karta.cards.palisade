@@ -13,6 +13,7 @@
     "@palisade/data-prep": "*",
     "@palisade/db": "*",
     "@palisade/emv": "*",
+    "@palisade/handoff": "*",
     "@palisade/retention": "*",
     "@palisade/service-auth": "*",
     "adm-zip": "^0.5.17",
