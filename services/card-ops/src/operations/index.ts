@@ -21,6 +21,10 @@ export const OPERATIONS = [
   'install_payment_applet',
   'personalise_payment_applet',
   'reset_pa_state',
+  // reprovision_card: patent C10/C24 post-issuance re-provisioning.  Wipes
+  // the PA applet (INS_WIPE), marks SADs consumed, flips Card to ACTIVATED
+  // so next tap gets fresh provisioning.
+  'reprovision_card',
   'uninstall_pa',
   'uninstall_t4t',
   'uninstall_receiver',

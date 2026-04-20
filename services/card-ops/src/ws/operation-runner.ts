@@ -27,6 +27,7 @@ import { runInstallPa } from '../operations/install-pa.js';
 import { runInstallPaymentApplet } from '../operations/install-payment-applet.js';
 import { runPersonalisePaymentApplet } from '../operations/personalise-payment-applet.js';
 import { runResetPaState } from '../operations/reset-pa-state.js';
+import { runReprovisionCard } from '../operations/reprovision-card.js';
 import { ApduAuditLogger } from './apdu-audit.js';
 
 type CardOpSessionWithCard = Prisma.CardOpSessionGetPayload<{ include: { card: true } }>;
@@ -79,6 +80,9 @@ export async function runOperation(ctx: OperationContext): Promise<void> {
         break;
       case 'reset_pa_state':
         terminal = await runResetPaState(session, io);
+        break;
+      case 'reprovision_card':
+        terminal = await runReprovisionCard(session, io);
         break;
       // Phase 3 stubs — wired up so the plumbing is exercised.
       //
