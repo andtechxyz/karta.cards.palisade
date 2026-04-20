@@ -1,9 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { createSign, generateKeyPairSync } from 'node:crypto';
 import {
   AttestationVerifier,
   STUB_MODE_WARNING,
   ICC_PUBKEY_LEN,
   CPLC_LEN,
+  verifyAttestationSignature,
   type AttestationExtractResult,
 } from './attestation-verifier.js';
 
@@ -195,5 +197,87 @@ describe('AttestationVerifier.verify (strict mode)', () => {
     );
     expect(r.ok).toBe(false);
     expect(r.warning).toMatch(/could not parse/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// verifyAttestationSignature — signature-verify unit tests
+// ---------------------------------------------------------------------------
+//
+// The full strict-mode verify() path also walks a cert chain to a pinned
+// vendor root.  Synthesising an X.509 chain in tests requires a library
+// (node-forge / @peculiar/x509) we don't take as a dep for this alone,
+// so the chain-walk path is exercised only via the negative-path tests
+// above ("malformed DER", "empty chain").  The SIGNATURE VERIFY portion
+// — the actual ECDSA over (iccPubkey || cplc) — is what distinguishes
+// a genuine chip attestation from a replay, so we cover it in isolation
+// here with an in-memory P-256 keypair playing the role of the leaf.
+
+describe('verifyAttestationSignature', () => {
+  it('accepts a real ECDSA-SHA256 signature over (iccPubkey || cplc)', () => {
+    const { publicKey, privateKey } = generateKeyPairSync('ec', {
+      namedCurve: 'P-256',
+    });
+    const iccPubkey = Buffer.alloc(ICC_PUBKEY_LEN, 0x04);
+    const cplc = Buffer.alloc(CPLC_LEN, 0xAA);
+    const signer = createSign('SHA256');
+    signer.update(Buffer.concat([iccPubkey, cplc]));
+    const sig = signer.sign(privateKey);
+
+    expect(verifyAttestationSignature(iccPubkey, cplc, sig, publicKey)).toBe(true);
+  });
+
+  it('rejects a signature over the wrong message', () => {
+    const { publicKey, privateKey } = generateKeyPairSync('ec', {
+      namedCurve: 'P-256',
+    });
+    const iccPubkey = Buffer.alloc(ICC_PUBKEY_LEN, 0x04);
+    const cplc = Buffer.alloc(CPLC_LEN, 0xAA);
+    const signer = createSign('SHA256');
+    signer.update(Buffer.from('OTHER MESSAGE'));
+    const sig = signer.sign(privateKey);
+
+    expect(verifyAttestationSignature(iccPubkey, cplc, sig, publicKey)).toBe(false);
+  });
+
+  it('rejects a signature from the wrong key', () => {
+    const kpSigner = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+    const kpVerifier = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+    const iccPubkey = Buffer.alloc(ICC_PUBKEY_LEN, 0x04);
+    const cplc = Buffer.alloc(CPLC_LEN, 0xAA);
+    const signer = createSign('SHA256');
+    signer.update(Buffer.concat([iccPubkey, cplc]));
+    const sig = signer.sign(kpSigner.privateKey);
+
+    // Signed with kpSigner but verifying against kpVerifier — must fail.
+    expect(verifyAttestationSignature(iccPubkey, cplc, sig, kpVerifier.publicKey)).toBe(false);
+  });
+
+  it('rejects a bit-flipped signature', () => {
+    const { publicKey, privateKey } = generateKeyPairSync('ec', {
+      namedCurve: 'P-256',
+    });
+    const iccPubkey = Buffer.alloc(ICC_PUBKEY_LEN, 0x04);
+    const cplc = Buffer.alloc(CPLC_LEN, 0xAA);
+    const signer = createSign('SHA256');
+    signer.update(Buffer.concat([iccPubkey, cplc]));
+    const sig = Buffer.from(signer.sign(privateKey));
+    // Flip a byte deep in the signature payload.
+    sig[Math.floor(sig.length / 2)] ^= 0x01;
+
+    expect(verifyAttestationSignature(iccPubkey, cplc, sig, publicKey)).toBe(false);
+  });
+
+  it('returns false (not throws) on structurally-invalid DER signature', () => {
+    const { publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+    const iccPubkey = Buffer.alloc(ICC_PUBKEY_LEN, 0x04);
+    const cplc = Buffer.alloc(CPLC_LEN, 0xAA);
+    // 72 bytes of 0x00 — not a valid DER ECDSA signature.
+    const bogusSig = Buffer.alloc(72, 0x00);
+
+    expect(() =>
+      verifyAttestationSignature(iccPubkey, cplc, bogusSig, publicKey),
+    ).not.toThrow();
+    expect(verifyAttestationSignature(iccPubkey, cplc, bogusSig, publicKey)).toBe(false);
   });
 });

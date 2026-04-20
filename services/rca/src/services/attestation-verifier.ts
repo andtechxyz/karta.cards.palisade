@@ -334,12 +334,13 @@ export class AttestationVerifier {
 
     // 3. Verify the attestation signature over (pubkey || CPLC) with the
     //    leaf's public key.
-    const signed = Buffer.concat([extract.iccPubkey, extract.cplc]);
     const leafKey = createPublicKey(leaf.publicKey.export({ format: 'der', type: 'spki' }));
-    const v = createVerify('SHA256');
-    v.update(signed);
-    const sigOk = v.verify(leafKey, extract.attestation);
-
+    const sigOk = verifyAttestationSignature(
+      extract.iccPubkey,
+      extract.cplc,
+      extract.attestation,
+      leafKey,
+    );
     if (!sigOk) {
       return {
         ok: false,
@@ -349,6 +350,38 @@ export class AttestationVerifier {
     }
 
     return { ok: true, vendor };
+  }
+}
+
+/**
+ * Low-level attestation signature check.  Exported so unit tests can
+ * exercise the ECDSA-SHA256 path with a synthetic EC keypair — building
+ * a full X.509 cert chain in tests requires a third-party library we
+ * don't want to add just for that.  Production callers (verify() above)
+ * funnel through here too, so test coverage of this helper directly
+ * exercises the same code path.
+ *
+ * Signed bytes: (iccPubkey || cplc).  Returns true on valid DER ECDSA
+ * signature, false on any malformed/mismatched input.  `createVerify`
+ * is strict about DER structure so malformed sig bytes return false
+ * rather than throwing.
+ */
+export function verifyAttestationSignature(
+  iccPubkey: Buffer,
+  cplc: Buffer,
+  attestation: Buffer,
+  leafPubkey: KeyObject,
+): boolean {
+  const signed = Buffer.concat([iccPubkey, cplc]);
+  const v = createVerify('SHA256');
+  v.update(signed);
+  try {
+    return v.verify(leafPubkey, attestation);
+  } catch {
+    // `createVerify` throws on structurally-invalid DER — treat as
+    // rejection rather than propagating so callers see a consistent
+    // "false" on any bad input.
+    return false;
   }
 }
 
