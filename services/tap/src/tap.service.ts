@@ -5,6 +5,7 @@ import { verifySunUrl, type SunVerificationResult } from './sun/index.js';
 import { getTapConfig } from './env.js';
 import { getCardFieldKeyProvider } from './key-provider.js';
 import { getSdmDeriver } from './sdm-deriver.js';
+import { metrics } from './metrics.js';
 
 // SUN-tap handler — invoked by the cardholder's phone after the card emits
 // its NDEF URL.  Verifies the SUN signature, advances the monotonic read
@@ -60,8 +61,12 @@ export async function handleSunTap(input: HandleSunTapInput): Promise<HandleSunT
       keyVersion: true,
     },
   });
-  if (!card) throw notFound('card_not_found', 'Unknown cardRef');
+  if (!card) {
+    metrics().counter('tap.verify.fail', 1, { reason: 'card_not_found' });
+    throw notFound('card_not_found', 'Unknown cardRef');
+  }
   if (card.status === 'REVOKED' || card.status === 'SUSPENDED') {
+    metrics().counter('tap.verify.fail', 1, { reason: 'card_disabled' });
     throw unauthorized('card_disabled', `Card is ${card.status}`);
   }
 
@@ -89,21 +94,26 @@ export async function handleSunTap(input: HandleSunTapInput): Promise<HandleSunT
   }
 
   if (!result.valid) {
+    metrics().counter('tap.verify.fail', 1, { reason: 'sun_invalid' });
     throw badRequest('sun_invalid', `SUN verification failed: ${result.errors.join('; ')}`);
   }
 
   // Atomic counter advance — only succeeds if the new counter is strictly
   // greater than the stored one.  Replay or out-of-order tap → count === 0.
+  const advanceStart = Date.now();
   const advance = await prisma.card.updateMany({
     where: { id: card.id, lastReadCounter: { lt: result.counter } },
     data: { lastReadCounter: result.counter },
   });
+  metrics().timing('tap.counter.advance', Date.now() - advanceStart);
   if (advance.count !== 1) {
+    metrics().counter('tap.verify.fail', 1, { reason: 'sun_counter_replay' });
     throw gone(
       'sun_counter_replay',
       `Counter ${result.counter} is not greater than stored ${card.lastReadCounter} (replay or stale tap)`,
     );
   }
+  metrics().counter('tap.verify.ok', 1);
 
   const config = getTapConfig();
 

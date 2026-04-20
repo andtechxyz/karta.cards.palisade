@@ -12,6 +12,7 @@ import {
 import { getTapConfig } from '../env.js';
 import { getCardFieldKeyProvider } from '../key-provider.js';
 import { getSdmDeriver } from '../sdm-deriver.js';
+import { metrics } from '../metrics.js';
 
 // Mobile-app facing entry point for cardRef-less SUN URLs.  Given the raw
 // SUN params the chip emits — `?e=<picc-hex>&m=<mac-hex>` — verify the tap
@@ -95,6 +96,7 @@ async function runVerify(
     sdmDeriver,
   });
   if (!match) {
+    metrics().counter('tap.verify.fail', 1, { reason: 'card_not_found' });
     throw notFound(
       'card_not_found',
       'No card decrypted the PICC bytes — wrong key, revoked card, or bogus tap',
@@ -135,20 +137,25 @@ async function runVerify(
   }
 
   if (!valid) {
+    metrics().counter('tap.verify.fail', 1, { reason: 'sun_invalid' });
     throw unauthorized('sun_invalid', 'SDMMAC mismatch — URL was tampered with');
   }
 
   // Atomic counter advance — replay defence.
+  const advanceStart = Date.now();
   const advance = await prisma.card.updateMany({
     where: { id: match.cardId, lastReadCounter: { lt: match.counter } },
     data: { lastReadCounter: match.counter },
   });
+  metrics().timing('tap.counter.advance', Date.now() - advanceStart);
   if (advance.count !== 1) {
+    metrics().counter('tap.verify.fail', 1, { reason: 'sun_counter_replay' });
     throw gone(
       'sun_counter_replay',
       `Counter ${match.counter} not greater than stored ${match.lastReadCounter} (replay)`,
     );
   }
+  metrics().counter('tap.verify.ok', 1);
 
   // Mint handoff IFF the card is in a state that allows provisioning.
   const config = getTapConfig();

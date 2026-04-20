@@ -233,6 +233,16 @@ Emitted metrics (CloudWatch namespace `card-ops`):
 Also set `METRICS_BACKEND=cloudwatch` on `vera-card-ops` task def
 (same jq patch as vera-rca above) to turn it on.
 
+Emitted metrics (CloudWatch namespace `tap`):
+
+| Metric | Dimensions | When |
+|---|---|---|
+| `tap.verify.ok` | — | SUN URL verified + counter advanced |
+| `tap.verify.fail` | `reason` ∈ {sun_invalid, sun_counter_replay, card_not_found, card_disabled} | SUN URL rejected |
+| `tap.counter.advance` | — TIMING sample (ms) | Every atomic counter `updateMany` |
+
+Set `METRICS_BACKEND=cloudwatch` on `vera-tap` task def the same way.
+
 Useful CloudWatch alarms to wire up:
 - `rca.plan_step.rejected` > 5 in 5 min → mobile bug or attack
 - `rca.attestation.verify{result=fail}` > 0 in strict mode → real chip rejection
