@@ -74,16 +74,32 @@ const SENSITIVE_INS = new Set<number>([
   0xE6, // INSTALL (in GP context — lengths can carry key bytes)
 ]);
 
+// CLA byte secure-messaging mask.  GlobalPlatform Card Spec v2.3.1 §11.1.4:
+// bits b3-b4 of the CLA byte encode secure-messaging state.
+//   0x04 = header authenticated (C-MAC)
+//   0x0C = C-MAC + C-DECRYPTION (SCP03 SL 0x03)
+// Any CLA with bit 0x04 set means the APDU is carrying SCP03-wrapped
+// payload: either an 8-byte C-MAC trailer, or an ENC(C-MAC(data)) body.
+// In both cases the plaintext is irrelevant to an auditor (the audit
+// trail will show the header / progress milestone instead) and the raw
+// bytes include MAC material we don't want replayed out of the logs.
+// So: redact the body for ALL wrapped APDUs regardless of INS.
+const SCP03_SM_BIT = 0x04;
+
 /**
- * Decide whether an APDU's data body should be redacted.  Returns true
- * for any APDU whose INS byte is in SENSITIVE_INS.  Strictly by INS; we
- * don't try to sniff the CLA bits because (a) the SCP03 proprietary CLA
- * varies with session level, (b) INS is enough — STORE DATA with CLA=00
- * is equally sensitive as CLA=84.
+ * Decide whether an APDU's data body should be redacted.  Two triggers:
+ *   (1) INS is in SENSITIVE_INS (STORE DATA / PUT KEY / INSTALL) — these
+ *       carry key or CHD payloads in the clear before SCP03 ever wraps
+ *       them at the driver layer.
+ *   (2) CLA has the SCP03 secure-messaging bit set (0x04) — body is a
+ *       wrapped ENC/MAC blob that must not appear in audit logs (PCI
+ *       10.5 / audit P-3).
  */
 function isSensitiveCommand(hex: string): boolean {
   if (hex.length < 4) return false;
+  const cla = parseInt(hex.slice(0, 2), 16);
   const ins = parseInt(hex.slice(2, 4), 16);
+  if ((cla & SCP03_SM_BIT) !== 0) return true;
   return SENSITIVE_INS.has(ins);
 }
 

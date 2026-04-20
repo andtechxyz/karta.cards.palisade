@@ -43,6 +43,19 @@ export interface SessionKeys {
   sRmac: Buffer; // Response MAC when R-MAC is enabled
 }
 
+/**
+ * Zero the three session key buffers in place.  Call once per session
+ * when reaching a terminal state (COMPLETE / FAILED / WS close) so the
+ * plaintext SCP03 keys don't linger on the V8 heap past the op lifetime.
+ * PCI 3.5 / 3.6 — audit S-3.  The caller must not hold other references
+ * to these buffers after this returns.
+ */
+export function scrubSessionKeys(keys: SessionKeys): void {
+  keys.sEnc.fill(0);
+  keys.sMac.fill(0);
+  keys.sRmac.fill(0);
+}
+
 /** Bits of the security level byte sent in EXTERNAL AUTHENTICATE. */
 export const SECURITY_LEVEL = {
   NO_SECURE_MESSAGING: 0x00,
@@ -599,11 +612,25 @@ export function createScp03Driver(
     return unwrapResponse(getSession(), input);
   };
 
+  /**
+   * Zero session key material in place.  Call once at op terminal state
+   * (COMPLETE/FAILED, or in a finally block around the whole drive
+   * sequence).  After scrub() the driver is unusable — subsequent
+   * wrap()/unwrap() calls won't authenticate.  PCI 3.5/3.6 — audit S-3.
+   */
+  const scrub = (): void => {
+    if (session) {
+      scrubSessionKeys(session.sessionKeys);
+      session.macChain.fill(0);
+    }
+  };
+
   return {
     initializeUpdate,
     onInitUpdateResp,
     wrap,
     unwrap,
     getSession,
+    scrub,
   };
 }

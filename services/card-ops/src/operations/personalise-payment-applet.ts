@@ -123,121 +123,134 @@ export async function runPersonalisePaymentApplet(
 
   // --- 3. SCP03 handshake -------------------------------------------------
   const keys = await getGpStaticKeys(session.cardId);
-  const { send } = await establishScp03(io, keys, {
+  const { send, scrub } = await establishScp03(io, keys, {
     securityLevel: SECURITY_LEVEL.C_MAC | SECURITY_LEVEL.C_DECRYPTION,
     phasePrefix: 'SCP03',
   });
 
-  // --- 4. SELECT the payment applet ---------------------------------------
-  io.send({ type: 'apdu', hex: '', phase: 'SELECT_APPLET', progress: 0.12 });
+  try {
+    // --- 4. SELECT the payment applet -------------------------------------
+    io.send({ type: 'apdu', hex: '', phase: 'SELECT_APPLET', progress: 0.12 });
 
-  const emvAidBuf = Buffer.from(emvAidHex, 'hex');
-  const selectApdu = buildSelectByAid(emvAidBuf);
-  const sel = await send({
-    cla: selectApdu[0], ins: selectApdu[1], p1: selectApdu[2], p2: selectApdu[3],
-    data: selectApdu.subarray(5, 5 + selectApdu[4]),
-  });
-  if (sel.sw !== 0x9000) {
-    throw new Error(`SELECT payment applet failed SW=${sel.sw.toString(16).toUpperCase()}`);
-  }
+    const emvAidBuf = Buffer.from(emvAidHex, 'hex');
+    const selectApdu = buildSelectByAid(emvAidBuf);
+    const sel = await send({
+      cla: selectApdu[0], ins: selectApdu[1], p1: selectApdu[2], p2: selectApdu[3],
+      data: selectApdu.subarray(5, 5 + selectApdu[4]),
+    });
+    if (sel.sw !== 0x9000) {
+      throw new Error(`SELECT payment applet failed SW=${sel.sw.toString(16).toUpperCase()}`);
+    }
 
-  // --- 5. Decrypt SAD + deserialise into DGI list -------------------------
-  io.send({ type: 'apdu', hex: '', phase: 'DECRYPT_SAD', progress: 0.18 });
+    // --- 5. Decrypt SAD + deserialise into DGI list ----------------------
+    io.send({ type: 'apdu', hex: '', phase: 'DECRYPT_SAD', progress: 0.18 });
 
-  const config = getCardOpsConfig();
-  const encryptedBuf = Buffer.isBuffer(sadRecord.sadEncrypted)
-    ? sadRecord.sadEncrypted
-    : Buffer.from(sadRecord.sadEncrypted);
-  const sadPlaintext = await DataPrepService.decryptSad(
-    encryptedBuf,
-    config.KMS_SAD_KEY_ARN,
-    sadRecord.sadKeyVersion,
-  );
-  const dgis = SADBuilder.deserialiseDgis(sadPlaintext);
-  if (dgis.length === 0) {
-    return {
-      type: 'error',
-      code: 'SAD_EMPTY',
-      message: 'Decrypted SAD contained zero DGIs — refusing to personalise an empty applet',
-    };
-  }
-  if (dgis.length > 256) {
-    // Our P2 = block-index scheme only has a single byte.  If some
-    // pathological profile needs more, we'll need the chained-APDU
-    // INS pattern — flag early so the op doesn't half-run.
-    return {
-      type: 'error',
-      code: 'SAD_TOO_MANY_DGIS',
-      message: `SAD has ${dgis.length} DGIs; STORE DATA scaffold caps at 256 blocks`,
-    };
-  }
-
-  // --- 6. STORE DATA streaming -------------------------------------------
-  io.send({ type: 'apdu', hex: '', phase: 'STORE_DATA', progress: 0.20 });
-
-  const total = dgis.length;
-  for (let i = 0; i < total; i++) {
-    const [, dgiBytes] = dgis[i];
-    const isLast = i === total - 1;
-    const p1 = isLast ? 0x80 : 0x00;
-    const p2 = i & 0xFF;
-
-    // Body safety: a DGI that blows past a single short-APDU payload
-    // can't go in one STORE DATA under this scaffold.  data-prep
-    // already chunks below 255 B in practice; if a real vendor CAP
-    // emits a larger container we'll need extended-length APDUs.
-    if (dgiBytes.length > 255) {
+    const config = getCardOpsConfig();
+    const encryptedBuf = Buffer.isBuffer(sadRecord.sadEncrypted)
+      ? sadRecord.sadEncrypted
+      : Buffer.from(sadRecord.sadEncrypted);
+    const sadPlaintext = await DataPrepService.decryptSad(
+      encryptedBuf,
+      config.KMS_SAD_KEY_ARN,
+      sadRecord.sadKeyVersion,
+    );
+    const dgis = SADBuilder.deserialiseDgis(sadPlaintext);
+    if (dgis.length === 0) {
       return {
         type: 'error',
-        code: 'DGI_TOO_LARGE',
-        message: `DGI index ${i} is ${dgiBytes.length} bytes; STORE DATA scaffold requires <=255`,
+        code: 'SAD_EMPTY',
+        message: 'Decrypted SAD contained zero DGIs — refusing to personalise an empty applet',
+      };
+    }
+    if (dgis.length > 256) {
+      // Our P2 = block-index scheme only has a single byte.  If some
+      // pathological profile needs more, we'll need the chained-APDU
+      // INS pattern — flag early so the op doesn't half-run.
+      return {
+        type: 'error',
+        code: 'SAD_TOO_MANY_DGIS',
+        message: `SAD has ${dgis.length} DGIs; STORE DATA scaffold caps at 256 blocks`,
       };
     }
 
-    const result = await send({
-      cla: 0x80, ins: 0xE2, p1, p2,
-      data: dgiBytes,
-    });
-    if (result.sw !== 0x9000) {
-      throw new Error(`STORE DATA block ${i} failed SW=${result.sw.toString(16).toUpperCase()}`);
+    // --- 6. STORE DATA streaming -----------------------------------------
+    io.send({ type: 'apdu', hex: '', phase: 'STORE_DATA', progress: 0.20 });
+
+    const total = dgis.length;
+    try {
+      for (let i = 0; i < total; i++) {
+        const [, dgiBytes] = dgis[i];
+        const isLast = i === total - 1;
+        const p1 = isLast ? 0x80 : 0x00;
+        const p2 = i & 0xFF;
+
+        // Body safety: a DGI that blows past a single short-APDU payload
+        // can't go in one STORE DATA under this scaffold.  data-prep
+        // already chunks below 255 B in practice; if a real vendor CAP
+        // emits a larger container we'll need extended-length APDUs.
+        if (dgiBytes.length > 255) {
+          return {
+            type: 'error',
+            code: 'DGI_TOO_LARGE',
+            message: `DGI index ${i} is ${dgiBytes.length} bytes; STORE DATA scaffold requires <=255`,
+          };
+        }
+
+        const result = await send({
+          cla: 0x80, ins: 0xE2, p1, p2,
+          data: dgiBytes,
+        });
+        if (result.sw !== 0x9000) {
+          throw new Error(`STORE DATA block ${i} failed SW=${result.sw.toString(16).toUpperCase()}`);
+        }
+
+        io.send({
+          type: 'apdu', hex: '', phase: 'STORE_DATA',
+          // 0.20 → 0.95 across the STORE DATA stream; the last 5% covers
+          // the SadRecord status update + audit flush.
+          progress: 0.20 + (0.75 * (i + 1) / total),
+        });
+      }
+    } finally {
+      // Per-DGI plaintext fragments held in `dgis` still reference the
+      // decrypted SAD buffer.  Zero it now — the payment-applet APDUs
+      // are already in transit so we don't need the plaintext again.
+      for (const [, dgiBytes] of dgis) dgiBytes.fill(0);
+      sadPlaintext.fill(0);
     }
 
-    io.send({
-      type: 'apdu', hex: '', phase: 'STORE_DATA',
-      // 0.20 → 0.95 across the STORE DATA stream; the last 5% covers
-      // the SadRecord status update + audit flush.
-      progress: 0.20 + (0.75 * (i + 1) / total),
+    // --- 7. Consume the SAD record ---------------------------------------
+    await prisma.sadRecord.update({
+      where: { id: sadRecord.id },
+      data: { status: 'CONSUMED' },
     });
+
+    // Flush the APDU audit buffer explicitly — personalisation leaves a
+    // fully-populated transcript that compliance wants on disk before
+    // we touch the session row's COMPLETE transition (the runner will
+    // flush again as part of its terminal path, but this tightens the
+    // crash window).
+    await io.audit?.flush();
+
+    await prisma.cardOpSession.update({
+      where: { id: session.id },
+      data: {
+        phase: 'COMPLETE',
+        completedAt: new Date(),
+        scpState: Prisma.DbNull,
+      },
+    });
+
+    return {
+      type: 'complete',
+      phase: 'DONE',
+      progress: 1.0,
+      instanceAid: emvAidHex.toUpperCase(),
+      dgiCount: total,
+      proxyCardId,
+    };
+  } finally {
+    // PCI 3.5 / audit S-3: zero SCP03 S-ENC/S-MAC/S-RMAC + MAC chain.
+    scrub();
   }
-
-  // --- 7. Consume the SAD record -----------------------------------------
-  await prisma.sadRecord.update({
-    where: { id: sadRecord.id },
-    data: { status: 'CONSUMED' },
-  });
-
-  // Flush the APDU audit buffer explicitly — personalisation leaves a
-  // fully-populated transcript that compliance wants on disk before
-  // we touch the session row's COMPLETE transition (the runner will
-  // flush again as part of its terminal path, but this tightens the
-  // crash window).
-  await io.audit?.flush();
-
-  await prisma.cardOpSession.update({
-    where: { id: session.id },
-    data: {
-      phase: 'COMPLETE',
-      completedAt: new Date(),
-      scpState: Prisma.DbNull,
-    },
-  });
-
-  return {
-    type: 'complete',
-    phase: 'DONE',
-    progress: 1.0,
-    instanceAid: emvAidHex.toUpperCase(),
-    dgiCount: total,
-    proxyCardId,
-  };
 }

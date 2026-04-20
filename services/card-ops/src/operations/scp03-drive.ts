@@ -116,6 +116,12 @@ export async function establishScp03(
   } = {},
 ): Promise<{
   send: (input: WrapInput) => Promise<DriveResult>;
+  /**
+   * Zero the in-memory SCP03 session keys + MAC chaining value.
+   * Callers should invoke in a finally block after the op sequence
+   * completes — the driver is unusable afterward.  PCI 3.5 / audit S-3.
+   */
+  scrub: () => void;
 }> {
   const isdAid = opts.isdAid ?? DEFAULT_ISD_AID;
   const securityLevel = opts.securityLevel ?? SL_CMAC;
@@ -159,5 +165,5 @@ export async function establishScp03(
     return { response: fullResp, data, sw };
   };
 
-  return { send };
+  return { send, scrub: driver.scrub };
 }

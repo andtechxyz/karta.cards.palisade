@@ -1,5 +1,5 @@
 import { Router, type NextFunction, type Request, type Response } from 'express';
-import { createHash, createHmac, timingSafeEqual, randomUUID } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual, randomUUID, randomBytes } from 'node:crypto';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import {
   SecretsManagerClient,
@@ -26,6 +26,15 @@ const secretsManager = new SecretsManagerClient({
 // own fresh Buffer and scrub without mutating the cache entry.
 const partnerKeyCache = new Map<string, { keyHex: string; expiresAt: number }>();
 const PARTNER_KEY_CACHE_TTL_MS = 60_000;
+
+// A stable-lifetime dummy HMAC key used for the unknown-credential /
+// unrotated-credential path.  Random per boot so an attacker can't
+// precompute signatures that would verify against it, but stable within
+// a single process so the dummy HMAC work takes the same code path and
+// roughly the same time as a real HMAC-cache hit.  PCI 8.3 / audit N-3:
+// closes the timing oracle where an unknown keyId short-circuited before
+// we read the body + ran HMAC.
+const DUMMY_HMAC_KEY = randomBytes(32);
 
 async function resolvePartnerHmacKey(secretArn: string): Promise<Buffer> {
   const now = Date.now();
@@ -114,44 +123,55 @@ export function partnerHmacMiddleware() {
         throw unauthorized('clock_skew', 'Timestamp outside replay window');
       }
 
+      // N-3 (timing-oracle closure): take the SAME path for every
+      // credential outcome so a remote attacker can't differentiate
+      // "unknown keyId", "revoked credential", "unrotated credential",
+      // and "bad signature" by response latency.
+      //
+      // The code below unconditionally:
+      //   1. Does the DB lookup (paid regardless of outcome).
+      //   2. Reads the request body into memory.
+      //   3. Resolves an HMAC key — the real one on a happy credential,
+      //      a per-process random `DUMMY_HMAC_KEY` otherwise.  The
+      //      dummy path still goes through createHmac() so timing /
+      //      allocation patterns mirror the success path.
+      //   4. Runs timingSafeEqual on fixed-length inputs.
+      // Only after all of that do we branch and throw, using a single
+      // generic "bad_signature" error for all non-success paths.
       const cred = await prisma.partnerCredential.findUnique({ where: { keyId } });
-      if (!cred || cred.status !== 'ACTIVE') {
-        // Don't leak whether the keyId exists; a revoked or missing key both
-        // surface as generic unauthorized.
-        throw unauthorized('unknown_key', 'Invalid credential');
-      }
 
-      // Buffer the full body before signature check so the handler can reuse
-      // it for S3 upload and hashing without re-reading the stream.
+      // Buffer the full body regardless — the real path needs it for
+      // HMAC + S3; the dummy path needs it so an attacker can't
+      // distinguish "unknown key" (short response) from "valid key,
+      // bad sig" (post-body response).
       const body = await readBody(req);
 
-      // H-6 remediation: the HMAC key lives in Secrets Manager under
-      // `cred.secretArn`, NOT in the DB row.  secretHash remains for
-      // audit / one-way-hash verification only.  Verifying with the DB
-      // hash (pre-remediation) meant a DB dump = partner impersonation.
+      // H-6 remediation: HMAC key lives in Secrets Manager under
+      // `cred.secretArn`, not in the DB row.  If a credential predates
+      // the migration (secretArn null) we fall back to DUMMY_HMAC_KEY
+      // so verification always fails — operators must rotate via
+      // /api/admin/partner-credentials to get a new SM-backed key
+      // before the partner can sign.
       //
-      // Partners sign with HMAC-SHA256(hex-decoded hmacKey, canonical)
-      // where hmacKey is the 32-byte random they received at credential
-      // creation.  We resolve the same key from SM (cached 60s).  If a
-      // credential predates the H-6 migration (secretArn null), fail
-      // closed — operators must rotate before the partner can sign.
-      if (!cred.secretArn) {
-        throw unauthorized(
-          'credential_needs_rotation',
-          'This partner credential predates the H-6 key-storage migration. Rotate via /api/admin/partner-credentials to issue a new key.',
-        );
+      // ACTIVE + has secretArn → real key.  Anything else (missing,
+      // inactive, unrotated) → dummy key that will never match.
+      let hmacKey: Buffer = DUMMY_HMAC_KEY;
+      const credUsable = cred && cred.status === 'ACTIVE' && cred.secretArn;
+      if (credUsable) {
+        try {
+          hmacKey = await resolvePartnerHmacKey(cred.secretArn!);
+        } catch (err) {
+          // Don't leak SM error details to the partner.  Fall back to
+          // the dummy so the downstream HMAC + compare still runs,
+          // maintaining constant-time behaviour on SM failure.
+          // eslint-disable-next-line no-console
+          console.error(
+            `[partner-hmac] failed to fetch key for ${cred.id}: ${err instanceof Error ? err.message : err}`,
+          );
+          hmacKey = DUMMY_HMAC_KEY;
+        }
       }
-      let hmacKey: Buffer;
-      try {
-        hmacKey = await resolvePartnerHmacKey(cred.secretArn);
-      } catch (err) {
-        // Don't leak SM error details to the partner.
-        // eslint-disable-next-line no-console
-        console.error(
-          `[partner-hmac] failed to fetch key for ${cred.id}: ${err instanceof Error ? err.message : err}`,
-        );
-        throw unauthorized('bad_signature', 'Signature did not verify');
-      }
+
       const canonical = canonicalString(
         req.method,
         req.originalUrl,
@@ -162,20 +182,21 @@ export function partnerHmacMiddleware() {
         .update(canonical)
         .digest();
       const got = Buffer.from(signatureHex, 'hex');
-      let verified = false;
-      try {
-        verified =
-          expected.length === got.length && timingSafeEqual(expected, got);
-      } finally {
-        // Scrub the resolved HMAC key from the local buffer even on
-        // cache hit — cached copy lives in the Map with its own
-        // lifecycle, so zeroing here is cheap insurance (note we got
-        // a reference to the cached Buffer, not a copy; zeroing would
-        // affect subsequent cache reads.  Skip scrubbing until we
-        // clone on return).  Keeping as-is for now; future: cache
-        // stores hex, decode to Buffer per-request.
+      // timingSafeEqual requires same length.  `got` can be arbitrary
+      // hex; compare against a fixed-length equivalent on mismatch to
+      // keep the comparison itself constant-time.
+      let sigOk = false;
+      if (expected.length === got.length) {
+        sigOk = timingSafeEqual(expected, got);
+      } else {
+        // Still pay the comparison cost on length mismatch to avoid a
+        // length-based oracle.
+        const pad = Buffer.alloc(expected.length);
+        timingSafeEqual(expected, pad);
       }
-      if (!verified) {
+
+      // Now — and ONLY now — branch on credential validity + signature.
+      if (!credUsable || !sigOk) {
         throw unauthorized('bad_signature', 'Signature did not verify');
       }
 
@@ -183,7 +204,7 @@ export function partnerHmacMiddleware() {
       // write to fail the request, but we do await so the timestamp is
       // visible immediately in the admin UI.
       await prisma.partnerCredential.update({
-        where: { id: cred.id },
+        where: { id: cred!.id },
         data: {
           lastUsedAt: new Date(),
           lastUsedIp: req.ip ?? null,
@@ -191,9 +212,9 @@ export function partnerHmacMiddleware() {
       });
 
       req.partnerCredential = {
-        id: cred.id,
-        keyId: cred.keyId,
-        financialInstitutionId: cred.financialInstitutionId,
+        id: cred!.id,
+        keyId: cred!.keyId,
+        financialInstitutionId: cred!.financialInstitutionId,
       };
       req.rawPartnerBody = body;
       next();

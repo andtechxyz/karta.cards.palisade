@@ -27,31 +27,36 @@ export async function runListApplets(
   io: DriveIO,
 ): Promise<WSMessage> {
   const keys = await getGpStaticKeys(session.cardId);
-  const { send } = await establishScp03(io, keys, { phasePrefix: 'SCP03' });
+  const { send, scrub } = await establishScp03(io, keys, { phasePrefix: 'SCP03' });
 
-  const applets: AppEntry[] = [];
-  const packages: AppEntry[] = [];
+  try {
+    const applets: AppEntry[] = [];
+    const packages: AppEntry[] = [];
 
-  // Applications (installed applets + SSDs)
-  applets.push(...await drainGetStatus(send, 0x40));
-  // Exec load files (packages)
-  packages.push(...await drainGetStatus(send, 0x20));
+    // Applications (installed applets + SSDs)
+    applets.push(...await drainGetStatus(send, 0x40));
+    // Exec load files (packages)
+    packages.push(...await drainGetStatus(send, 0x20));
 
-  await prisma.cardOpSession.update({
-    where: { id: session.id },
-    data: {
-      phase: 'COMPLETE',
-      completedAt: new Date(),
-      scpState: Prisma.DbNull,
-    },
-  });
+    await prisma.cardOpSession.update({
+      where: { id: session.id },
+      data: {
+        phase: 'COMPLETE',
+        completedAt: new Date(),
+        scpState: Prisma.DbNull,
+      },
+    });
 
-  return {
-    type: 'complete',
-    applets,
-    packages,
-    progress: 1.0,
-  };
+    return {
+      type: 'complete',
+      applets,
+      packages,
+      progress: 1.0,
+    };
+  } finally {
+    // PCI 3.5 / audit S-3: zero SCP03 S-ENC/S-MAC/S-RMAC + MAC chain.
+    scrub();
+  }
 }
 
 async function drainGetStatus(

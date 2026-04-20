@@ -126,109 +126,114 @@ export async function runInstallPaymentApplet(
   }
 
   const keys = await getGpStaticKeys(session.cardId);
-  const { send } = await establishScp03(io, keys, {
+  const { send, scrub } = await establishScp03(io, keys, {
     securityLevel: SECURITY_LEVEL.C_MAC | SECURITY_LEVEL.C_DECRYPTION,
     phasePrefix: 'SCP03',
   });
 
-  const loadFileAidBuf = Buffer.from(cap.packageAid, 'hex');
-  const instanceAidBuf = Buffer.from(emvAidHex, 'hex');
-  // Module AID = first applet AID declared in the CAP.  Fall back to
-  // the package AID if the CAP has no Applet component (shouldn't
-  // happen for MChip / VSDC, but keeps parsing defensive for odd
-  // vendor builds where the applet class AID is implicit).
-  const moduleAidHex = cap.appletAids[0] ?? cap.packageAid;
-  const moduleAidBuf = Buffer.from(moduleAidHex, 'hex');
+  try {
+    const loadFileAidBuf = Buffer.from(cap.packageAid, 'hex');
+    const instanceAidBuf = Buffer.from(emvAidHex, 'hex');
+    // Module AID = first applet AID declared in the CAP.  Fall back to
+    // the package AID if the CAP has no Applet component (shouldn't
+    // happen for MChip / VSDC, but keeps parsing defensive for odd
+    // vendor builds where the applet class AID is implicit).
+    const moduleAidHex = cap.appletAids[0] ?? cap.packageAid;
+    const moduleAidBuf = Buffer.from(moduleAidHex, 'hex');
 
-  io.send({ type: 'apdu', hex: '', phase: 'DELETE_OLD', progress: 0.1 });
+    io.send({ type: 'apdu', hex: '', phase: 'DELETE_OLD', progress: 0.1 });
 
-  // Best-effort DELETE of any existing applet at the EMV AID and the
-  // package AID.  Two APDUs because install_pa already models it this
-  // way — avoids the "delete related objects" bit (P2=0x80) so we don't
-  // accidentally nuke dependents if a vendor CAP got reused across
-  // programs.  6A88 = absent = fine.
-  const delInstance = buildDelete(instanceAidBuf);
-  const r1 = await send({
-    cla: delInstance[0], ins: delInstance[1], p1: delInstance[2], p2: delInstance[3],
-    data: delInstance.subarray(5, 5 + delInstance[4]),
-  });
-  if (r1.sw !== 0x9000 && r1.sw !== 0x6A88) {
-    throw new Error(`DELETE instance failed SW=${r1.sw.toString(16).toUpperCase()}`);
-  }
-
-  const delPkg = buildDelete(loadFileAidBuf);
-  const r2 = await send({
-    cla: delPkg[0], ins: delPkg[1], p1: delPkg[2], p2: delPkg[3],
-    data: delPkg.subarray(5, 5 + delPkg[4]),
-  });
-  if (r2.sw !== 0x9000 && r2.sw !== 0x6A88) {
-    throw new Error(`DELETE package failed SW=${r2.sw.toString(16).toUpperCase()}`);
-  }
-
-  io.send({ type: 'apdu', hex: '', phase: 'INSTALL_LOAD', progress: 0.2 });
-
-  // INSTALL [load]
-  const installLoad = buildInstallForLoad(loadFileAidBuf);
-  const r3 = await send({
-    cla: installLoad[0], ins: installLoad[1], p1: installLoad[2], p2: installLoad[3],
-    data: installLoad.subarray(5, 5 + installLoad[4]),
-  });
-  if (r3.sw !== 0x9000) {
-    throw new Error(`INSTALL [load] failed SW=${r3.sw.toString(16).toUpperCase()}`);
-  }
-
-  io.send({ type: 'apdu', hex: '', phase: 'LOADING', progress: 0.3 });
-
-  // LOAD blocks.
-  const blocks = chunkLoadBlock(cap.loadFileDataBlock, 240);
-  for (let i = 0; i < blocks.length; i++) {
-    const block = blocks[i];
-    const result = await send({
-      cla: block[0], ins: block[1], p1: block[2], p2: block[3],
-      data: block.subarray(5, 5 + block[4]),
+    // Best-effort DELETE of any existing applet at the EMV AID and the
+    // package AID.  Two APDUs because install_pa already models it this
+    // way — avoids the "delete related objects" bit (P2=0x80) so we don't
+    // accidentally nuke dependents if a vendor CAP got reused across
+    // programs.  6A88 = absent = fine.
+    const delInstance = buildDelete(instanceAidBuf);
+    const r1 = await send({
+      cla: delInstance[0], ins: delInstance[1], p1: delInstance[2], p2: delInstance[3],
+      data: delInstance.subarray(5, 5 + delInstance[4]),
     });
-    if (result.sw !== 0x9000) {
-      throw new Error(`LOAD block ${i} failed SW=${result.sw.toString(16).toUpperCase()}`);
+    if (r1.sw !== 0x9000 && r1.sw !== 0x6A88) {
+      throw new Error(`DELETE instance failed SW=${r1.sw.toString(16).toUpperCase()}`);
     }
-    io.send({
-      type: 'apdu', hex: '', phase: 'LOADING',
-      progress: 0.3 + (0.2 * (i + 1) / blocks.length),
+
+    const delPkg = buildDelete(loadFileAidBuf);
+    const r2 = await send({
+      cla: delPkg[0], ins: delPkg[1], p1: delPkg[2], p2: delPkg[3],
+      data: delPkg.subarray(5, 5 + delPkg[4]),
     });
+    if (r2.sw !== 0x9000 && r2.sw !== 0x6A88) {
+      throw new Error(`DELETE package failed SW=${r2.sw.toString(16).toUpperCase()}`);
+    }
+
+    io.send({ type: 'apdu', hex: '', phase: 'INSTALL_LOAD', progress: 0.2 });
+
+    // INSTALL [load]
+    const installLoad = buildInstallForLoad(loadFileAidBuf);
+    const r3 = await send({
+      cla: installLoad[0], ins: installLoad[1], p1: installLoad[2], p2: installLoad[3],
+      data: installLoad.subarray(5, 5 + installLoad[4]),
+    });
+    if (r3.sw !== 0x9000) {
+      throw new Error(`INSTALL [load] failed SW=${r3.sw.toString(16).toUpperCase()}`);
+    }
+
+    io.send({ type: 'apdu', hex: '', phase: 'LOADING', progress: 0.3 });
+
+    // LOAD blocks.
+    const blocks = chunkLoadBlock(cap.loadFileDataBlock, 240);
+    for (let i = 0; i < blocks.length; i++) {
+      const block = blocks[i];
+      const result = await send({
+        cla: block[0], ins: block[1], p1: block[2], p2: block[3],
+        data: block.subarray(5, 5 + block[4]),
+      });
+      if (result.sw !== 0x9000) {
+        throw new Error(`LOAD block ${i} failed SW=${result.sw.toString(16).toUpperCase()}`);
+      }
+      io.send({
+        type: 'apdu', hex: '', phase: 'LOADING',
+        progress: 0.3 + (0.2 * (i + 1) / blocks.length),
+      });
+    }
+
+    io.send({ type: 'apdu', hex: '', phase: 'INSTALL_INSTALL', progress: 0.6 });
+
+    // INSTALL [install+selectable] — instance AID = EMV AID so SELECT + GET
+    // STATUS returns the standardised payment-scheme AID.
+    const installInstall = buildInstallForInstall(
+      loadFileAidBuf,
+      moduleAidBuf,
+      instanceAidBuf,
+    );
+    const r4 = await send({
+      cla: installInstall[0], ins: installInstall[1], p1: installInstall[2], p2: installInstall[3],
+      data: installInstall.subarray(5, 5 + installInstall[4]),
+    });
+    if (r4.sw !== 0x9000) {
+      throw new Error(`INSTALL [install+selectable] failed SW=${r4.sw.toString(16).toUpperCase()}`);
+    }
+
+    await prisma.cardOpSession.update({
+      where: { id: session.id },
+      data: {
+        phase: 'COMPLETE',
+        completedAt: new Date(),
+        scpState: Prisma.DbNull,
+      },
+    });
+
+    return {
+      type: 'complete',
+      phase: 'DONE',
+      progress: 1.0,
+      packageAid: cap.packageAid,
+      moduleAid: moduleAidHex.toUpperCase(),
+      instanceAid: emvAidHex.toUpperCase(),
+      capFilename,
+    };
+  } finally {
+    // PCI 3.5 / audit S-3: zero SCP03 S-ENC/S-MAC/S-RMAC + MAC chain.
+    scrub();
   }
-
-  io.send({ type: 'apdu', hex: '', phase: 'INSTALL_INSTALL', progress: 0.6 });
-
-  // INSTALL [install+selectable] — instance AID = EMV AID so SELECT + GET
-  // STATUS returns the standardised payment-scheme AID.
-  const installInstall = buildInstallForInstall(
-    loadFileAidBuf,
-    moduleAidBuf,
-    instanceAidBuf,
-  );
-  const r4 = await send({
-    cla: installInstall[0], ins: installInstall[1], p1: installInstall[2], p2: installInstall[3],
-    data: installInstall.subarray(5, 5 + installInstall[4]),
-  });
-  if (r4.sw !== 0x9000) {
-    throw new Error(`INSTALL [install+selectable] failed SW=${r4.sw.toString(16).toUpperCase()}`);
-  }
-
-  await prisma.cardOpSession.update({
-    where: { id: session.id },
-    data: {
-      phase: 'COMPLETE',
-      completedAt: new Date(),
-      scpState: Prisma.DbNull,
-    },
-  });
-
-  return {
-    type: 'complete',
-    phase: 'DONE',
-    progress: 1.0,
-    packageAid: cap.packageAid,
-    moduleAid: moduleAidHex.toUpperCase(),
-    instanceAid: emvAidHex.toUpperCase(),
-    capFilename,
-  };
 }
