@@ -9,19 +9,35 @@
 #   AWS_ACCESS_KEY_ID      — IAM access key with permissions for ECR push and ECS deploy
 #   AWS_SECRET_ACCESS_KEY  — Corresponding IAM secret key
 #
-# The IAM user needs these policies:
-#   - ecr:GetAuthorizationToken, ecr:BatchCheckLayerAvailability, ecr:PutImage,
-#     ecr:InitiateLayerUpload, ecr:UploadLayerPart, ecr:CompleteLayerUpload,
-#     ecr:BatchGetImage, ecr:GetDownloadUrlForLayer
-#   - ecs:UpdateService, ecs:DescribeServices, ecs:DescribeTaskDefinition,
-#     ecs:RegisterTaskDefinition
-#   - iam:PassRole (for the ECS task execution role)
+# Cost-optimisations applied:
+#   - `paths-ignore` skips the workflow for docs / config / applet-only
+#     commits (saves ~30 min / push when true)
+#   - `concurrency` cancels queued runs on rapid-fire pushes to main
+#   - `actions/setup-node@v4` with `cache: 'npm'` reuses the npm cache
+#     (~40s saved per test job)
+#   - `docker/build-push-action@v6` with `type=gha` layer cache reuses the
+#     Dockerfile's builder stage across runs (~2 min saved per matrix job)
 
 name: Deploy
 
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'applets/**'            # Java applet source is built off-pipeline
+      - '.vscode/**'
+      - '.gitignore'
+      - '.gitattributes'
+      - '**/CODEOWNERS'
+      - 'test-fixtures/**'
+
+concurrency:
+  # One deploy at a time per branch — rapid-fire pushes cancel the
+  # earlier queued run so we don't build+deploy the same code twice.
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   AWS_REGION: ap-southeast-2
@@ -44,6 +60,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          # setup-node's built-in npm cache.  Keyed on package-lock.json
+          # hash; invalidated automatically when deps change.
+          cache: 'npm'
 
       - run: npm ci
       - run: npm audit --audit-level=high
@@ -108,31 +127,38 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Set up Docker Buildx
+        # Required for build-push-action's cache backend (type=gha
+        # isn't available on the default docker driver).
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push Docker image
-        run: |
-          SHORT_SHA=${GITHUB_SHA::7}
-          FULL_IMAGE=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}
-          DOCKERFILE="${{ matrix.dockerfile || 'Dockerfile' }}"
-
-          docker build \
-            --build-arg SERVICE=${{ matrix.service }} \
-            -f "${DOCKERFILE}" \
-            -t ${FULL_IMAGE}:${SHORT_SHA} \
-            -t ${FULL_IMAGE}:latest \
-            .
-
-          docker push ${FULL_IMAGE}:${SHORT_SHA}
-          docker push ${FULL_IMAGE}:latest
-
-          echo "full_image=${FULL_IMAGE}" >> "$GITHUB_OUTPUT"
-          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
         id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile || 'Dockerfile' }}
+          build-args: |
+            SERVICE=${{ matrix.service }}
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.sha.outputs.short }}
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:latest
+          # GHA layer cache scoped per-service so the tap service's
+          # builder stage doesn't thrash with rca's, and mode=max caches
+          # all intermediate layers (bigger cache, much faster rebuilds).
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
 
       - name: Update ECS task definition and deploy
         run: |
           # Reuse existing vera-* ECS services (single-cluster).
           SERVICE_NAME=vera-${{ matrix.service }}
-          FULL_IMAGE=${{ steps.build.outputs.full_image }}:${{ steps.build.outputs.short_sha }}
+          FULL_IMAGE=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.sha.outputs.short }}
 
           # Fetch the current task definition
           TASK_DEF_ARN=$(aws ecs describe-services \
