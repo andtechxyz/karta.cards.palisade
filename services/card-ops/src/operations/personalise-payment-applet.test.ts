@@ -314,8 +314,8 @@ describe('runPersonalisePaymentApplet', () => {
       sadEncrypted: Buffer.from('deadbeef', 'hex'),
       sadKeyVersion: 1,
     });
-    // SAD serialised form with count=0 is just 2 zero bytes.
-    mocks.decryptSad.mockResolvedValue(Buffer.from([0x00, 0x00]));
+    // PA wire format: zero DGIs = empty buffer.
+    mocks.decryptSad.mockResolvedValue(Buffer.alloc(0));
 
     const io = scriptedIo([
       ...scp03Opener(),

@@ -649,25 +649,38 @@ describe('SADBuilder — serialiseDgis / deserialiseDgis', () => {
     expect(deserialised[2][1]).toEqual(Buffer.from('ddeeff', 'hex'));
   });
 
-  it('serialised format starts with a 2-byte count', () => {
-    const dgis: Array<[number, Buffer]> = [
-      [0x0101, Buffer.from('aa', 'hex')],
-      [0x0202, Buffer.from('bb', 'hex')],
-    ];
-    const serialised = SADBuilder.serialiseDgis(dgis);
-    expect(serialised.readUInt16BE(0)).toBe(2);
-  });
-
-  it('serialised format contains dgiNum(2) + dgiLen(2) + data per entry', () => {
+  it('serialised format emits PA wire format: tag(2) + BER-TLV length + data per entry', () => {
     const data = Buffer.from('cafe', 'hex');
     const dgis: Array<[number, Buffer]> = [[0x1234, data]];
     const serialised = SADBuilder.serialiseDgis(dgis);
 
-    // count(2) + dgiNum(2) + dgiLen(2) + data(2) = 8
-    expect(serialised.length).toBe(8);
-    expect(serialised.readUInt16BE(2)).toBe(0x1234); // dgiNum
-    expect(serialised.readUInt16BE(4)).toBe(2);       // dgiLen
-    expect(serialised.subarray(6)).toEqual(data);     // data
+    // tag(2) + BER-len(1 for len<0x80) + data(2) = 5 bytes
+    expect(serialised.length).toBe(5);
+    expect(serialised.readUInt16BE(0)).toBe(0x1234); // tag
+    expect(serialised[2]).toBe(2);                   // BER short-form length
+    expect(serialised.subarray(3)).toEqual(data);    // data
+  });
+
+  it('serialised format uses BER long-form 0x81 for lengths 0x80-0xFF', () => {
+    const data = Buffer.alloc(0x80, 0xab); // length = 128
+    const dgis: Array<[number, Buffer]> = [[0x1234, data]];
+    const serialised = SADBuilder.serialiseDgis(dgis);
+
+    expect(serialised.readUInt16BE(0)).toBe(0x1234);
+    expect(serialised[2]).toBe(0x81);
+    expect(serialised[3]).toBe(0x80);
+    expect(serialised.subarray(4)).toEqual(data);
+  });
+
+  it('serialised format uses BER long-form 0x82 for lengths > 0xFF', () => {
+    const data = Buffer.alloc(300, 0xcd); // length = 300 = 0x012C
+    const dgis: Array<[number, Buffer]> = [[0x1234, data]];
+    const serialised = SADBuilder.serialiseDgis(dgis);
+
+    expect(serialised.readUInt16BE(0)).toBe(0x1234);
+    expect(serialised[2]).toBe(0x82);
+    expect(serialised.readUInt16BE(3)).toBe(300);
+    expect(serialised.subarray(5)).toEqual(data);
   });
 });
 

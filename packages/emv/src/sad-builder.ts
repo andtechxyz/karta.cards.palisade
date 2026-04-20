@@ -109,44 +109,86 @@ export const SADBuilder = {
   },
 
   /**
-   * Serialise DGI list into a flat byte blob for encryption.
-   * Format: count(2) || [dgiNum(2) || dgiLen(2) || dgiData] * N
+   * Serialise DGI list into the PA applet's wire format.
+   *
+   * Format: [dgiTag(2 BE) || BER-TLV length || dgiData] *
+   *
+   * This is what the palisade-pa TRANSFER_SAD handler expects (see
+   * ProvisioningAgent.java processTransferSad + StoreDataBuilder).  The
+   * PA parses DGIs sequentially using BER-TLV short-form (`len < 0x80`
+   * → 1 byte) or long-form (`0x81 LL` / `0x82 LL LL`).  No count header
+   * — the PA walks to the end of the buffer.
+   *
+   * (History: earlier revisions emitted a fixed `count(2) + [tag(2) +
+   * len(2) + data]` layout, which the PA mis-parsed as tag=0x0004 +
+   * BER-len=0x7F and threw SW 6984 on the next DGI.)
    */
   serialiseDgis(dgis: Array<[number, Buffer]>): Buffer {
     const parts: Buffer[] = [];
-    const header = Buffer.alloc(2);
-    header.writeUInt16BE(dgis.length, 0);
-    parts.push(header);
-
     for (const [dgiNum, dgiData] of dgis) {
-      const entry = Buffer.alloc(4);
-      entry.writeUInt16BE(dgiNum, 0);
-      entry.writeUInt16BE(dgiData.length, 2);
-      parts.push(entry, dgiData);
+      const tag = Buffer.alloc(2);
+      tag.writeUInt16BE(dgiNum, 0);
+      parts.push(tag, encodeBerLength(dgiData.length), dgiData);
     }
-
     return Buffer.concat(parts);
   },
 
   /**
-   * Deserialise flat byte blob back into DGI list.
+   * Deserialise flat byte blob back into DGI list.  Inverse of
+   * {@link serialiseDgis} — walks the PA wire format reading BER-TLV
+   * lengths.
    */
   deserialiseDgis(data: Buffer): Array<[number, Buffer]> {
-    const count = data.readUInt16BE(0);
     const dgis: Array<[number, Buffer]> = [];
-    let offset = 2;
-
-    for (let i = 0; i < count; i++) {
+    let offset = 0;
+    while (offset < data.length) {
+      if (offset + 2 > data.length) {
+        throw new Error(`deserialiseDgis: truncated tag at offset ${offset}`);
+      }
       const dgiNum = data.readUInt16BE(offset);
-      const dgiLen = data.readUInt16BE(offset + 2);
-      const dgiData = Buffer.from(data.subarray(offset + 4, offset + 4 + dgiLen));
-      dgis.push([dgiNum, dgiData]);
-      offset += 4 + dgiLen;
+      offset += 2;
+      const { length: dgiLen, bytes: lenBytes } = decodeBerLength(data, offset);
+      offset += lenBytes;
+      if (offset + dgiLen > data.length) {
+        throw new Error(
+          `deserialiseDgis: DGI 0x${dgiNum.toString(16)} overruns buffer ` +
+            `(len=${dgiLen}, remaining=${data.length - offset})`,
+        );
+      }
+      dgis.push([dgiNum, Buffer.from(data.subarray(offset, offset + dgiLen))]);
+      offset += dgiLen;
     }
-
     return dgis;
   },
 } as const;
+
+/** BER-TLV length encoder.  Short form if <0x80, else 0x81/0x82 prefix. */
+function encodeBerLength(len: number): Buffer {
+  if (len < 0) throw new Error(`BER length cannot be negative: ${len}`);
+  if (len < 0x80) return Buffer.from([len]);
+  if (len <= 0xff) return Buffer.from([0x81, len]);
+  if (len <= 0xffff) return Buffer.from([0x82, (len >> 8) & 0xff, len & 0xff]);
+  throw new Error(`BER length ${len} exceeds 16-bit range`);
+}
+
+/** BER-TLV length decoder. Returns parsed length + how many bytes it consumed. */
+function decodeBerLength(
+  data: Buffer,
+  off: number,
+): { length: number; bytes: number } {
+  if (off >= data.length) throw new Error(`BER length past end of buffer`);
+  const first = data[off];
+  if (first < 0x80) return { length: first, bytes: 1 };
+  if (first === 0x81) {
+    if (off + 1 >= data.length) throw new Error(`BER 0x81 truncated`);
+    return { length: data[off + 1], bytes: 2 };
+  }
+  if (first === 0x82) {
+    if (off + 2 >= data.length) throw new Error(`BER 0x82 truncated`);
+    return { length: (data[off + 1] << 8) | data[off + 2], bytes: 3 };
+  }
+  throw new Error(`BER length byte 0x${first.toString(16)} not supported`);
+}
 
 // ---------------------------------------------------------------------------
 // Internal helpers
