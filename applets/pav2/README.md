@@ -57,9 +57,14 @@ non-BLOCKED states (returns 9000 unchanged). BLOCKED returns SW 6985
 (conditions not satisfied).
 
 ### INS_GET_CHALLENGE (0x80 EC 00 00 Le=10)
-Returns 16 bytes from the on-chip SECURE_RANDOM. Caller (RCA) binds the
-challenge into a SAD prefix for replay protection. No authentication
-required — entropy is the only secret.
+Returns 16 bytes from the on-chip SECURE_RANDOM. Available for callers
+that want a chip-sourced nonce — e.g. future defence-in-depth where PA
+verifies the nonce matches what pav2 last issued (see "Patent
+compliance" below).  Not consumed by the current provisioning flow:
+SAD replay prevention is enforced server-side via the `SadRecord`
+status transition (`READY → CONSUMED` inside the provisioning
+`$transaction`), which is sufficient under the normal threat model.
+No authentication required — entropy is the only secret.
 
 ### INS_REVOKE (0x80 ED 00 00)
 Irreversible. Flips state to STATE_BLOCKED and zeroes both AES-128
@@ -68,17 +73,71 @@ not supported). Recovery requires full applet re-personalisation.
 
 ## Patent compliance
 
-The pav2 additions close three partial/missing claims from the overnight
-audit:
+### C4 — replay rejection (satisfied server-side)
 
-- **C4** (nonce binding + replay rejection): `INS_GET_CHALLENGE` gives the
-  RCA a chip-issued random that must appear in the next SAD prefix.
-- **C5** (explicit pending→committed state transitions): `INS_ACTIVATE`
-  replaces the odd/even WebAuthn-trigger workaround from v1, making state
-  moves driven by authenticated backend APDUs.
-- **C11** (on-chip revocation enforcement): `INS_REVOKE` converts backend
-  revocation policy into a cryptographic fact on the chip — no key
-  material remains exploitable.
+C4 requires that a captured SAD cannot be replayed.  Each SAD is bound
+to exactly one provisioning attempt, and the binding must be
+enforced cryptographically so a passive observer on the WS relay
+can't re-inject a previously-seen payload.
+
+The **working enforcement is server-side**, via the state machine on
+`SadRecord.status`:
+
+1. `POST /api/provisioning/start` locates the card's `READY` SadRecord;
+   RCA decrypts + ships it to the PA applet via plan-mode.
+2. When PA's `CONFIRM` round-trips 9000, the session-manager's
+   `$transaction` atomically flips
+   `SadRecord.status: READY → CONSUMED` alongside
+   `Card.status: ACTIVATED → PROVISIONED`.
+3. Any subsequent `/api/provisioning/start` against the same
+   proxyCardId finds no `READY` record → rejects with `sad_not_ready`.
+
+Replay is prevented because the server refuses to re-emit a consumed
+SAD.  Without server emission, the mobile has nothing to relay.  This
+is the normal-case C4 enforcement.
+
+### C4 — chip-side defence-in-depth (optional, deferred)
+
+For the narrower threat of a compromised backend replaying an old SAD
+to the same physical chip, chip-side enforcement is available as
+defence-in-depth.  The groundwork is in place on both sides:
+
+- **pav2** exposes `INS_GET_CHALLENGE` (this applet).
+- **rca/plan-builder** exposes `PlanOptions.includeChipChallenge`
+  which, when set, prepends `SELECT pav2 + GET_CHALLENGE` to the
+  provisioning plan.  Default off.
+- **@palisade/emv/apdu-builder** exports `getChallenge()` and
+  `selectPav2()` helpers for assembling the steps.
+
+To close the defence-in-depth path fully, the PA applet would need to:
+a. Persist pav2's last-issued challenge in EEPROM across power-down.
+   Requires a JavaCard Shareable Interface Object (SIO) on pav2 that
+   PA looks up via `JCSystem.getAppletShareableInterfaceObject(pav2Aid, ...)`
+   during `processTransferSad`, gated on PA's client AID inside pav2's
+   `getShareableInterfaceObject()`.
+b. Verify the SAD payload's trailing 16 bytes match the SIO's last
+   challenge, via a constant-time compare.
+c. Wipe the challenge once matched so the same nonce can't be reused.
+
+Because this requires coordinated pav2 + PA CAP rebuilds AND
+re-personalisation of every in-field card, it is NOT in the critical
+path for C4 compliance — the server-side state machine is the
+defensible answer under the realistic threat model.  The applet hooks
+are left in place so the work can land when a full fleet re-perso is
+planned for other reasons (e.g. the strict-attestation rollout).
+
+### C5 — explicit pending→committed state transitions
+
+`INS_ACTIVATE` replaces the odd/even WebAuthn-trigger workaround from
+v1, making state moves driven by authenticated backend APDUs rather
+than as a side-effect of FIDO2 credential creation count.
+
+### C11 — on-chip revocation enforcement
+
+`INS_REVOKE` converts backend revocation policy into a cryptographic
+fact on the chip — `cardState → STATE_BLOCKED`, SDM AES keys zeroed.
+No key material remains exploitable even if the attacker can still
+physically issue APDUs post-revoke.
 
 ## Wire-up notes
 

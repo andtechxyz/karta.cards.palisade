@@ -125,18 +125,16 @@ const SELECT_PA_APDU = '00A4040008A00000006250414C';
 /**
  * SELECT the Palisade T4T applet (pav2).  AID D2760000850101 is the NFC
  * Forum Type 4 Tag standard AID and is what the chip SELECTs by default
- * on a bare NDEF tap.  We re-SELECT from server-side to invoke
- * INS_GET_CHALLENGE (C4 patent nonce binding).
+ * on a bare NDEF tap.  Used by the optional chip-challenge plan-step
+ * sequence (see `includeChipChallenge` below).
  */
 const SELECT_PAV2_APDU = '00A4040007D2760000850101';
 
 /**
  * GET_CHALLENGE on pav2: CLA=80 INS=EC P1=00 P2=00 Le=10 (16 bytes).
- * Patent C4 — the response is 16 bytes of on-chip RNG + SW=9000 that
- * the server records into the session audit trail as a freshness token.
- * A future PA-applet update (shareable interface) will enforce that
- * each TRANSFER_SAD payload carries this same challenge before
- * committing.
+ * Returns 16 bytes of on-chip RNG + SW=9000.  Part of the optional
+ * chip-challenge path — see `includeChipChallenge` below for the full
+ * rationale.
  */
 const GET_CHALLENGE_APDU = '80EC000010';
 
@@ -195,12 +193,24 @@ export function schemeByteForIssuer(scheme: string): number {
  * Opt-in flags for the plan builder.  Defaults preserve the 5-step
  * sequence so existing provisioning flows are unchanged.
  *
- * `includeChipChallenge` — when set, prepend a SELECT pav2 +
- *    GET_CHALLENGE round-trip to the plan.  The returned 16-byte
- *    nonce is recorded by the server (session-manager audit path).
- *    Adds ~2 extra NFC RTTs so it's off by default; flip on once the
- *    mobile build + PA applet agree on the chip-side verification
- *    protocol (patent C4 full enforcement).
+ * `includeChipChallenge` — when set, prepend SELECT pav2 +
+ *    GET_CHALLENGE to the plan.  The returned 16-byte nonce is
+ *    recorded in the session audit trail.
+ *
+ *    **Not needed for SAD replay prevention.**  Replay is already
+ *    enforced server-side via the `SadRecord.status: READY → CONSUMED`
+ *    transition inside the provisioning `$transaction` — a consumed
+ *    SAD cannot be re-emitted by /api/provisioning/start, so there's
+ *    nothing for the mobile to relay on a replay attempt.
+ *
+ *    The flag exists for an optional chip-side defence-in-depth path:
+ *    once the PA applet is updated to look up a pav2 Shareable
+ *    Interface Object and verify the SAD's trailing 16 bytes against
+ *    the last issued challenge, enabling this flag closes the
+ *    narrow "compromised backend replays old SAD" threat model.
+ *    Until that applet work + fleet re-perso ships, the chip side
+ *    doesn't consume the nonce, so turning this on today adds 2 NFC
+ *    RTTs of latency for audit-trail enrichment only.  Default off.
  */
 export interface PlanOptions {
   includeChipChallenge?: boolean;
@@ -227,16 +237,17 @@ export function buildProvisioningPlan(
   let i = 0;
 
   if (options.includeChipChallenge) {
-    // Patent C4 nonce binding — fetch a 16-byte chip challenge before
-    // the provisioning sequence.  Server records the response bytes
-    // (via the apdu audit log) as a freshness token bound to this
-    // ProvisioningSession.id.  Future PA applet update will verify
-    // the challenge appears inside TRANSFER_SAD before committing.
+    // Chip-challenge defence-in-depth path (off by default).  Audit-
+    // trail-only today: the 16-byte nonce is captured in the session's
+    // apduLog but not consumed by the chip.  Becomes enforcement when
+    // the PA applet is updated to look up pav2's Shareable Interface
+    // and compare against the SAD's trailing bytes.  See PlanOptions
+    // docstring + applets/pav2/README.md for the full rationale.
     steps.push({
-      i: i++, apdu: SELECT_PAV2_APDU,  phase: 'c4_select_pav2',   progress: 0.02, expectSw: '9000',
+      i: i++, apdu: SELECT_PAV2_APDU,  phase: 'chip_challenge_select', progress: 0.02, expectSw: '9000',
     });
     steps.push({
-      i: i++, apdu: GET_CHALLENGE_APDU, phase: 'c4_get_challenge', progress: 0.04, expectSw: '9000',
+      i: i++, apdu: GET_CHALLENGE_APDU, phase: 'chip_challenge_fetch',  progress: 0.04, expectSw: '9000',
     });
   }
 
