@@ -292,6 +292,28 @@ Useful data-prep alarms:
 - `data-prep.sad_decrypt.fail` > 0 in prod → SAD encrypted with a
   retired key version or KMS revoked access
 
+Emitted metrics (CloudWatch namespace `admin`):
+
+| Metric | Dimensions | When |
+|---|---|---|
+| `admin.partner_auth.ok` | `keyId` | Partner HMAC verified |
+| `admin.partner_auth.fail` | `reason` ∈ {missing_signature, bad_signature, clock_skew, bad_timestamp} | Partner request rejected |
+| `admin.batch.received` | `result` ∈ {ok, empty, too_large, fi_mismatch, program_mismatch} | `POST /embossing-batches` landed |
+| `admin.batch.size_bytes` | — GAUGE | Last accepted batch's byte size |
+
+Set `METRICS_BACKEND=cloudwatch` on `vera-admin` task def the same way.
+
+Useful admin alarms:
+- `admin.partner_auth.fail{reason=bad_signature}` > 10 in 5 min →
+  partner key rotation needed OR brute-force probe hitting the N-3
+  timing-oracle-protected path (ok if that's the attack signature —
+  constant-time means timing doesn't leak valid keyIds)
+- `admin.batch.received{result=too_large}` > 0 → partner uploading
+  batches past the 500 MB cap (either bug in their file chunker or
+  intentional DoS attempt)
+- `admin.batch.received{result=fi_mismatch|program_mismatch}` > 0 →
+  partner misconfigured their template/program IDs
+
 Useful CloudWatch alarms to wire up:
 - `rca.plan_step.rejected` > 5 in 5 min → mobile bug or attack
 - `rca.attestation.verify{result=fail}` > 0 in strict mode → real chip rejection

@@ -10,6 +10,7 @@ import { z } from 'zod';
 import { prisma } from '@palisade/db';
 import { ApiError, badRequest, notFound, unauthorized, validateBody } from '@palisade/core';
 import { getAdminConfig } from '../env.js';
+import { metrics } from '../metrics.js';
 
 // Secrets Manager client for partner HMAC key resolution (H-6).  One
 // instance per process; resolves in the container's region.
@@ -109,17 +110,21 @@ export function partnerHmacMiddleware() {
       const timestampStr = readHeader(req, 'x-partner-timestamp');
 
       if (!keyId || !signatureHex || !timestampStr) {
+        metrics().counter('admin.partner_auth.fail', 1, { reason: 'missing_signature' });
         throw unauthorized('missing_signature', 'Missing partner auth headers');
       }
       if (!/^[0-9a-fA-F]+$/.test(signatureHex)) {
+        metrics().counter('admin.partner_auth.fail', 1, { reason: 'bad_signature' });
         throw unauthorized('bad_signature', 'Signature must be hex');
       }
       const timestamp = Number.parseInt(timestampStr, 10);
       if (!Number.isFinite(timestamp)) {
+        metrics().counter('admin.partner_auth.fail', 1, { reason: 'bad_timestamp' });
         throw unauthorized('bad_timestamp', 'Timestamp is not a number');
       }
       const now = Math.floor(Date.now() / 1000);
       if (Math.abs(now - timestamp) > SIGNATURE_WINDOW_SECONDS) {
+        metrics().counter('admin.partner_auth.fail', 1, { reason: 'clock_skew' });
         throw unauthorized('clock_skew', 'Timestamp outside replay window');
       }
 
@@ -197,8 +202,10 @@ export function partnerHmacMiddleware() {
 
       // Now — and ONLY now — branch on credential validity + signature.
       if (!credUsable || !sigOk) {
+        metrics().counter('admin.partner_auth.fail', 1, { reason: 'bad_signature' });
         throw unauthorized('bad_signature', 'Signature did not verify');
       }
+      metrics().counter('admin.partner_auth.ok', 1, { keyId });
 
       // Record last-used on success.  Non-blocking — we don't want an audit
       // write to fail the request, but we do await so the timestamp is
@@ -246,8 +253,14 @@ router.post('/embossing-batches', async (req: PartnerRequest, res) => {
   if (!templateId) throw badRequest('missing_template_id', 'X-Partner-TemplateId required');
   if (!programId) throw badRequest('missing_program_id', 'X-Partner-ProgramId required');
 
-  if (body.length === 0) throw badRequest('empty_body', 'Batch body is empty');
-  if (body.length > MAX_BATCH_SIZE) throw badRequest('file_too_large', 'Batch exceeds 500MB limit');
+  if (body.length === 0) {
+    metrics().counter('admin.batch.received', 1, { result: 'empty' });
+    throw badRequest('empty_body', 'Batch body is empty');
+  }
+  if (body.length > MAX_BATCH_SIZE) {
+    metrics().counter('admin.batch.received', 1, { result: 'too_large' });
+    throw badRequest('file_too_large', 'Batch exceeds 500MB limit');
+  }
 
   const [template, program] = await Promise.all([
     prisma.embossingTemplate.findUnique({ where: { id: templateId } }),
@@ -260,12 +273,14 @@ router.post('/embossing-batches', async (req: PartnerRequest, res) => {
   // credential.  Prevents a partner from uploading against an FI they don't
   // represent by specifying a borrowed templateId.
   if (template.financialInstitutionId !== cred.financialInstitutionId) {
+    metrics().counter('admin.batch.received', 1, { result: 'fi_mismatch' });
     throw unauthorized('template_fi_mismatch', 'Template does not belong to partner FI');
   }
   // And the program must use (or be compatible with) that FI too.  Programs
   // can belong to an FI via Program.financialInstitutionId; enforce it so a
   // partner can't redirect to a program they don't own.
   if (program.financialInstitutionId && program.financialInstitutionId !== cred.financialInstitutionId) {
+    metrics().counter('admin.batch.received', 1, { result: 'program_mismatch' });
     throw unauthorized('program_fi_mismatch', 'Program does not belong to partner FI');
   }
 
@@ -304,6 +319,9 @@ router.post('/embossing-batches', async (req: PartnerRequest, res) => {
     },
     select: { id: true, status: true, uploadedAt: true },
   });
+
+  metrics().counter('admin.batch.received', 1, { result: 'ok' });
+  metrics().gauge('admin.batch.size_bytes', body.length);
 
   res.status(201).json({ batchId: batch.id, status: batch.status, uploadedAt: batch.uploadedAt });
 });
