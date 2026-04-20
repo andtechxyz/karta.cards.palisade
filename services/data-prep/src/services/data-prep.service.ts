@@ -87,22 +87,38 @@ export class DataPrepService {
       input.cardSequenceNumber ?? '01',
     );
 
-    // Step 4: Build SAD (TLV/DGI structures)
-    const profileForSad = this.toSadProfile(issuerProfile);
-    const cardData: CardData = {
-      pan: input.pan,
-      expiryDate: input.expiryYymm,
-      effectiveDate: this.computeEffectiveDate(input.expiryYymm),
-      serviceCode: input.serviceCode ?? '201',
-      cardSequenceNumber: input.cardSequenceNumber ?? '01',
-      icvv: derived.icvv,
-    };
+    // Build and encrypt the SAD inside a try/finally so the plaintext
+    // per-card EMV master keys (MK-AC, MK-SMI, MK-SMC) are zeroed on every
+    // exit path — success, throw from SADBuilder, KMS failure, DB failure.
+    // These three 16-byte buffers would otherwise linger on the V8 heap
+    // until GC, readable via core dump or memory-scraping debugger.
+    // PCI 3.5 / 3.6.2.
+    let sadBytes: Buffer | null = null;
+    let encrypted: Buffer;
+    let keyVersion: number;
+    try {
+      // Step 4: Build SAD (TLV/DGI structures)
+      const profileForSad = this.toSadProfile(issuerProfile);
+      const cardData: CardData = {
+        pan: input.pan,
+        expiryDate: input.expiryYymm,
+        effectiveDate: this.computeEffectiveDate(input.expiryYymm),
+        serviceCode: input.serviceCode ?? '201',
+        cardSequenceNumber: input.cardSequenceNumber ?? '01',
+        icvv: derived.icvv,
+      };
 
-    const dgis = SADBuilder.buildSad(profileForSad, chipProfile, cardData);
+      const dgis = SADBuilder.buildSad(profileForSad, chipProfile, cardData);
 
-    // Step 5: Serialise and encrypt
-    const sadBytes = SADBuilder.serialiseDgis(dgis);
-    const { encrypted, keyVersion } = await this.encryptSad(sadBytes, config.KMS_SAD_KEY_ARN);
+      // Step 5: Serialise and encrypt
+      sadBytes = SADBuilder.serialiseDgis(dgis);
+      ({ encrypted, keyVersion } = await this.encryptSad(sadBytes, config.KMS_SAD_KEY_ARN));
+    } finally {
+      derived.mkAcKeyBytes.fill(0);
+      derived.mkSmiKeyBytes.fill(0);
+      derived.mkSmcKeyBytes.fill(0);
+      sadBytes?.fill(0);
+    }
 
     // Step 6: Store SAD record
     const sadRecord = await prisma.sadRecord.create({

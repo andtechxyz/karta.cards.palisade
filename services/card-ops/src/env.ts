@@ -1,7 +1,7 @@
 import { defineEnv, baseEnvShape, authKeysJson } from '@palisade/core';
 import { z } from 'zod';
 
-const { get: getCardOpsConfig, reset: _resetCardOpsConfig } = defineEnv({
+const { get: _getCardOpsConfigRaw, reset: _resetCardOpsConfig } = defineEnv({
   ...baseEnvShape,
 
   PORT: z.coerce.number().default(3009),
@@ -56,5 +56,41 @@ const { get: getCardOpsConfig, reset: _resetCardOpsConfig } = defineEnv({
   // data-prep / rca so decrypts round-trip across services.
   KMS_SAD_KEY_ARN: z.string().default(''),
 });
+
+// Wrap the raw config getter with a production guard that refuses to boot
+// with GP test keys or CARD_OPS_USE_TEST_KEYS=1 still set.  PCI 3.6.1 /
+// 6.4.3 — test keys must never authenticate production cards.
+const GP_TEST_KEY_BYTES = '404142434445464748494A4B4C4D4E4F';
+function getCardOpsConfig(): ReturnType<typeof _getCardOpsConfigRaw> {
+  const cfg = _getCardOpsConfigRaw();
+  if (process.env.NODE_ENV === 'production') {
+    if (cfg.CARD_OPS_USE_TEST_KEYS) {
+      throw new Error(
+        'CARD_OPS_USE_TEST_KEYS=1 is forbidden in production.  Leave it unset so the per-FI GP key ARNs are resolved per card.',
+      );
+    }
+    try {
+      const parsed = JSON.parse(cfg.GP_MASTER_KEY);
+      const usingTest =
+        (parsed.enc ?? '').toUpperCase() === GP_TEST_KEY_BYTES ||
+        (parsed.mac ?? '').toUpperCase() === GP_TEST_KEY_BYTES ||
+        (parsed.dek ?? '').toUpperCase() === GP_TEST_KEY_BYTES;
+      if (usingTest) {
+        throw new Error(
+          'GP_MASTER_KEY contains the well-known GlobalPlatform test key (40..4F).  Production must set per-FI ARNs on IssuerProfile; GP_MASTER_KEY is dev-only.',
+        );
+      }
+    } catch (parseErr) {
+      // GP_MASTER_KEY should still be valid JSON even in prod (the
+      // schema default is JSON-shaped).  Re-throw parse errors; the
+      // testKey branch throws its own message.
+      if (parseErr instanceof SyntaxError) {
+        throw new Error('GP_MASTER_KEY is not valid JSON');
+      }
+      throw parseErr;
+    }
+  }
+  return cfg;
+}
 
 export { getCardOpsConfig, _resetCardOpsConfig };

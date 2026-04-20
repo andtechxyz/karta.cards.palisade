@@ -321,13 +321,15 @@ describe('createCognitoAuthMiddleware', () => {
     await middleware(req, res, next);
 
     // We verify signature + issuer with `jose` and check audience/client_id
-    // ourselves (depending on token_use), so the only option passed in is
-    // the issuer.
+    // ourselves (depending on token_use).  We pin the algorithm explicitly
+    // to `RS256` (Cognito's default) — defence in depth against a future
+    // jose default change or a misissued JWK.
     expect(jwtVerify).toHaveBeenCalledWith(
       'check.options.token',
       expect.any(Function), // JWKS function
       {
         issuer: `https://cognito-idp.ap-southeast-2.amazonaws.com/${CONFIG.userPoolId}`,
+        algorithms: ['RS256'],
       },
     );
   });

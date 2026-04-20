@@ -96,7 +96,13 @@ export function createCognitoAuthMiddleware(config: CognitoAuthConfig): RequestH
       // Mobile API callers typically send the access token (it's what
       // AWS Amplify / cognito-identity returns from `getCurrentUser`),
       // so failing access tokens here breaks every authenticated call.
-      const { payload } = await jwtVerify(token, jwks, { issuer });
+      // Pin alg to RS256 (Cognito default) — defence in depth against a future
+      // jose default change or a misissued JWK.  `algorithms` is the defined
+      // allowlist name in jose v5.
+      const { payload } = await jwtVerify(token, jwks, {
+        issuer,
+        algorithms: ['RS256'],
+      });
 
       const tokenUse = payload['token_use'];
       if (tokenUse === 'access') {

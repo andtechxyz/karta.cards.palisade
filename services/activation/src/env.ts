@@ -26,7 +26,10 @@ const { get: getActivationConfig, reset: _resetActivationConfig } = defineEnv({
   // detection at register time).  Declared inline — no shared fragment.
   CARD_UID_FINGERPRINT_KEY: hexKey(32),
   PORT: z.coerce.number().int().positive().default(3002),
-  TAP_HANDOFF_SECRET: z.string().min(32),
+  // 32-byte (64 hex chars) HMAC-SHA256 key for handoff tokens.  Must match
+  // the same value used by the tap service.  Hex-only — non-hex input would
+  // silently produce a weak Buffer from Buffer.from(hex,'hex').
+  TAP_HANDOFF_SECRET: hexKey(32),
   PAY_URL: z.string().url().default('https://pay.karta.cards'),
   VAULT_SERVICE_URL: z.string().url().default('http://localhost:3004'),
   // Shared secret for HMAC-signed vault calls; must appear verbatim in the

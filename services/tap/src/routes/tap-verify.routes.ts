@@ -102,6 +102,7 @@ async function runVerify(
   }
 
   let valid = false;
+  let macSessionKey: Buffer | null = null;
   try {
     // Reconstruct the exact URL the chip signed.  Per AN14683 the MAC
     // covers host+path through `&m=`; host+path is fixed to
@@ -110,7 +111,7 @@ async function runVerify(
       `https://mobile.karta.cards/t/${input.urlCode}` +
       `?e=${input.piccHex.toUpperCase()}&m=${input.macHex.toUpperCase()}`;
     const macInput = extractSdmmacInput(fullUrl);
-    const { mac: macSessionKey } = deriveSessionKeys(
+    ({ mac: macSessionKey } = deriveSessionKeys(
       match.sdmFileReadKey,
       match.uid,
       Buffer.from([
@@ -118,11 +119,19 @@ async function runVerify(
         (match.counter >> 8) & 0xff,
         (match.counter >> 16) & 0xff,
       ]),
-    );
+    ));
     valid = verifySdmmac(macSessionKey, macInput, input.macHex);
   } finally {
+    // Zero all plaintext key material + UID on the way out.  The UID is
+    // stored only in encrypted form at rest and should not linger on the
+    // heap for GC to eventually collect (PCI 3.3/3.5).  The derived
+    // session MAC key is derived from the per-card file-read key and is
+    // itself a tag-of-knowledge that proves access to the root — scrub it
+    // too.
     match.sdmMetaReadKey.fill(0);
     match.sdmFileReadKey.fill(0);
+    match.uid.fill(0);
+    macSessionKey?.fill(0);
   }
 
   if (!valid) {

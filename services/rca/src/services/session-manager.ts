@@ -292,6 +292,16 @@ export class SessionManager {
         'RCA_ALLOW_MINIMAL_SAD=1 for dev fallback.',
       );
     }
+    // Hard guard: this flag ships cards with placeholder bank/program IDs
+    // which CORRUPTS per-FI chip identity.  Must never be active in prod.
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'RCA_ALLOW_MINIMAL_SAD=1 is forbidden in production.  Populate ' +
+        'IssuerProfile (bankId/progId/postProvisionUrl/scheme/chipProfile) ' +
+        'on the Program instead.  The dev flag corrupts per-FI identity on ' +
+        'the chip and leaks placeholder values into the provenance log.',
+      );
+    }
 
     console.warn(
       '[rca] RCA_ALLOW_MINIMAL_SAD=1: falling back to minimal "PALISADE" ' +

@@ -35,33 +35,45 @@ export const internal = (code: string, message: string, details?: unknown) =>
  */
 export function errorMiddleware(
   err: unknown,
-  _req: Request,
+  req: Request,
   res: Response,
   _next: NextFunction,
 ): void {
   if (err instanceof ApiError) {
+    // Server-side log includes path + code + internal details (for audit).
+    // Client-side response deliberately omits `details` to avoid leaking
+    // internal schema / field names / regex shapes to probing attackers
+    // (PCI 6.2.4 / 10.2).
     // eslint-disable-next-line no-console
-    console.log(`[err] ApiError ${err.status} ${err.code}: ${err.message}`);
+    console.log(
+      `[err] ${req.method} ${req.path} ApiError ${err.status} ${err.code}: ${err.message}` +
+        (err.details ? ` details=${JSON.stringify(err.details).slice(0, 500)}` : ''),
+    );
     res.status(err.status).json({
-      error: { code: err.code, message: err.message, details: err.details ?? undefined },
+      error: { code: err.code, message: err.message },
     });
     return;
   }
   if (err instanceof ZodError) {
+    // ZodError `issues` contain field names + expected types + regex shapes
+    // which are useful to a probing attacker.  Log server-side, return a
+    // generic error to the client.
+    const issuePaths = err.issues.map((i) => i.path.join('.') || '<root>').join(',');
     // eslint-disable-next-line no-console
-    console.log(`[err] ZodError 400 validation_failed: ${JSON.stringify(err.issues).slice(0, 500)}`);
+    console.log(
+      `[err] ${req.method} ${req.path} ZodError 400 validation_failed paths=[${issuePaths}]`,
+    );
     res.status(400).json({
       error: {
         code: 'validation_failed',
         message: 'Request failed validation',
-        details: err.issues,
       },
     });
     return;
   }
   const msg = err instanceof Error ? err.message : String(err);
   // eslint-disable-next-line no-console
-  console.error('[unhandled]', msg);
+  console.error(`[unhandled] ${req.method} ${req.path}:`, msg);
   res.status(500).json({
     error: { code: 'internal_error', message: 'Internal server error' },
   });

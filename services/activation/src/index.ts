@@ -48,13 +48,18 @@ app.use('/api/cards/mine',
 // provisioning-agent / batch-processor callers.
 const payGate = requireSignedRequest({ keys: config.PAY_AUTH_KEYS });
 const webAuthnRouters = createWebAuthnRouters(payGate);
+// Pay-gated WebAuthn routes carry credential enumeration + counter-update
+// surfaces.  Rate-limit at the tighter authRateLimit so a compromised pay
+// secret doesn't give an attacker unbounded WebAuthn reads.  PCI 8.3.6.
 app.use('/api/cards',
   express.json({ limit: '64kb', verify: captureRawBody }),
+  apiRateLimit,
   createCardsPayRouter(payGate),
   webAuthnRouters.cardScoped,
 );
 app.use('/api/webauthn-credentials',
   express.json({ limit: '64kb', verify: captureRawBody }),
+  apiRateLimit,
   webAuthnRouters.credentialScoped,
 );
 
@@ -76,12 +81,13 @@ app.use('/api/provisioning',
 );
 
 // --- Admin card-ops initiation ---
-// Cognito-gated (admin group + email allowlist).  Router creates a
-// CardOpSession, calls card-ops for S2S register, and returns the
-// WebSocket URL the admin client should connect to.
+// Cognito-gated (admin group + email allowlist).  Admin-privileged endpoint
+// that returns a WS URL usable for GP ops — use the tighter authRateLimit
+// so credential-stuffing an admin JWT can't also spray card-op starts.
+// PCI 8.3.6.
 app.use('/api/admin/card-op',
   express.json({ limit: '64kb' }),
-  apiRateLimit,
+  authRateLimit,
   createCardOpRouter(),
 );
 

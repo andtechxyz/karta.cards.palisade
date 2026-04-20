@@ -79,6 +79,14 @@ export async function getGpStaticKeys(cardId?: string): Promise<StaticKeys> {
   }
 
   if (!cardId) {
+    // In production, missing cardId is a hard failure — authenticating a
+    // real card with test keys (known-plaintext 404142…4F) means any admin
+    // op after could be signed by anyone who can reach the card.  PCI 3.5.
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        '[card-ops][static-keys] cardId is required in production; refusing to fall back to GP test keys',
+      );
+    }
     console.warn('[card-ops][static-keys] no cardId supplied; falling back to GP test keys');
     return getTestKeys();
   }
@@ -109,9 +117,18 @@ export async function getGpStaticKeys(cardId?: string): Promise<StaticKeys> {
   });
 
   const issuer = card?.program?.issuerProfile;
+  const isProd = process.env.NODE_ENV === 'production';
   if (!issuer || !issuer.gpEncKeyArn || !issuer.gpMacKeyArn || !issuer.gpDekKeyArn) {
+    // Same PCI concern as the no-cardId branch: refusing test-key fallback
+    // is the only safe answer in prod for a card that IS configured but
+    // whose ARNs are missing.
+    if (isProd) {
+      throw new Error(
+        `[card-ops][static-keys] cardId=${cardId} has no GP key ARNs configured; refusing to fall back to GP test keys in production`,
+      );
+    }
     console.warn(
-      `[card-ops][static-keys] cardId=${cardId} has no GP key ARNs configured; falling back to GP test keys`,
+      `[card-ops][static-keys] cardId=${cardId} has no GP key ARNs configured; falling back to GP test keys (dev only)`,
     );
     return getTestKeys();
   }
@@ -125,8 +142,18 @@ export async function getGpStaticKeys(cardId?: string): Promise<StaticKeys> {
     return { enc, mac, dek };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    // A transient Secrets Manager error must NEVER cause us to authenticate
+    // a real card with the GP test keys.  Propagate the error — the caller
+    // will fail the operation and the UI will surface it; operator can
+    // retry.  This closes the "momentary SM outage downgrades security"
+    // attack.
+    if (isProd) {
+      throw new Error(
+        `[card-ops][static-keys] cardId=${cardId} key fetch failed (${msg}); refusing to fall back to GP test keys in production`,
+      );
+    }
     console.warn(
-      `[card-ops][static-keys] cardId=${cardId} key fetch failed (${msg}); falling back to GP test keys`,
+      `[card-ops][static-keys] cardId=${cardId} key fetch failed (${msg}); falling back to GP test keys (dev only)`,
     );
     return getTestKeys();
   }
