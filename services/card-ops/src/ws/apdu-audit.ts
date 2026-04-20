@@ -38,32 +38,129 @@ export interface ApduAuditEntry {
   hex: string;
   sw?: string;
   phase?: string;
+  /**
+   * Flag set when this entry's hex has been redacted (CHD / key material
+   * suspected).  `hex` then holds only the 4-byte APDU header (CLA INS P1 P2)
+   * or "REDACTED" for the data body.  PCI 3.2 / 3.5 — ingestible fields
+   * cannot be shown in plaintext in audit logs.
+   */
+  redacted?: boolean;
+}
+
+// -----------------------------------------------------------------------------
+// Sensitive-APDU redaction policy
+// -----------------------------------------------------------------------------
+//
+// GP management APDUs that carry key material OR cardholder data must not
+// be logged in full.  The redaction keeps the APDU header (CLA/INS/P1/P2)
+// for audit correlation but strips the data body and any plaintext SW
+// payload that could carry keys.
+//
+// PCI-relevant sensitive APDUs on a card-ops session:
+//   - STORE DATA    (CLA=8x / INS=E2)         — DGI-wrapped data incl.
+//                                                EMV MK / ICC priv key
+//   - PUT KEY       (CLA=8x / INS=D8)         — loads a new SCP03 or
+//                                                ISD key
+//   - INSTALL [for load/install]  (CLA=8x / INS=E6)  — can carry key
+//                                                      material in C9
+//                                                      install data
+//   - Anything post-EXTERNAL_AUTHENTICATE on the same session is SCP03-
+//     enciphered, but the WRAPPER bytes still leak structure — redact
+//     bodies to be conservative.
+
+const SENSITIVE_INS = new Set<number>([
+  0xE2, // STORE DATA
+  0xD8, // PUT KEY
+  0xE6, // INSTALL (in GP context — lengths can carry key bytes)
+]);
+
+/**
+ * Decide whether an APDU's data body should be redacted.  Returns true
+ * for any APDU whose INS byte is in SENSITIVE_INS.  Strictly by INS; we
+ * don't try to sniff the CLA bits because (a) the SCP03 proprietary CLA
+ * varies with session level, (b) INS is enough — STORE DATA with CLA=00
+ * is equally sensitive as CLA=84.
+ */
+function isSensitiveCommand(hex: string): boolean {
+  if (hex.length < 4) return false;
+  const ins = parseInt(hex.slice(2, 4), 16);
+  return SENSITIVE_INS.has(ins);
+}
+
+/**
+ * Redact an APDU command to header-only.  Keep CLA INS P1 P2 (first 8
+ * hex chars) so phase correlation still works in post-mortem; drop Lc +
+ * data + Le.  The replacement string is a deterministic "REDACTED"
+ * marker so the audit row is obviously redacted vs just empty.
+ */
+function redactCommand(hex: string): string {
+  const header = hex.slice(0, 8).toUpperCase(); // CLA INS P1 P2
+  return `${header}-REDACTED`;
+}
+
+/**
+ * Redact a response that MAY carry key material.  When the immediately
+ * preceding command was sensitive, the response body can contain (a)
+ * SCP03-enciphered key blobs, (b) STORE DATA error diagnostics that
+ * echo loaded bytes, (c) enumerations of key identifiers.  Redact the
+ * data portion, keep the trailing 4-char SW for pass/fail audit.
+ */
+function redactResponse(hex: string): string {
+  if (hex.length < 4) return hex.toUpperCase();
+  const sw = hex.slice(-4).toUpperCase();
+  return `REDACTED-${sw}`;
 }
 
 export class ApduAuditLogger {
   private entries: ApduAuditEntry[] = [];
   private readonly sessionId: string;
+  /**
+   * Redaction context — set true by the most recent recordCommand when
+   * that command was sensitive (STORE DATA / PUT KEY / INSTALL).  The
+   * NEXT recordResponse checks this flag to decide whether to also
+   * redact the response body.  Reset after the response is recorded so
+   * subsequent non-sensitive APDUs aren't accidentally redacted.
+   */
+  private lastCommandSensitive = false;
 
   constructor(sessionId: string) {
     this.sessionId = sessionId;
   }
 
-  /** Append a command APDU (on the wire, uppercase hex). */
+  /**
+   * Append a command APDU (on the wire, uppercase hex).  Sensitive INS
+   * values (STORE DATA, PUT KEY, INSTALL) have their data body redacted
+   * before the entry is stored — header bytes are preserved so audit
+   * correlation still works.
+   */
   recordCommand(hex: string, phase?: string): void {
+    const upper = hex.toUpperCase();
+    const sensitive = isSensitiveCommand(upper);
+    this.lastCommandSensitive = sensitive;
     this.entries.push({
       ts: new Date().toISOString(),
       direction: 'cmd',
-      hex: hex.toUpperCase(),
+      hex: sensitive ? redactCommand(upper) : upper,
+      ...(sensitive ? { redacted: true } : {}),
       ...(phase ? { phase } : {}),
     });
   }
 
-  /** Append a response APDU including SW (uppercase hex). */
+  /**
+   * Append a response APDU including SW (uppercase hex).  If the
+   * immediately-preceding command was sensitive, the response body is
+   * redacted too — SCP03-enciphered key blobs and STORE DATA
+   * diagnostics can echo loaded bytes back.  SW is always preserved.
+   */
   recordResponse(hex: string, sw?: string, phase?: string): void {
+    const upper = hex.toUpperCase();
+    const redact = this.lastCommandSensitive;
+    this.lastCommandSensitive = false;
     this.entries.push({
       ts: new Date().toISOString(),
       direction: 'rsp',
-      hex: hex.toUpperCase(),
+      hex: redact ? redactResponse(upper) : upper,
+      ...(redact ? { redacted: true } : {}),
       ...(sw ? { sw: sw.toUpperCase() } : {}),
       ...(phase ? { phase } : {}),
     });

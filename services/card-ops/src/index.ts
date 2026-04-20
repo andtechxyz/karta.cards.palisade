@@ -20,6 +20,7 @@ import { WebSocketServer } from 'ws';
 import { requireSignedRequest, captureRawBody } from '@palisade/service-auth';
 import { errorMiddleware } from '@palisade/core';
 import { prisma } from '@palisade/db';
+import { startSweeper, scrubStaleCardOpScpState } from '@palisade/retention';
 
 import { getCardOpsConfig } from './env.js';
 import { createRegisterRouter } from './routes/register.routes.js';
@@ -88,6 +89,18 @@ wss.on('connection', async (ws, req) => {
   }
 
   handleRelayConnection(ws, sessionId);
+});
+
+// ---------------------------------------------------------------------------
+// Retention sweepers — PCI 3.5 / 3.6.4
+// ---------------------------------------------------------------------------
+// Scrub plaintext SCP03 session keys from orphaned CardOpSession rows.
+// Happy path clears them on COMPLETE/FAILED; this catches abandoned
+// sessions where the WS died before the clear path ran.
+startSweeper({
+  name: 'card-op-scp-state',
+  intervalMs: 5 * 60_000,
+  run: scrubStaleCardOpScpState,
 });
 
 // ---------------------------------------------------------------------------
