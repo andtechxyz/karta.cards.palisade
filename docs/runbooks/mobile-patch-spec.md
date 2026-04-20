@@ -97,6 +97,54 @@ mobile-side changes required unless you want the speedup.
 { "type": "error", "code": "CARD_ERROR", "message": "..." }
 ```
 
+### Error codes
+
+Mobile handler should treat every `error` as terminal for the current
+WebSocket (session is FAILED server-side, retrying on the same `wsUrl`
+will not recover it — the phone must ask the backend for a fresh
+sessionId via `POST /api/provisioning/start`).
+
+| code | Cause | Mobile action |
+|---|---|---|
+| `CARD_ERROR` | Chip returned non-9000 at a step | Show chip error; offer retry via fresh session |
+| `NFC_ERROR` | Phone's NFC transceive failed | "Hold card steady"; retry via fresh session |
+| `PA_FAILED` | PA applet's FINAL_STATUS byte != 0x01 | Hard failure; contact support |
+| `attestation_failed` | Strict-mode attestation rejected chip | Card may be counterfeit; do not retry |
+| `plan_step_invalid` | Plan-mode step cursor rejected the response | Always fetch a fresh session via `/api/provisioning/start` before retrying (see below) |
+
+#### `plan_step_invalid` subcodes
+
+The `message` field carries a specific reason the server-side step
+cursor rejected the response.  All of them require the mobile to
+start over — never resend the same response on the same WebSocket.
+
+| subcode in `message` | Meaning |
+|---|---|
+| `plan_step_state_missing` | Server lost the cursor (e.g. rca restarted mid-session).  Fresh session needed. |
+| `plan_step_state_expired` | Session sat idle past its TTL.  Fresh session needed. |
+| `plan_step_out_of_range` | Response carried an `i` outside `[0, stepCount)`.  Bug in mobile. |
+| `plan_step_replay` | Response's `i` ≤ last accepted step.  Phone double-sent; de-dupe locally. |
+| `plan_step_skip` | Response's `i` jumped forward past the next expected step.  Bug in mobile. |
+
+Recovery flow:
+
+```ts
+ws.onmessage = async (evt) => {
+  const msg = JSON.parse(evt.data as string);
+  if (msg.type === 'error') {
+    ws.close();
+    if (msg.code === 'plan_step_invalid') {
+      // Cursor lost — fetch a fresh session and retry from scratch.
+      await startNewProvisioningSession();
+    } else {
+      showError(msg.code, msg.message);
+    }
+    return;
+  }
+  // ... other handlers
+};
+```
+
 ### Reference implementation (TypeScript)
 
 ```ts
