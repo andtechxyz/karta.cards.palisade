@@ -40,12 +40,16 @@ export function errorMiddleware(
   _next: NextFunction,
 ): void {
   if (err instanceof ApiError) {
+    // eslint-disable-next-line no-console
+    console.log(`[err] ApiError ${err.status} ${err.code}: ${err.message}`);
     res.status(err.status).json({
       error: { code: err.code, message: err.message, details: err.details ?? undefined },
     });
     return;
   }
   if (err instanceof ZodError) {
+    // eslint-disable-next-line no-console
+    console.log(`[err] ZodError 400 validation_failed: ${JSON.stringify(err.issues).slice(0, 500)}`);
     res.status(400).json({
       error: {
         code: 'validation_failed',

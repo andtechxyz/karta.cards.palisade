@@ -14,6 +14,19 @@ app.set('trust proxy', 1);
 
 app.use(express.json({ limit: '64kb' }));
 
+// TEMP debug logger — remove once tap test passes.  Logs every request's
+// method/path/body-shape so we can see what the mobile app is actually
+// sending vs what the routes expect.
+app.use((req, _res, next) => {
+  try {
+    const bodyKeys = req.body && typeof req.body === 'object' ? Object.keys(req.body) : [];
+    console.log(`[req] ${req.method} ${req.originalUrl} body-keys=[${bodyKeys.join(',')}] ct=${req.get('content-type') ?? ''}`);
+  } catch {
+    // don't block on logging failures
+  }
+  next();
+});
+
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'tap' });
 });
