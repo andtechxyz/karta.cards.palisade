@@ -266,6 +266,28 @@ Useful activation-side alarms:
 - `activation.provision_start.fail{reason=rca_failed}` > 0 → RCA
   5xx loop or HMAC auth drift
 
+Emitted metrics (CloudWatch namespace `data-prep`):
+
+| Metric | Dimensions | When |
+|---|---|---|
+| `data-prep.prepare.ok` | — | `POST /api/data-prep/prepare` succeeded |
+| `data-prep.prepare.fail` | `reason` ∈ {validation, issuer_profile_missing, kms_error, apc_error, other} | Prepare threw |
+| `data-prep.prepare.duration_ms` | — TIMING | Every prepare call (success + fail) |
+| `data-prep.sad_decrypt.ok` | `mode` ∈ {kms, dev} | Every `DataPrepService.decryptSad` (called from rca + card-ops) |
+| `data-prep.sad_decrypt.fail` | `mode`, `reason` ∈ {kms_error, empty_plaintext, unsupported_version, other} | Decrypt threw |
+| `data-prep.sad_decrypt.duration_ms` | `mode` — TIMING | Every decrypt |
+
+Set `METRICS_BACKEND=cloudwatch` on `vera-data-prep` task def the same way.
+
+Useful data-prep alarms:
+- `data-prep.sad_decrypt.duration_ms{mode=kms}` p95 > 600 ms → KMS
+  slow or cold-start; mobile provisioning will feel sluggish
+- `data-prep.prepare.fail{reason=apc_error}` > 0 → AWS Payment
+  Cryptography throttling or key-ARN misconfig; embossing batches
+  will stall
+- `data-prep.sad_decrypt.fail` > 0 in prod → SAD encrypted with a
+  retired key version or KMS revoked access
+
 Useful CloudWatch alarms to wire up:
 - `rca.plan_step.rejected` > 5 in 5 min → mobile bug or attack
 - `rca.attestation.verify{result=fail}` > 0 in strict mode → real chip rejection

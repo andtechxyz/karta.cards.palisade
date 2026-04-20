@@ -28,6 +28,7 @@ import { notFound } from '@palisade/core';
 
 import { EmvDerivationService } from './emv-derivation.js';
 import { getDataPrepConfig } from '../env.js';
+import { metrics } from '../metrics.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -313,28 +314,55 @@ export class DataPrepService {
     kmsKeyArn: string,
     sadKeyVersion = 0,
   ): Promise<Buffer> {
-    if (sadKeyVersion === 0 && kmsKeyArn) {
-      // Production: KMS decrypt — CiphertextBlob is self-describing.
-      // Use the module-level KMSClient singleton; constructing a fresh
-      // client on every call adds ~10-20 ms of TLS + DNS warm-up on the
-      // first request after process start (latency audit, opt #5).
-      const resp = await kmsClient().send(
-        new DecryptCommand({ CiphertextBlob: encrypted }),
-      );
-      if (!resp.Plaintext) {
-        throw new Error('KMS decrypt returned empty Plaintext');
+    // Instrument EVERY decrypt with a duration sample + outcome counter.
+    // This is the single biggest contributor to provisioning SAD_TRANSFER
+    // latency (KMS Decrypt round-trip = 150-400 ms cold), so operators
+    // need a p95 dashboard to spot drift.  Tag on `mode` so dev AES-ECB
+    // and prod KMS paths are visible separately.
+    const mode =
+      sadKeyVersion === SAD_KEY_VERSION_DEV_AES_ECB ? 'dev'
+      : sadKeyVersion === 0 && kmsKeyArn ? 'kms'
+      : 'unknown';
+    const startedAt = Date.now();
+    try {
+      if (sadKeyVersion === 0 && kmsKeyArn) {
+        // Production: KMS decrypt — CiphertextBlob is self-describing.
+        // Use the module-level KMSClient singleton; constructing a fresh
+        // client on every call adds ~10-20 ms of TLS + DNS warm-up on the
+        // first request after process start (latency audit, opt #5).
+        const resp = await kmsClient().send(
+          new DecryptCommand({ CiphertextBlob: encrypted }),
+        );
+        if (!resp.Plaintext) {
+          throw new Error('KMS decrypt returned empty Plaintext');
+        }
+        const pt = Buffer.from(resp.Plaintext);
+        metrics().counter('data-prep.sad_decrypt.ok', 1, { mode });
+        metrics().timing('data-prep.sad_decrypt.duration_ms', Date.now() - startedAt, { mode });
+        return pt;
       }
-      return Buffer.from(resp.Plaintext);
-    }
 
-    if (sadKeyVersion === SAD_KEY_VERSION_DEV_AES_ECB) {
-      // Dev mode: AES-128-ECB
-      return decryptSadDev(encrypted);
-    }
+      if (sadKeyVersion === SAD_KEY_VERSION_DEV_AES_ECB) {
+        const pt = decryptSadDev(encrypted);
+        metrics().counter('data-prep.sad_decrypt.ok', 1, { mode });
+        metrics().timing('data-prep.sad_decrypt.duration_ms', Date.now() - startedAt, { mode });
+        return pt;
+      }
 
-    throw new Error(
-      `decryptSad: unsupported sadKeyVersion=${sadKeyVersion} (kmsKeyArn=${kmsKeyArn ? 'set' : 'empty'})`,
-    );
+      throw new Error(
+        `decryptSad: unsupported sadKeyVersion=${sadKeyVersion} (kmsKeyArn=${kmsKeyArn ? 'set' : 'empty'})`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message.toLowerCase() : '';
+      const reason =
+        msg.includes('kms') ? 'kms_error'
+        : msg.includes('unsupported sadkeyversion') ? 'unsupported_version'
+        : msg.includes('empty plaintext') ? 'empty_plaintext'
+        : 'other';
+      metrics().counter('data-prep.sad_decrypt.fail', 1, { mode, reason });
+      metrics().timing('data-prep.sad_decrypt.duration_ms', Date.now() - startedAt, { mode });
+      throw err;
+    }
   }
 
   private computeEffectiveDate(expiryYymm: string): string {

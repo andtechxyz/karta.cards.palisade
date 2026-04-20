@@ -10,6 +10,7 @@
     { "path": "../../packages/core" },
     { "path": "../../packages/db" },
     { "path": "../../packages/emv" },
+    { "path": "../../packages/metrics" },
     { "path": "../../packages/service-auth" }
   ]
 }

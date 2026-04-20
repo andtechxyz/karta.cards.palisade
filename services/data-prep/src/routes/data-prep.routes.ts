@@ -12,6 +12,7 @@ import { prisma } from '@palisade/db';
 import { badRequest, notFound } from '@palisade/core';
 
 import { DataPrepService } from '../services/data-prep.service.js';
+import { metrics } from '../metrics.js';
 
 const prepareSchema = z.object({
   cardId: z.string().min(1),
@@ -35,11 +36,29 @@ export function createDataPrepRouter(): Router {
       console.log(
         `[err] data-prep/prepare validation_failed paths=[${parsed.error.issues.map((i) => i.path.join('.')).join(',')}]`,
       );
+      metrics().counter('data-prep.prepare.fail', 1, { reason: 'validation' });
       throw badRequest('validation_failed', 'Request failed validation');
     }
 
-    const result = await service.prepareCard(parsed.data);
-    res.status(201).json(result);
+    const startedAt = Date.now();
+    try {
+      const result = await service.prepareCard(parsed.data);
+      metrics().counter('data-prep.prepare.ok', 1);
+      metrics().timing('data-prep.prepare.duration_ms', Date.now() - startedAt);
+      res.status(201).json(result);
+    } catch (err) {
+      // Classify known failure surfaces so the dashboard separates a KMS
+      // outage from an APC misconfig from a missing issuer profile.
+      const msg = err instanceof Error ? err.message.toLowerCase() : '';
+      const reason =
+        msg.includes('issuerprofile') || msg.includes('issuer profile') ? 'issuer_profile_missing'
+        : msg.includes('kms') ? 'kms_error'
+        : msg.includes('paymentcryptography') || msg.includes('apc') ? 'apc_error'
+        : 'other';
+      metrics().counter('data-prep.prepare.fail', 1, { reason });
+      metrics().timing('data-prep.prepare.duration_ms', Date.now() - startedAt);
+      throw err;
+    }
   });
 
   // GET /api/data-prep/sad/:proxyCardId
