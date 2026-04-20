@@ -89,10 +89,19 @@ export class HsmSdmDeriver implements SdmDeriver {
 
   private async diversify(masterArn: string, uid: Buffer): Promise<Buffer> {
     assertUid(uid);
+    // AWS Payment Cryptography's GenerateMac requires the MessageData to be
+    // between 16 and 8192 hex chars (8–4096 bytes).  NTAG424 DNA UIDs are
+    // 7 bytes = 14 hex chars, which is below the floor.  Zero-pad to 8 bytes
+    // (the common EMV UDK practice) so the message is exactly 16 hex chars.
+    // The pad MUST match what perso-time key derivation used — treat the
+    // extra byte as part of the UID diversifier forever.
+    const messageData = Buffer.concat([uid, Buffer.alloc(1)])
+      .toString('hex')
+      .toUpperCase();
     const resp = await this.pcData.send(
       new GenerateMacCommand({
         KeyIdentifier: masterArn,
-        MessageData: uid.toString('hex').toUpperCase(),
+        MessageData: messageData,
         GenerationAttributes: { Algorithm: 'CMAC' },
       }),
     );
