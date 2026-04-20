@@ -14,6 +14,7 @@
 
 import type { WebSocket } from 'ws';
 import { prisma } from '@palisade/db';
+import { redactSid } from '@palisade/core';
 import { Prisma } from '@prisma/client';
 import { runOperation } from './operation-runner.js';
 import type { WSMessage } from './messages.js';
@@ -23,7 +24,7 @@ export async function handleRelayConnection(
   ws: WebSocket,
   sessionId: string,
 ): Promise<void> {
-  console.log(`[card-ops-ws] relay connected: session=${sessionId}`);
+  console.log(`[card-ops-ws] relay connected: session=${redactSid(sessionId)}`);
 
   const session = await prisma.cardOpSession.findUnique({
     where: { id: sessionId },
@@ -54,7 +55,7 @@ export async function handleRelayConnection(
       try {
         ws.send(JSON.stringify(msg));
       } catch (err) {
-        console.error(`[card-ops-ws] send failed for session ${sessionId}:`, err);
+        console.error(`[card-ops-ws] send failed for session ${redactSid(sessionId)}:`, err);
       }
     }
   };
@@ -85,7 +86,7 @@ export async function handleRelayConnection(
   });
 
   ws.on('close', (code, _reason) => {
-    console.log(`[card-ops-ws] relay closed: session=${sessionId}, code=${code}`);
+    console.log(`[card-ops-ws] relay closed: session=${redactSid(sessionId)}, code=${code}`);
     if (pendingReject) {
       const r = pendingReject;
       pendingResolve = null;
@@ -95,7 +96,7 @@ export async function handleRelayConnection(
   });
 
   ws.on('error', (err) => {
-    console.error(`[card-ops-ws] relay error: session=${sessionId}`, err);
+    console.error(`[card-ops-ws] relay error: session=${redactSid(sessionId)}`, err);
   });
 
   const nextInbound = (): Promise<WSMessage> => {
@@ -113,7 +114,7 @@ export async function handleRelayConnection(
       next: nextInbound,
     });
   } catch (err) {
-    console.error(`[card-ops-ws] operation failed for session ${sessionId}:`, err);
+    console.error(`[card-ops-ws] operation failed for session ${redactSid(sessionId)}:`, err);
     const message = err instanceof Error ? err.message : 'operation_error';
     send({ type: 'error', code: 'INTERNAL', message });
     await prisma.cardOpSession.update({

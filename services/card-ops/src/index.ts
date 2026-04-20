@@ -14,7 +14,7 @@
 
 import 'dotenv/config';
 import 'express-async-errors';
-import { resolveSecretRefs } from '@palisade/core';
+import { resolveSecretRefs, redactSid } from '@palisade/core';
 await resolveSecretRefs();
 
 import { createServer } from 'node:http';
@@ -88,7 +88,7 @@ wss.on('connection', async (ws, req) => {
     }
   } catch (err) {
     const code = err instanceof HandoffError ? err.code : 'token_verify_failed';
-    console.warn(`[card-ops-ws] upgrade rejected for ${sessionId}: ${code}`);
+    console.warn(`[card-ops-ws] upgrade rejected for ${redactSid(sessionId)}: ${code}`);
     ws.close(4001, `WS auth failed: ${code}`);
     return;
   }

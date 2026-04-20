@@ -14,7 +14,7 @@
 
 import { prisma } from '@palisade/db';
 import { APDUBuilder } from '@palisade/emv';
-import { badRequest } from '@palisade/core';
+import { badRequest, redactSid } from '@palisade/core';
 import { DataPrepService } from '@palisade/data-prep/services/data-prep.service';
 
 import { getRcaConfig } from '../env.js';
@@ -511,7 +511,17 @@ export class SessionManager {
       session.card?.program?.issuerProfile ?? null,
       session.sadRecord,
     );
-    const transferApdu = buildTransferSadApdu(ctx);
+    let transferApdu: Buffer;
+    try {
+      transferApdu = buildTransferSadApdu(ctx);
+    } finally {
+      // PCI 3.5 — S-2 from the post-fix audit: plaintext SAD contains
+      // per-card EMV master keys, PAN, expiry, etc.  After the wire APDU
+      // is built, the plaintext bytes serve no purpose — scrub the Buffer
+      // so a later core dump / memory scrape doesn't leak it.  The
+      // Buffer is the only reference the caller holds; scrub in place.
+      ctx.sadPayload.fill(0);
+    }
 
     return [{
       type: 'apdu',
@@ -598,7 +608,7 @@ export class SessionManager {
       return s;
     });
 
-    console.log(`[rca] provisioning complete: session=${sessionId}, card=${session.cardId}`);
+    console.log(`[rca] provisioning complete: session=${redactSid(sessionId)}, card=${redactSid(session.cardId)}`);
 
     // Fire callback to activation service (async, non-blocking)
     this.fireCallback(session.card.cardRef, session.card.chipSerial ?? '').catch((err) =>
@@ -837,7 +847,7 @@ export class SessionManager {
     });
 
     console.log(
-      `[rca] plan-mode provisioning complete: session=${sessionId}, card=${session.cardId}`,
+      `[rca] plan-mode provisioning complete: session=${redactSid(sessionId)}, card=${redactSid(session.cardId)}`,
     );
 
     // Fire callback to activation service (async, non-blocking).

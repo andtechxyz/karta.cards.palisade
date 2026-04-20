@@ -33,6 +33,7 @@
 
 import type { WebSocket } from 'ws';
 import { prisma } from '@palisade/db';
+import { redactSid } from '@palisade/core';
 
 import { SessionManager, type WSMessage } from '../services/session-manager.js';
 
@@ -55,7 +56,7 @@ export async function handleRelayConnection(
   options: RelayOptions = {},
 ): Promise<void> {
   const mode = options.planMode ? 'plan' : 'classical';
-  console.log(`[rca-ws] relay connected: session=${sessionId}, mode=${mode}`);
+  console.log(`[rca-ws] relay connected: session=${redactSid(sessionId)}, mode=${mode}`);
 
   ws.on('message', async (raw) => {
     try {
@@ -74,7 +75,7 @@ export async function handleRelayConnection(
         ws.close(1000, 'Session ended');
       }
     } catch (err) {
-      console.error(`[rca-ws] error in session ${sessionId}:`, err);
+      console.error(`[rca-ws] error in session ${redactSid(sessionId)}:`, err);
       if (ws.readyState === ws.OPEN) {
         ws.send(JSON.stringify({
           type: 'error',
@@ -87,11 +88,11 @@ export async function handleRelayConnection(
   });
 
   ws.on('close', (code, _reason) => {
-    console.log(`[rca-ws] relay closed: session=${sessionId}, code=${code}`);
+    console.log(`[rca-ws] relay closed: session=${redactSid(sessionId)}, code=${code}`);
   });
 
   ws.on('error', (err) => {
-    console.error(`[rca-ws] relay error: session=${sessionId}`, err);
+    console.error(`[rca-ws] relay error: session=${redactSid(sessionId)}`, err);
   });
 
   if (options.planMode) {
@@ -110,7 +111,7 @@ export async function handleRelayConnection(
       });
       ws.send(JSON.stringify(plan));
     } catch (err) {
-      console.error(`[rca-ws] plan build failed for session ${sessionId}:`, err);
+      console.error(`[rca-ws] plan build failed for session ${redactSid(sessionId)}:`, err);
       if (ws.readyState === ws.OPEN) {
         ws.send(JSON.stringify({
           type: 'error',
