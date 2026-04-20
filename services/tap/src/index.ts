@@ -18,6 +18,30 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'tap' });
 });
 
+// Apple App Site Association — Universal Links for tap.karta.cards.
+// Chip emits https://tap.karta.cards/<urlCode>?e=&m= after activation,
+// which iOS routes to the Palisade app via this file.
+// Served as application/json, no file extension, publicly cacheable.
+// Team ID 39GT4WXF5C; supports current + previous bundle IDs during migration.
+app.get('/.well-known/apple-app-site-association', (_req, res) => {
+  res.type('application/json').json({
+    applinks: {
+      apps: [],
+      details: [
+        {
+          appIDs: [
+            '39GT4WXF5C.cards.karta.palisade',
+            '39GT4WXF5C.com.mobile.karta.cards',
+          ],
+          components: [
+            { '/': '/*' },
+          ],
+        },
+      ],
+    },
+  });
+});
+
 // SUN-tap — mounted at root because the URL baked into the NFC chip has
 // no /api prefix.  Rate-limit to prevent replay brute-force.
 app.use('/activate', authRateLimit);
