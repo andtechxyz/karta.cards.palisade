@@ -86,11 +86,37 @@ export interface AttestationVerifyResult {
 // PLACEHOLDER VALUES — will be replaced with real vendor root public keys
 // once we have access to the attestation infrastructure.  Strict-mode
 // verification against these placeholders will FAIL — that's intentional
-// until the real pins are in place.
+// until the real pins are in place, AND we refuse to boot in strict
+// mode while they're still placeholders (see `assertAttestationPinsForMode`
+// below).  Operators who flip `PALISADE_ATTESTATION_MODE=strict` without
+// committing real pins get a loud startup error rather than a silent
+// reject-every-tap rollout.
 const NXP_ROOT_P256_PUBKEY_HEX =
   '00'.repeat(65); // TODO: replace with real NXP JCOP 5 attestation root pubkey
 const INFINEON_ROOT_P256_PUBKEY_HEX =
   '00'.repeat(65); // TODO: replace with real Infineon Secora attestation root pubkey
+
+/**
+ * Boot-time assertion: refuse to run in `strict` mode while BOTH vendor
+ * root pins are still the `'00' * 65` placeholder.  Call once at service
+ * start (see services/rca/src/index.ts).  This closes audit finding N-2:
+ * a misconfigured prod deploy otherwise silently rejects every card tap
+ * because every cert-chain validation against an all-zero pubkey fails.
+ */
+export function assertAttestationPinsForMode(mode: AttestationMode): void {
+  if (mode !== 'strict') return;
+  const nxpPlaceholder = /^0+$/.test(NXP_ROOT_P256_PUBKEY_HEX);
+  const infPlaceholder = /^0+$/.test(INFINEON_ROOT_P256_PUBKEY_HEX);
+  if (nxpPlaceholder && infPlaceholder) {
+    throw new Error(
+      'PALISADE_ATTESTATION_MODE=strict is set, but NXP_ROOT_P256_PUBKEY_HEX ' +
+        'and INFINEON_ROOT_P256_PUBKEY_HEX are still the all-zero ' +
+        'placeholders in attestation-verifier.ts.  Strict mode with placeholder ' +
+        'pins rejects EVERY card; flip back to permissive OR commit the real ' +
+        'vendor root public keys first.',
+    );
+  }
+}
 
 // Vendor OID prefixes in the leaf cert's Subject or Issuer DN.  Used to
 // auto-detect which vendor root to verify against.  Reserved for future

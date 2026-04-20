@@ -30,7 +30,13 @@ export function createDataPrepRouter(): Router {
   // POST /api/data-prep/prepare
   router.post('/prepare', async (req, res) => {
     const parsed = prepareSchema.safeParse(req.body);
-    if (!parsed.success) throw badRequest('validation_failed', parsed.error.message);
+    if (!parsed.success) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[err] data-prep/prepare validation_failed paths=[${parsed.error.issues.map((i) => i.path.join('.')).join(',')}]`,
+      );
+      throw badRequest('validation_failed', 'Request failed validation');
+    }
 
     const result = await service.prepareCard(parsed.data);
     res.status(201).json(result);

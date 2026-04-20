@@ -22,12 +22,19 @@ import { requireSignedRequest, captureRawBody } from '@palisade/service-auth';
 import { errorMiddleware } from '@palisade/core';
 import { prisma } from '@palisade/db';
 import { verifyHandoff, HandoffError } from '@palisade/handoff';
+import { assertAttestationPinsForMode } from './services/attestation-verifier.js';
 
 import { getRcaConfig } from './env.js';
 import { createProvisionRouter } from './routes/provision.routes.js';
 import { handleRelayConnection } from './ws/relay-handler.js';
 
 const config = getRcaConfig();
+
+// Boot-time invariant: refuse to start in strict attestation mode while
+// the vendor root public-key pins are still placeholders.  Otherwise
+// strict mode silently rejects every tap (N-2 from the PCI audit).
+assertAttestationPinsForMode(config.PALISADE_ATTESTATION_MODE);
+
 const app = express();
 const server = createServer(app);
 

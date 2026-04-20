@@ -43,6 +43,9 @@ const OPERATIONS = [
   'install_payment_applet',
   'personalise_payment_applet',
   'reset_pa_state',
+  'reprovision_card',
+  'activate_card',
+  'revoke_card',
   'uninstall_pa',
   'uninstall_t4t',
   'uninstall_receiver',
@@ -76,7 +79,13 @@ export function createCardOpRouter(): Router {
   router.post('/start', cognitoAdmin, async (req, res) => {
     const parsed = startSchema.safeParse(req.body);
     if (!parsed.success) {
-      throw badRequest('validation_failed', parsed.error.message);
+      // PCI 6.2.4 / 10.2 — don't leak Zod's field names + regex shapes to
+      // the client.  Log paths server-side; generic message to caller.
+      // eslint-disable-next-line no-console
+      console.log(
+        `[err] POST /api/admin/card-op/start validation_failed paths=[${parsed.error.issues.map((i) => i.path.join('.')).join(',')}]`,
+      );
+      throw badRequest('validation_failed', 'Request failed validation');
     }
     const { operation, cardRef } = parsed.data;
 

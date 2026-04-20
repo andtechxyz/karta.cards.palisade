@@ -25,6 +25,14 @@ export const OPERATIONS = [
   // the PA applet (INS_WIPE), marks SADs consumed, flips Card to ACTIVATED
   // so next tap gets fresh provisioning.
   'reprovision_card',
+  // activate_card: patent C5 explicit state transition.  Sends pav2's
+  // INS_ACTIVATE (0x80 EB) to flip T4T applet SHIPPED → ACTIVATED.
+  // Required on pav2 cards to escape the odd/even SUN-serve rejection.
+  'activate_card',
+  // revoke_card: patent C11 on-chip revocation.  Sends pav2's INS_REVOKE
+  // (0x80 ED) — irreversibly flips applet to BLOCKED and zeroes keys.
+  // Also marks Card.status=REVOKED in DB for defence-in-depth.
+  'revoke_card',
   'uninstall_pa',
   'uninstall_t4t',
   'uninstall_receiver',

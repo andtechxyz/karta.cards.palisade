@@ -23,7 +23,13 @@ export function createProvisionRouter(): Router {
 
   router.post('/start', async (req, res) => {
     const parsed = startSchema.safeParse(req.body);
-    if (!parsed.success) throw badRequest('validation_failed', parsed.error.message);
+    if (!parsed.success) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[err] rca/provision/start validation_failed paths=[${parsed.error.issues.map((i) => i.path.join('.')).join(',')}]`,
+      );
+      throw badRequest('validation_failed', 'Request failed validation');
+    }
 
     const session = await sessionManager.startSession(parsed.data.proxyCardId);
 

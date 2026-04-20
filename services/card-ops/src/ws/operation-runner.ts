@@ -28,6 +28,8 @@ import { runInstallPaymentApplet } from '../operations/install-payment-applet.js
 import { runPersonalisePaymentApplet } from '../operations/personalise-payment-applet.js';
 import { runResetPaState } from '../operations/reset-pa-state.js';
 import { runReprovisionCard } from '../operations/reprovision-card.js';
+import { runActivateCard } from '../operations/activate-card.js';
+import { runRevokeCard } from '../operations/revoke-card.js';
 import { ApduAuditLogger } from './apdu-audit.js';
 
 type CardOpSessionWithCard = Prisma.CardOpSessionGetPayload<{ include: { card: true } }>;
@@ -83,6 +85,12 @@ export async function runOperation(ctx: OperationContext): Promise<void> {
         break;
       case 'reprovision_card':
         terminal = await runReprovisionCard(session, io);
+        break;
+      case 'activate_card':
+        terminal = await runActivateCard(session, io);
+        break;
+      case 'revoke_card':
+        terminal = await runRevokeCard(session, io);
         break;
       // Phase 3 stubs — wired up so the plumbing is exercised.
       //

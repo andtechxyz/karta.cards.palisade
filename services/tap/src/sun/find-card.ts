@@ -208,8 +208,13 @@ export async function findCardByPicc(
         continue;
       }
       uid = Buffer.from(uidHex, 'hex');
-      // Refresh TTL on a hit.
-      cachePut(uidHex, { ...cached, expiresAt: Date.now() + CACHE_TTL_MS });
+      // Refresh TTL on a hit.  IMPORTANT: do NOT route through cachePut(),
+      // which zeros the previous entry's keys before swapping in the new
+      // one — here the new entry holds the SAME Buffer refs as the
+      // previous entry (spread preserves references), so cachePut would
+      // zero its own keys.  Post-audit fix (N-1) — directly mutate the
+      // existing entry's expiresAt; Map retains insertion order.
+      cached.expiresAt = Date.now() + CACHE_TTL_MS;
       return {
         cardId: cached.cardId,
         cardStatus: cached.cardStatus,

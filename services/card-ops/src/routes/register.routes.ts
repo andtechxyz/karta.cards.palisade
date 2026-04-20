@@ -28,7 +28,11 @@ export function createRegisterRouter(): Router {
   router.post('/register', async (req, res) => {
     const parsed = registerSchema.safeParse(req.body);
     if (!parsed.success) {
-      throw badRequest('validation_failed', parsed.error.message);
+      // eslint-disable-next-line no-console
+      console.log(
+        `[err] card-ops/register validation_failed paths=[${parsed.error.issues.map((i) => i.path.join('.')).join(',')}]`,
+      );
+      throw badRequest('validation_failed', 'Request failed validation');
     }
     const { sessionId, cardId, operation } = parsed.data;
 
