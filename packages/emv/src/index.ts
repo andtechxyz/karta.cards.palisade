@@ -39,6 +39,25 @@ export { APDUBuilder } from './apdu-builder.js';
 export { buildIccPkCertificate } from './icc-cert-builder.js';
 export type { IccCertInput } from './icc-cert-builder.js';
 
+// ParamBundle path — MChip CVN 18 chip-computed-DGI prototype.
+// See PROTOTYPE_PLAN.md at worktree root for architecture context.
+export {
+  ParamTag,
+  MAX_FIELD_LEN,
+  buildParamBundle,
+  parseParamBundle,
+  referenceBundleForJcDev,
+  loadGoldenBundle,
+} from './param-bundle-builder.js';
+export type { ParamBundleInput, ParamTagValue } from './param-bundle-builder.js';
+export {
+  MCHIP_CVN_18,
+  mapMChipToParamBundle,
+  buildMChipParamBundle,
+  simulateMChipChipBuild,
+} from './scheme-mchip.js';
+export type { McipMapperInput, SimulatedChipDgis } from './scheme-mchip.js';
+
 // Embossing file parsing
 export type { EmbossingParser, EmbossingRecord, ParseResult, ParseError } from './embossing-parser.js';
 export { getParser, parsers, csvParser, fixedWidthParser } from './parsers/index.js';
