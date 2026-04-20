@@ -88,6 +88,39 @@ export const APDUBuilder = {
   },
 
   /**
+   * pav2 GET_CHALLENGE command (CLA=80 INS=EC Le=10).  Targets the
+   * Palisade T4T v2 applet (AID D2760000850101) and returns 16 bytes of
+   * on-chip RNG output.  Used by patent C4 "nonce binding" — the RCA
+   * fetches a fresh chip challenge, binds it into the provenance
+   * audit trail + (future) the SAD payload, and the PA (post-update)
+   * verifies the bound challenge matches the last one pav2 issued
+   * before committing a SAD.
+   *
+   * The command is callable in any pav2 state (SHIPPED / ACTIVATED /
+   * BLOCKED) — entropy generation is a pure side-effect.  The applet
+   * does NOT record the challenge internally; cross-applet state
+   * sharing requires a JC shareable interface that's deferred until
+   * the PA + pav2 land together.  Today the server-side uses the
+   * returned bytes as a uniqueness token for the provisioning audit
+   * trail only.
+   */
+  getChallenge(): string {
+    return '80EC000010';
+  },
+
+  /**
+   * SELECT pav2 T4T applet by AID (D2760000850101).  Convenience
+   * wrapper for the C4 GET_CHALLENGE flow where the RCA temporarily
+   * switches from the PA applet to pav2, fetches a challenge, and
+   * switches back.  The AID is fixed and standardised by NFC Forum
+   * for Type 4 Tag applications; karta-se v1 reuses it so off-the-
+   * shelf NDEF readers work without modification.
+   */
+  selectPav2(): string {
+    return '00A4040007D2760000850101';
+  },
+
+  /**
    * GP INSTALL [for install and make selectable].
    * CLA=80 INS=E6 P1=0C P2=00
    */

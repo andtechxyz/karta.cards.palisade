@@ -123,6 +123,24 @@ export interface PlanContext {
 const SELECT_PA_APDU = '00A4040008A00000006250414C';
 
 /**
+ * SELECT the Palisade T4T applet (pav2).  AID D2760000850101 is the NFC
+ * Forum Type 4 Tag standard AID and is what the chip SELECTs by default
+ * on a bare NDEF tap.  We re-SELECT from server-side to invoke
+ * INS_GET_CHALLENGE (C4 patent nonce binding).
+ */
+const SELECT_PAV2_APDU = '00A4040007D2760000850101';
+
+/**
+ * GET_CHALLENGE on pav2: CLA=80 INS=EC P1=00 P2=00 Le=10 (16 bytes).
+ * Patent C4 — the response is 16 bytes of on-chip RNG + SW=9000 that
+ * the server records into the session audit trail as a freshness token.
+ * A future PA-applet update (shareable interface) will enforce that
+ * each TRANSFER_SAD payload carries this same challenge before
+ * committing.
+ */
+const GET_CHALLENGE_APDU = '80EC000010';
+
+/**
  * GENERATE_KEYS with a single-byte payload 0x01 ("ECC P-256 keypair").
  * Passing a session-ID payload appends bytes the PA discards (or worse —
  * returns 6D00).  Matches the exact bytes in Palisade's SSD e2e trace.
@@ -174,23 +192,61 @@ export function schemeByteForIssuer(scheme: string): number {
 // ---------------------------------------------------------------------------
 
 /**
- * Build the full 5-step provisioning plan for a session.
+ * Opt-in flags for the plan builder.  Defaults preserve the 5-step
+ * sequence so existing provisioning flows are unchanged.
+ *
+ * `includeChipChallenge` — when set, prepend a SELECT pav2 +
+ *    GET_CHALLENGE round-trip to the plan.  The returned 16-byte
+ *    nonce is recorded by the server (session-manager audit path).
+ *    Adds ~2 extra NFC RTTs so it's off by default; flip on once the
+ *    mobile build + PA applet agree on the chip-side verification
+ *    protocol (patent C4 full enforcement).
+ */
+export interface PlanOptions {
+  includeChipChallenge?: boolean;
+}
+
+/**
+ * Build the full provisioning plan for a session.  The canonical
+ * sequence is 5 steps (SELECT_PA → GENERATE_KEYS → TRANSFER_SAD →
+ * FINAL_STATUS → CONFIRM); with `includeChipChallenge` set it becomes
+ * 7 steps (SELECT_PAV2 → GET_CHALLENGE → SELECT_PA → …).
  *
  * Pure function — takes only the context assembled by the caller.  Callers
  * that need a session-scoped plan (e.g. {@link buildPlanForSession}) load
  * the context from the database first and then delegate here.  This split
  * keeps the APDU-assembly code unit-testable without a DB.
  */
-export function buildProvisioningPlan(ctx: PlanContext): Plan {
+export function buildProvisioningPlan(
+  ctx: PlanContext,
+  options: PlanOptions = {},
+): Plan {
   const transferSadApdu = buildTransferSadApdu(ctx).toString('hex').toUpperCase();
 
-  const steps: PlanStep[] = [
-    { i: 0, apdu: SELECT_PA_APDU,     phase: 'select_pa',      progress: 0.05, expectSw: '9000' },
-    { i: 1, apdu: GENERATE_KEYS_APDU, phase: 'key_generation', progress: 0.25, expectSw: '9000' },
-    { i: 2, apdu: transferSadApdu,    phase: 'provisioning',   progress: 0.55, expectSw: '9000' },
-    { i: 3, apdu: FINAL_STATUS_APDU,  phase: 'finalizing',     progress: 0.80, expectSw: '9000' },
-    { i: 4, apdu: CONFIRM_APDU,       phase: 'confirming',     progress: 0.95, expectSw: '9000' },
-  ];
+  const steps: PlanStep[] = [];
+  let i = 0;
+
+  if (options.includeChipChallenge) {
+    // Patent C4 nonce binding — fetch a 16-byte chip challenge before
+    // the provisioning sequence.  Server records the response bytes
+    // (via the apdu audit log) as a freshness token bound to this
+    // ProvisioningSession.id.  Future PA applet update will verify
+    // the challenge appears inside TRANSFER_SAD before committing.
+    steps.push({
+      i: i++, apdu: SELECT_PAV2_APDU,  phase: 'c4_select_pav2',   progress: 0.02, expectSw: '9000',
+    });
+    steps.push({
+      i: i++, apdu: GET_CHALLENGE_APDU, phase: 'c4_get_challenge', progress: 0.04, expectSw: '9000',
+    });
+  }
+
+  steps.push(
+    { i: i++, apdu: SELECT_PA_APDU,     phase: 'select_pa',      progress: 0.05, expectSw: '9000' },
+    { i: i++, apdu: GENERATE_KEYS_APDU, phase: 'key_generation', progress: 0.25, expectSw: '9000' },
+    { i: i++, apdu: transferSadApdu,    phase: 'provisioning',   progress: 0.55, expectSw: '9000' },
+    { i: i++, apdu: FINAL_STATUS_APDU,  phase: 'finalizing',     progress: 0.80, expectSw: '9000' },
+    { i: i++, apdu: CONFIRM_APDU,       phase: 'confirming',     progress: 0.95, expectSw: '9000' },
+  );
 
   return { type: 'plan', version: 1, steps };
 }

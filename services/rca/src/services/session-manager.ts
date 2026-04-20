@@ -95,6 +95,97 @@ interface SadRecordShape {
 }
 
 // ---------------------------------------------------------------------------
+// SAD pre-decrypt cache (latency optimization)
+// ---------------------------------------------------------------------------
+//
+// `POST /api/provision/start` fires a KMS decrypt in the background and
+// stores the plaintext SAD keyed by sessionId.  By the time the mobile
+// app finishes its TLS handshake + WS upgrade + attestation round-trip,
+// the plaintext is almost always already cached — `buildPlanContext`
+// pulls from the cache instead of paying the 150-400ms KMS round-trip
+// inline during the SAD_TRANSFER window.
+//
+// Cache entry lifecycle:
+//   - Populated by `startSession()` (fire-and-forget background task).
+//   - Read by `buildPlanContext()` on cache hit; falls back to inline
+//     `DataPrepService.decryptSad` on miss or expiry.
+//   - Zeroed + removed by `consumeSadFromCache()` once the plaintext has
+//     been serialized into the TRANSFER_SAD APDU (match to S-2 scrub).
+//   - Sweep-expired after WS_TIMEOUT_SECONDS via `pruneSadCache()`;
+//     in-memory only, so an RCA restart starts clean.
+//
+// The cache is a module-level Map, not per-instance, because the WS
+// relay handler and the HTTP router create separate SessionManager
+// instances in the current design.  A singleton cache lets the /start
+// writer and the WS-driven reader be different SM instances.
+interface SadCacheEntry {
+  payload: Buffer;
+  /** Epoch-ms — when this entry becomes unusable. */
+  expiresAt: number;
+}
+const sadCache = new Map<string, SadCacheEntry>();
+// 60 seconds aligns with WS_TIMEOUT_SECONDS default; startSession reads
+// config.WS_TIMEOUT_SECONDS and passes it to the prime path, but we
+// also cap with this constant so a pathological config can't leak
+// plaintext SAD for hours.
+const SAD_CACHE_MAX_TTL_MS = 120_000;
+
+/**
+ * Fetch a cached plaintext SAD, deleting + scrubbing the entry on hit.
+ * Returns `null` if the cache entry is missing or expired (in which
+ * case the caller decrypts inline as a fallback).
+ */
+function consumeSadFromCache(sessionId: string): Buffer | null {
+  const entry = sadCache.get(sessionId);
+  if (!entry) return null;
+  sadCache.delete(sessionId);
+  if (entry.expiresAt < Date.now()) {
+    // Expired — still zero it before returning null so a later core
+    // dump doesn't leak the plaintext.
+    entry.payload.fill(0);
+    return null;
+  }
+  return entry.payload;
+}
+
+/**
+ * Store a pre-decrypted SAD in the cache.  TTL is clamped to
+ * `SAD_CACHE_MAX_TTL_MS` to prevent config-driven long-lived plaintext.
+ */
+function storeSadInCache(
+  sessionId: string,
+  payload: Buffer,
+  ttlMs: number,
+): void {
+  const clamped = Math.min(Math.max(ttlMs, 10_000), SAD_CACHE_MAX_TTL_MS);
+  sadCache.set(sessionId, {
+    payload,
+    expiresAt: Date.now() + clamped,
+  });
+}
+
+/**
+ * Best-effort sweep of expired SAD cache entries.  Run opportunistically
+ * at every startSession call so the map doesn't accumulate expired
+ * entries when the mobile never connects.  Scrubs plaintext on eviction.
+ */
+function pruneSadCache(): void {
+  const now = Date.now();
+  for (const [sid, entry] of sadCache) {
+    if (entry.expiresAt < now) {
+      entry.payload.fill(0);
+      sadCache.delete(sid);
+    }
+  }
+}
+
+/** Test hook: clear the module-level SAD cache between runs. */
+export function _resetSadCacheForTests(): void {
+  for (const [, entry] of sadCache) entry.payload.fill(0);
+  sadCache.clear();
+}
+
+// ---------------------------------------------------------------------------
 // Session Manager
 // ---------------------------------------------------------------------------
 
@@ -104,6 +195,10 @@ export class SessionManager {
    * Validates the card has a READY SAD record, creates a ProvisioningSession.
    */
   async startSession(proxyCardId: string): Promise<SessionState> {
+    // Opportunistic sweep of expired cache entries so the Map doesn't
+    // accumulate stale plaintext when mobiles abandon sessions.
+    pruneSadCache();
+
     // Find the SAD record
     const sadRecord = await prisma.sadRecord.findUnique({
       where: { proxyCardId },
@@ -122,6 +217,34 @@ export class SessionManager {
     });
 
     console.log(`[rca] session created: ${session.id} for card ${sadRecord.cardId}`);
+
+    // Fire-and-forget KMS decrypt so the plaintext is ready by the time
+    // the mobile app finishes TLS + WS open + attestation.  On failure
+    // we log and move on — the synchronous path in buildPlanContext
+    // will retry the decrypt with a proper error surface.  Saves
+    // 150-400ms off the critical SAD_TRANSFER window (patent C5 keeps
+    // the MK derivation pipeline asynchronous; this extends the same
+    // async pattern to the plaintext SAD fetch).
+    const config = getRcaConfig();
+    const encryptedBuf = Buffer.isBuffer(sadRecord.sadEncrypted)
+      ? sadRecord.sadEncrypted
+      : Buffer.from(sadRecord.sadEncrypted);
+    const ttlMs = (config.WS_TIMEOUT_SECONDS ?? 60) * 1000;
+    const sessionId = session.id;
+    // Don't await — we want the decrypt running concurrently with the
+    // response write + the mobile's WS handshake.  Errors are swallowed
+    // here but replayed inline on cache miss.
+    DataPrepService.decryptSad(
+      encryptedBuf,
+      config.KMS_SAD_KEY_ARN ?? '',
+      sadRecord.sadKeyVersion,
+    )
+      .then((payload) => storeSadInCache(sessionId, payload, ttlMs))
+      .catch((err) => {
+        console.warn(
+          `[rca] SAD pre-decrypt failed for ${redactSid(sessionId)}: ${err instanceof Error ? err.message : err} — will retry inline`,
+        );
+      });
 
     return {
       sessionId: session.id,
@@ -216,7 +339,11 @@ export class SessionManager {
     }
 
     const issuerProfile = session.card?.program?.issuerProfile ?? null;
-    const ctx = await this.buildPlanContext(issuerProfile, session.sadRecord);
+    const ctx = await this.buildPlanContext(
+      issuerProfile,
+      session.sadRecord,
+      sessionId,
+    );
     return buildProvisioningPlan(ctx);
   }
 
@@ -224,7 +351,9 @@ export class SessionManager {
    * Resolve a PlanContext from a session's IssuerProfile + SadRecord.
    *
    * Path A (happy): IssuerProfile has bankId/progId/postProvisionUrl/scheme
-   * and chipProfile.  Real SAD bytes are decrypted from SadRecord.
+   * and chipProfile.  Real SAD bytes are pulled from the pre-decrypt
+   * cache when available (populated in `startSession`); otherwise
+   * decrypted inline from SadRecord.sadEncrypted.
    *
    * Path B (RCA_ALLOW_MINIMAL_SAD=1 fallback): any of the required
    * IssuerProfile fields are missing.  We log a prominent warning and
@@ -236,6 +365,7 @@ export class SessionManager {
   private async buildPlanContext(
     issuerProfile: IssuerProfileShape | null,
     sadRecord: SadRecordShape | null,
+    sessionId?: string,
   ): Promise<PlanContext> {
     const complete =
       issuerProfile !== null &&
@@ -254,15 +384,22 @@ export class SessionManager {
         );
       }
 
-      const config = getRcaConfig();
-      const encryptedBuf = Buffer.isBuffer(sadRecord.sadEncrypted)
-        ? sadRecord.sadEncrypted
-        : Buffer.from(sadRecord.sadEncrypted);
-      const sadPayload = await DataPrepService.decryptSad(
-        encryptedBuf,
-        config.KMS_SAD_KEY_ARN ?? '',
-        sadRecord.sadKeyVersion,
-      );
+      // Prefer the pre-decrypted plaintext from startSession's background
+      // task when available.  Cache miss (pre-decrypt failed, or a
+      // restart between /start and WS open) → decrypt inline.  Both
+      // paths return the same Buffer shape downstream.
+      let sadPayload = sessionId ? consumeSadFromCache(sessionId) : null;
+      if (!sadPayload) {
+        const config = getRcaConfig();
+        const encryptedBuf = Buffer.isBuffer(sadRecord.sadEncrypted)
+          ? sadRecord.sadEncrypted
+          : Buffer.from(sadRecord.sadEncrypted);
+        sadPayload = await DataPrepService.decryptSad(
+          encryptedBuf,
+          config.KMS_SAD_KEY_ARN ?? '',
+          sadRecord.sadKeyVersion,
+        );
+      }
 
       const ip = issuerProfile as IssuerProfileShape & {
         bankId: number;
@@ -510,6 +647,7 @@ export class SessionManager {
     const ctx = await this.buildPlanContext(
       session.card?.program?.issuerProfile ?? null,
       session.sadRecord,
+      sessionId,
     );
     let transferApdu: Buffer;
     try {
@@ -577,16 +715,48 @@ export class SessionManager {
       fidoCredData = credId.toString('base64url');
     }
 
-    // Atomically commit the three provisioning outcomes — session →
-    // COMPLETE, card → PROVISIONED, SAD → CONSUMED — so a crash between
-    // them can't leave the DB in a split state (session complete but card
-    // still ACTIVATED, or card provisioned but SAD still READY for
-    // replay).  PCI 10.5 / patent C5 (pending → committed state machine).
+    // Latency optimization — the DB commit ($transaction) is not on the
+    // chip's critical path: CONFIRM (step 4) is what latches the chip
+    // state.  Previously we ran the $transaction BEFORE returning the
+    // CONFIRM APDU, charging 30-50ms of Postgres RTT against the tap
+    // window.  Now we:
+    //   1. Pre-fetch the card/sadRecord fields the response message
+    //      needs (cardRef, proxyCardId, chipSerial).
+    //   2. Return CONFIRM + complete so the phone can finalize the
+    //      chip immediately.
+    //   3. Run the atomic commit asynchronously; on failure, log
+    //      loudly and let the retention sweeper / admin surface the
+    //      inconsistency.
     //
-    // We load the session inside the transaction so the card/sad FKs are
-    // guaranteed current; this swaps the prior sequential load-then-write
-    // for a single atomic unit.
-    const session = await prisma.$transaction(async (tx) => {
+    // Crash semantics are unchanged from before this rewrite: if the
+    // server dies between sending CONFIRM and committing, the chip is
+    // physically PROVISIONED but the DB still reads ACTIVATED — the
+    // same failure mode the pre-rewrite code had between committing
+    // and sending CONFIRM (just flipped on which side of the WS
+    // response boundary the crash lands).  In both cases recovery is
+    // an admin-driven reprovision_card.
+    const preFetched = await prisma.provisioningSession.findUnique({
+      where: { id: sessionId },
+      include: { card: true, sadRecord: true },
+    });
+    if (!preFetched) {
+      await prisma.provisioningSession.update({
+        where: { id: sessionId },
+        data: { phase: 'FAILED', failedAt: new Date(), failureReason: 'session_missing' },
+      });
+      return [{ type: 'error', code: 'session_missing', message: 'Session vanished between FINAL_STATUS and commit' }];
+    }
+
+    // Kick off the atomic commit in the background.  Patent C5 / PCI
+    // 10.5 semantics preserved — the $transaction still groups the
+    // three writes so an individual write failure rolls the others
+    // back; only the *completion* is no longer on the WS wait path.
+    //
+    // The promise intentionally isn't awaited.  A parent catch is
+    // attached so we don't produce an unhandled rejection on DB
+    // outage; the callback fires from inside the same then-chain so
+    // it sees the committed state on success.
+    const commitPromise = prisma.$transaction(async (tx) => {
       const s = await tx.provisioningSession.update({
         where: { id: sessionId },
         data: {
@@ -607,17 +777,27 @@ export class SessionManager {
       });
       return s;
     });
-
-    console.log(`[rca] provisioning complete: session=${redactSid(sessionId)}, card=${redactSid(session.cardId)}`);
-
-    // Fire callback to activation service (async, non-blocking)
-    this.fireCallback(session.card.cardRef, session.card.chipSerial ?? '').catch((err) =>
-      console.error('[rca] callback failed:', err),
-    );
+    commitPromise
+      .then((s) => {
+        console.log(
+          `[rca] provisioning complete: session=${redactSid(sessionId)}, card=${redactSid(s.cardId)}`,
+        );
+        // Fire callback to activation service — best-effort, callback
+        // retries live on activation's idempotency path.
+        this.fireCallback(s.card.cardRef, s.card.chipSerial ?? '').catch((err) =>
+          console.error('[rca] callback failed:', err),
+        );
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(
+          `[rca] COMMIT FAILED session=${redactSid(sessionId)}: ${msg} — chip is provisioned but DB state is not; operator must reconcile via admin UI`,
+        );
+      });
 
     return [
       { type: 'apdu', hex: APDUBuilder.confirm(), phase: 'confirming', progress: 0.95 },
-      { type: 'complete', proxyCardId: session.sadRecord.proxyCardId },
+      { type: 'complete', proxyCardId: preFetched.sadRecord.proxyCardId },
     ];
   }
 

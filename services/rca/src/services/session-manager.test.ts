@@ -54,7 +54,7 @@ vi.mock('@palisade/data-prep/services/data-prep.service', () => ({
 // ---------------------------------------------------------------------------
 
 import { prisma } from '@palisade/db';
-import { SessionManager, type WSMessage } from './session-manager.js';
+import { SessionManager, _resetSadCacheForTests, type WSMessage } from './session-manager.js';
 import { _resetRcaConfig } from '../env.js';
 
 // ---------------------------------------------------------------------------
@@ -131,6 +131,10 @@ describe('SessionManager', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     _resetRcaConfig();
+    // The SAD pre-decrypt cache is module-level; tests that exercise
+    // handleMessage without going through startSession expect the cache
+    // to be empty so inline decryptSad is still observed by the mock.
+    _resetSadCacheForTests();
     delete process.env.RCA_ALLOW_MINIMAL_SAD;
     warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -321,9 +325,18 @@ describe('SessionManager', () => {
 
   describe('handleMessage — response in AWAITING_FINAL with success byte', () => {
     it('returns CONFIRM + complete, updates card to PROVISIONED', async () => {
-      (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
-        makeSession('AWAITING_FINAL'),
-      );
+      // The implementation pre-fetches the session (with card + sadRecord
+      // relations) so the response payload is ready before the DB commit
+      // kicks off asynchronously.  AWAITING_FINAL branch on the first
+      // findUnique (phase check) + same enriched shape on the second.
+      const enriched = {
+        ...makeSession('AWAITING_FINAL'),
+        cardId: 'card_01',
+        sadRecordId: 'sad_01',
+        card: { cardRef: 'ref_01', chipSerial: 'CS001' },
+        sadRecord: { proxyCardId: 'pxy_abc123' },
+      };
+      (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(enriched);
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue({
         ...makeSession('COMPLETE'),
         cardId: 'card_01',
@@ -348,6 +361,11 @@ describe('SessionManager', () => {
       expect(responses[0].phase).toBe('confirming');
       expect(responses[1].type).toBe('complete');
       expect(responses[1].proxyCardId).toBe('pxy_abc123');
+
+      // The atomic commit runs asynchronously now — flush the microtask
+      // queue so the $transaction callback (mocked to run inline) has
+      // executed by the time we assert on card.update / sadRecord.update.
+      await new Promise((r) => setImmediate(r));
 
       // Card status updated to PROVISIONED
       expect(prisma.card.update).toHaveBeenCalledWith(
