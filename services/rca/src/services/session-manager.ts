@@ -567,28 +567,35 @@ export class SessionManager {
       fidoCredData = credId.toString('base64url');
     }
 
-    // Update session to COMPLETE
-    const session = await prisma.provisioningSession.update({
-      where: { id: sessionId },
-      data: {
-        phase: 'COMPLETE',
-        completedAt: new Date(),
-        provenance: provHash,
-        fidoCredData,
-      },
-      include: { card: true, sadRecord: true },
-    });
-
-    // Update card status to PROVISIONED
-    await prisma.card.update({
-      where: { id: session.cardId },
-      data: { status: 'PROVISIONED', provisionedAt: new Date() },
-    });
-
-    // Mark SAD as consumed
-    await prisma.sadRecord.update({
-      where: { id: session.sadRecordId },
-      data: { status: 'CONSUMED' },
+    // Atomically commit the three provisioning outcomes — session →
+    // COMPLETE, card → PROVISIONED, SAD → CONSUMED — so a crash between
+    // them can't leave the DB in a split state (session complete but card
+    // still ACTIVATED, or card provisioned but SAD still READY for
+    // replay).  PCI 10.5 / patent C5 (pending → committed state machine).
+    //
+    // We load the session inside the transaction so the card/sad FKs are
+    // guaranteed current; this swaps the prior sequential load-then-write
+    // for a single atomic unit.
+    const session = await prisma.$transaction(async (tx) => {
+      const s = await tx.provisioningSession.update({
+        where: { id: sessionId },
+        data: {
+          phase: 'COMPLETE',
+          completedAt: new Date(),
+          provenance: provHash,
+          fidoCredData,
+        },
+        include: { card: true, sadRecord: true },
+      });
+      await tx.card.update({
+        where: { id: s.cardId },
+        data: { status: 'PROVISIONED', provisionedAt: new Date() },
+      });
+      await tx.sadRecord.update({
+        where: { id: s.sadRecordId },
+        data: { status: 'CONSUMED' },
+      });
+      return s;
     });
 
     console.log(`[rca] provisioning complete: session=${sessionId}, card=${session.cardId}`);
@@ -804,23 +811,29 @@ export class SessionManager {
    * APDU send (phone already executed it before we got here).
    */
   private async handlePlanConfirm(sessionId: string): Promise<WSMessage[]> {
-    const session = await prisma.provisioningSession.update({
-      where: { id: sessionId },
-      data: {
-        phase: 'COMPLETE',
-        completedAt: new Date(),
-      },
-      include: { card: true, sadRecord: true },
-    });
-
-    await prisma.card.update({
-      where: { id: session.cardId },
-      data: { status: 'PROVISIONED', provisionedAt: new Date() },
-    });
-
-    await prisma.sadRecord.update({
-      where: { id: session.sadRecordId },
-      data: { status: 'CONSUMED' },
+    // Same atomicity argument as handleFinalStatus in the classical path:
+    // a crash between writes would leave an orphaned COMPLETE session with
+    // an ACTIVATED (not PROVISIONED) card and a READY (not CONSUMED) SAD.
+    // $transaction groups them so either all commit or none do.  PCI 10.5 /
+    // patent C5.
+    const session = await prisma.$transaction(async (tx) => {
+      const s = await tx.provisioningSession.update({
+        where: { id: sessionId },
+        data: {
+          phase: 'COMPLETE',
+          completedAt: new Date(),
+        },
+        include: { card: true, sadRecord: true },
+      });
+      await tx.card.update({
+        where: { id: s.cardId },
+        data: { status: 'PROVISIONED', provisionedAt: new Date() },
+      });
+      await tx.sadRecord.update({
+        where: { id: s.sadRecordId },
+        data: { status: 'CONSUMED' },
+      });
+      return s;
     });
 
     console.log(

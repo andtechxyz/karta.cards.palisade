@@ -8,8 +8,8 @@ import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 // mocked for the same reason as before — no DB in unit tests.
 // ---------------------------------------------------------------------------
 
-vi.mock('@palisade/db', () => ({
-  prisma: {
+vi.mock('@palisade/db', () => {
+  const p: Record<string, unknown> = {
     provisioningSession: {
       create: vi.fn(),
       findUnique: vi.fn(),
@@ -22,8 +22,14 @@ vi.mock('@palisade/db', () => ({
     card: {
       update: vi.fn(),
     },
-  },
-}));
+  };
+  // $transaction passes the same `prisma` object back as `tx` so the
+  // callback sees the SAME mocked models that top-level tests assert on.
+  // Real Prisma gives the caller an isolated tx client; tests don't need
+  // that fidelity.
+  p.$transaction = vi.fn((cb: (tx: unknown) => unknown) => cb(p));
+  return { prisma: p };
+});
 
 vi.mock('@palisade/service-auth', () => ({
   signRequest: vi.fn().mockReturnValue('HMAC test-signature'),

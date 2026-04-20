@@ -408,6 +408,11 @@ model Card {
   updatedAt DateTime @updatedAt
 
   @@index([cognitoSub])
+  // Hot path: tap-service find-card filters Cards by (programId, status IN
+  // ACTIVATED|PROVISIONED) before trial-decrypting.  Without a composite
+  // index Postgres full-scans the programId index and filters status in
+  // memory; at 10K+ cards per program that's measurable per-tap latency.
+  @@index([programId, status])
 }
 
 // Short-lived, single-use server-side session minted when the cardholder taps
