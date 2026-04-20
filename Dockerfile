@@ -111,6 +111,10 @@ COPY --from=builder /app/packages/provisioning-client/dist/         packages/pro
 COPY --from=builder /app/packages/provisioning-client/package.json  packages/provisioning-client/
 COPY --from=builder /app/packages/sdm-keys/dist/             packages/sdm-keys/dist/
 COPY --from=builder /app/packages/sdm-keys/package.json      packages/sdm-keys/
+COPY --from=builder /app/packages/admin-config/dist/         packages/admin-config/dist/
+COPY --from=builder /app/packages/admin-config/package.json  packages/admin-config/
+COPY --from=builder /app/packages/metrics/dist/              packages/metrics/dist/
+COPY --from=builder /app/packages/metrics/package.json       packages/metrics/
 
 # Copy the target service's compiled output
 ARG SERVICE
