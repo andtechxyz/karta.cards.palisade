@@ -243,6 +243,29 @@ Emitted metrics (CloudWatch namespace `tap`):
 
 Set `METRICS_BACKEND=cloudwatch` on `vera-tap` task def the same way.
 
+Emitted metrics (CloudWatch namespace `activation`):
+
+| Metric | Dimensions | When |
+|---|---|---|
+| `activation.register.ok` | — | `POST /api/cards/register` succeeded |
+| `activation.register.fail` | `reason` ∈ {duplicate, vault_rejected, validation, other} | Register threw |
+| `activation.provision_start.ok` | — | Mobile /provisioning/start returned a wsUrl |
+| `activation.provision_start.fail` | `reason` ∈ {card_not_found, invalid_status, sad_not_staged, sad_not_ready, rca_failed} | Start rejected |
+| `activation.provision_complete.ok` | — | RCA callback flipped Card → PROVISIONED |
+| `activation.provision_complete.fail` | `reason` ∈ {card_not_found, invalid_status} | Callback rejected |
+| `activation.admin_card_op.started` | `op` ∈ {install_pa, reprovision_card, revoke_card, …} | Admin fired a card-op start |
+
+Set `METRICS_BACKEND=cloudwatch` on `vera-activation` task def the same way.
+
+Useful activation-side alarms:
+- `activation.provision_complete.fail` > 0 over a 5 min window →
+  callback mismatch (common: RCA finished but card already PROVISIONED
+  from a previous attempt — often the signal a retry is looping)
+- `activation.register.fail{reason=vault_rejected}` > 1 / min →
+  Vera vault is down or rejecting; register flow is blocked
+- `activation.provision_start.fail{reason=rca_failed}` > 0 → RCA
+  5xx loop or HMAC auth drift
+
 Useful CloudWatch alarms to wire up:
 - `rca.plan_step.rejected` > 5 in 5 min → mobile bug or attack
 - `rca.attestation.verify{result=fail}` > 0 in strict mode → real chip rejection

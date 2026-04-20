@@ -12,6 +12,7 @@
     { "path": "../../packages/core" },
     { "path": "../../packages/db" },
     { "path": "../../packages/handoff" },
+    { "path": "../../packages/metrics" },
     { "path": "../../packages/retention" },
     { "path": "../../packages/sdm-keys" },
     { "path": "../../packages/service-auth" },

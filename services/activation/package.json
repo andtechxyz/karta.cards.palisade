@@ -8,21 +8,22 @@
     "build": "tsc -b"
   },
   "dependencies": {
+    "@palisade/admin-config": "*",
+    "@palisade/cognito-auth": "*",
     "@palisade/core": "*",
     "@palisade/db": "*",
     "@palisade/handoff": "*",
+    "@palisade/metrics": "^0.0.1",
     "@palisade/retention": "*",
     "@palisade/sdm-keys": "*",
     "@palisade/service-auth": "*",
     "@palisade/vault-client": "*",
-    "@palisade/admin-config": "*",
-    "@palisade/cognito-auth": "*",
     "@palisade/webauthn": "*",
+    "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "undici": "^7.3.0",
     "express": "^4.21.2",
     "express-async-errors": "^3.1.0",
-    "cors": "^2.8.5",
+    "undici": "^7.3.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {

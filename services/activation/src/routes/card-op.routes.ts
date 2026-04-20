@@ -31,6 +31,7 @@ import { signRequest } from '@palisade/service-auth';
 import { signHandoff } from '@palisade/handoff';
 import { getAdminEmails } from '@palisade/admin-config';
 import { getActivationConfig } from '../env.js';
+import { metrics } from '../metrics.js';
 
 // Explicit enum so Zod rejects typos at the router boundary.  Keep this
 // list in sync with services/card-ops/src/operations/index.ts — adding
@@ -108,6 +109,7 @@ export function createCardOpRouter(): Router {
         phase: 'READY',
       },
     });
+    metrics().counter('activation.admin_card_op.started', 1, { op: operation });
 
     if (!config.CARD_OPS_URL) {
       // Local dev / test without card-ops running — still return a sessionId

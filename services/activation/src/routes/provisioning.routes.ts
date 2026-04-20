@@ -7,6 +7,7 @@ import { createCognitoAuthMiddleware } from '@palisade/cognito-auth';
 import { requireSignedRequest, signRequest } from '@palisade/service-auth';
 import { request } from 'undici';
 import { getActivationConfig } from '../env.js';
+import { metrics } from '../metrics.js';
 
 export function createProvisioningRouter(): Router {
   const router = Router();
@@ -35,14 +36,24 @@ export function createProvisioningRouter(): Router {
       where: { id: payload.sub },
       select: { id: true, cardRef: true, status: true, proxyCardId: true, cognitoSub: true },
     });
-    if (!card) throw notFound('card_not_found', 'Card not found');
-    if (card.status !== 'ACTIVATED') throw badRequest('invalid_status', `Card is ${card.status}, expected ACTIVATED`);
+    if (!card) {
+      metrics().counter('activation.provision_start.fail', 1, { reason: 'card_not_found' });
+      throw notFound('card_not_found', 'Card not found');
+    }
+    if (card.status !== 'ACTIVATED') {
+      metrics().counter('activation.provision_start.fail', 1, {
+        reason: 'invalid_status',
+        status: card.status,
+      });
+      throw badRequest('invalid_status', `Card is ${card.status}, expected ACTIVATED`);
+    }
     // Guard: SAD must have been staged at register-time (or via the admin
     // re-stage endpoint).  If proxyCardId is null, data-prep was unreachable
     // when the card was first registered and SAD never landed — fail loudly
     // with an actionable error instead of forwarding null to RCA and getting
     // back a cryptic Zod validation 400.
     if (!card.proxyCardId) {
+      metrics().counter('activation.provision_start.fail', 1, { reason: 'sad_not_staged' });
       throw badRequest(
         'sad_not_staged',
         'No SAD staged for this card (proxyCardId is null) — data-prep was unreachable at registration. Ask an admin to re-stage SAD.',
@@ -87,6 +98,10 @@ export function createProvisioningRouter(): Router {
         // Surface the RCA's body to logs so we can debug auth/contract drift.
         const errText = await rcaResp.body.text();
         console.error(`[activation] RCA /provision/start ${rcaResp.statusCode}: ${errText}`);
+        metrics().counter('activation.provision_start.fail', 1, {
+          reason: 'rca_failed',
+          status: String(rcaResp.statusCode),
+        });
         throw badRequest('rca_error', 'Failed to start provisioning session');
       }
 
@@ -107,6 +122,7 @@ export function createProvisioningRouter(): Router {
       select: { id: true },
     });
     if (!sadRecord) {
+      metrics().counter('activation.provision_start.fail', 1, { reason: 'sad_not_ready' });
       throw badRequest(
         'sad_not_ready',
         `No READY SAD record for proxyCardId ${card.proxyCardId} — re-stage via admin and retry.`,
@@ -136,6 +152,7 @@ export function createProvisioningRouter(): Router {
           }),
     ]);
 
+    metrics().counter('activation.provision_start.ok', 1);
     res.status(201).json({
       sessionId,
       wsUrl,
