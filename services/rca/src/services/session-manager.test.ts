@@ -54,7 +54,13 @@ vi.mock('@palisade/data-prep/services/data-prep.service', () => ({
 // ---------------------------------------------------------------------------
 
 import { prisma } from '@palisade/db';
-import { SessionManager, _resetSadCacheForTests, type WSMessage } from './session-manager.js';
+import {
+  SessionManager,
+  _resetSadCacheForTests,
+  _resetPlanStepStateForTests,
+  _seedPlanStepStateForTests,
+  type WSMessage,
+} from './session-manager.js';
 import { _resetRcaConfig } from '../env.js';
 
 // ---------------------------------------------------------------------------
@@ -131,10 +137,12 @@ describe('SessionManager', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     _resetRcaConfig();
-    // The SAD pre-decrypt cache is module-level; tests that exercise
-    // handleMessage without going through startSession expect the cache
-    // to be empty so inline decryptSad is still observed by the mock.
+    // The SAD pre-decrypt cache and the plan-step cursor are both
+    // module-level Maps; tests that exercise handleMessage without
+    // going through startSession / buildPlanForSession need both
+    // maps empty so their mocked flows aren't polluted by prior runs.
     _resetSadCacheForTests();
+    _resetPlanStepStateForTests();
     delete process.env.RCA_ALLOW_MINIMAL_SAD;
     warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -652,6 +660,9 @@ describe('SessionManager', () => {
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
         makeSession('PLAN_SENT'),
       );
+      // Canonical 5-step plan: seed cursor at lastProcessed=0 so step 1
+      // is the expected next index.
+      _seedPlanStepStateForTests('session_01', 5, 0);
 
       const msg: WSMessage = {
         type: 'response',
@@ -694,6 +705,7 @@ describe('SessionManager', () => {
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
         makeSession('PLAN_SENT'),
       );
+      _seedPlanStepStateForTests('session_01', 5, 0);
 
       await mgr.handleMessage('session_01', {
         type: 'response',
@@ -716,6 +728,7 @@ describe('SessionManager', () => {
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
         makeSession('AWAITING_CONFIRM'),
       );
+      _seedPlanStepStateForTests('session_01', 5, 2);
 
       const msg: WSMessage = {
         type: 'response',
@@ -742,6 +755,7 @@ describe('SessionManager', () => {
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
         makeSession('FAILED'),
       );
+      _seedPlanStepStateForTests('session_01', 5, 2);
 
       const msg: WSMessage = {
         type: 'response',
@@ -774,6 +788,7 @@ describe('SessionManager', () => {
       });
       (prisma.card.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
       (prisma.sadRecord.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      _seedPlanStepStateForTests('session_01', 5, 3);
 
       const msg: WSMessage = { type: 'response', i: 4, hex: '', sw: '9000' };
       const responses = await mgr.handleMessage('session_01', msg);
@@ -797,6 +812,7 @@ describe('SessionManager', () => {
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
         makeSession('FAILED'),
       );
+      _seedPlanStepStateForTests('session_01', 5, 1);
 
       const msg: WSMessage = { type: 'response', i: 2, hex: '', sw: '6A82' };
       const responses = await mgr.handleMessage('session_01', msg);
@@ -816,13 +832,88 @@ describe('SessionManager', () => {
     });
 
     it('step 0 (SELECT PA) and step 2 (TRANSFER_SAD) responses are logged but emit nothing', async () => {
+      // Fresh cursor at -1 for the first step 0; after processing the
+      // cursor advances to 0, then we need it at 1 to accept step 2.
+      _seedPlanStepStateForTests('session_01', 5, -1);
       const select0: WSMessage = { type: 'response', i: 0, hex: '6F10A00000006250414C', sw: '9000' };
       const responses0 = await mgr.handleMessage('session_01', select0);
       expect(responses0).toHaveLength(0);
 
+      // Fast-forward the cursor so step 2 is the next expected index
+      // (skipping the step-1 keygen test dance in this specific case).
+      _seedPlanStepStateForTests('session_01', 5, 1);
       const transfer2: WSMessage = { type: 'response', i: 2, hex: '00020021', sw: '9000' };
       const responses2 = await mgr.handleMessage('session_01', transfer2);
       expect(responses2).toHaveLength(0);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // handlePlanResponse — step cursor enforcement (patent C5)
+  // -------------------------------------------------------------------------
+  describe('handlePlanResponse — step cursor enforcement', () => {
+    it('rejects step with no prior plan initialization (plan_step_state_missing)', async () => {
+      const msg: WSMessage = { type: 'response', i: 1, hex: '00', sw: '9000' };
+      const responses = await mgr.handleMessage('session_unknown', msg);
+      expect(responses).toHaveLength(1);
+      expect(responses[0].type).toBe('error');
+      expect(responses[0].code).toBe('plan_step_invalid');
+      expect(responses[0].message).toContain('plan_step_state_missing');
+    });
+
+    it('rejects a replay (same index twice)', async () => {
+      _seedPlanStepStateForTests('session_01', 5, 2);
+      const msg: WSMessage = { type: 'response', i: 2, hex: '00', sw: '9000' };
+      const responses = await mgr.handleMessage('session_01', msg);
+      expect(responses).toHaveLength(1);
+      expect(responses[0].code).toBe('plan_step_invalid');
+      expect(responses[0].message).toContain('plan_step_replay');
+    });
+
+    it('rejects a skipped index (+2 from lastProcessed)', async () => {
+      _seedPlanStepStateForTests('session_01', 5, 0);
+      const msg: WSMessage = { type: 'response', i: 2, hex: '00', sw: '9000' };
+      const responses = await mgr.handleMessage('session_01', msg);
+      expect(responses).toHaveLength(1);
+      expect(responses[0].code).toBe('plan_step_invalid');
+      expect(responses[0].message).toContain('plan_step_skip');
+    });
+
+    it('rejects an out-of-range index (>= expectedSteps)', async () => {
+      _seedPlanStepStateForTests('session_01', 5, 4);
+      const msg: WSMessage = { type: 'response', i: 5, hex: '00', sw: '9000' };
+      const responses = await mgr.handleMessage('session_01', msg);
+      expect(responses).toHaveLength(1);
+      expect(responses[0].code).toBe('plan_step_invalid');
+      expect(responses[0].message).toContain('plan_step_out_of_range');
+    });
+
+    it('accepts sequential advance 0 → 1 → 2 → 3 → 4 without rejection', async () => {
+      (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...makeSession('COMPLETE'),
+        cardId: 'card_01',
+        sadRecordId: 'sad_01',
+        card: { cardRef: 'ref_01', chipSerial: 'CS001' },
+        sadRecord: { proxyCardId: 'pxy_abc123' },
+      });
+      (prisma.card.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      (prisma.sadRecord.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
+
+      _seedPlanStepStateForTests('session_01', 5, -1);
+      for (let i = 0; i <= 4; i++) {
+        const isFinal = i === 3;
+        const hex = isFinal ? '01' + 'CC'.repeat(32) : '';
+        const responses = await mgr.handleMessage('session_01', {
+          type: 'response',
+          i,
+          hex,
+          sw: '9000',
+        } as WSMessage);
+        // None of the intermediate steps should produce plan_step_invalid
+        expect(
+          responses.some((r) => r.code === 'plan_step_invalid'),
+        ).toBe(false);
+      }
     });
   });
 });

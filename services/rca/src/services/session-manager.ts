@@ -186,6 +186,125 @@ export function _resetSadCacheForTests(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Plan-mode step sequencing (patent C5 state-machine enforcement)
+// ---------------------------------------------------------------------------
+//
+// Plan-mode trusts the mobile app to execute steps in order.  A rogue or
+// buggy client could:
+//   1. Skip step 1 (GENERATE_KEYS) so attestation never runs, then jump
+//      to step 3 (FINAL_STATUS) and trick the server into committing a
+//      provisioning flow we never verified the chip for.
+//   2. Replay step 3 or step 4 to fire the activation callback twice or
+//      double-advance the state machine.
+//   3. Jump past the chip-challenge step when includeChipChallenge is
+//      opted in — defeating the C4 nonce binding entirely.
+//
+// The server-side defence is a per-session step cursor: we require the
+// first inbound `i` to be 0 and each subsequent `i` to be exactly
+// `lastProcessed + 1`.  Anything else returns an error and FAILs the
+// session.  The cursor is initialized when buildPlanForSession() runs
+// and cleared on terminal state or sweep.
+//
+// Module-level Map (not per-instance) for the same reason the SAD cache
+// is — the HTTP router and the WS relay handler may instantiate
+// separate SessionManagers.
+interface PlanStepState {
+  /** Total steps in the plan (from PlanContext at build time). */
+  expectedSteps: number;
+  /** Index of the most recently accepted step.  -1 before step 0 runs. */
+  lastProcessed: number;
+  /** Epoch-ms expiry for sweep — aligns with the session WS timeout. */
+  expiresAt: number;
+}
+const planStepState = new Map<string, PlanStepState>();
+const PLAN_STEP_STATE_TTL_MS = 120_000;
+
+/**
+ * Initialize the step-sequence cursor for a plan-mode session.  Called
+ * by buildPlanForSession() once the plan is built but before it's sent
+ * on the wire.
+ */
+function initPlanStepState(sessionId: string, stepCount: number): void {
+  planStepState.set(sessionId, {
+    expectedSteps: stepCount,
+    lastProcessed: -1,
+    expiresAt: Date.now() + PLAN_STEP_STATE_TTL_MS,
+  });
+}
+
+/**
+ * Attempt to advance the step cursor to `i`.  Returns the previous
+ * `lastProcessed` on success so callers can tell if this is a first-time
+ * step completion; returns an error string on rejection (bad index,
+ * replay, skipped step, unknown session).
+ */
+function advancePlanStep(
+  sessionId: string,
+  i: number,
+): { ok: true; prior: number } | { ok: false; reason: string } {
+  const state = planStepState.get(sessionId);
+  if (!state) {
+    // Either a stale session (server restart lost the in-memory cursor)
+    // or a malicious response with no prior plan message.  Either way,
+    // reject — plan mode requires the server-side cursor.
+    return { ok: false, reason: 'plan_step_state_missing' };
+  }
+  if (state.expiresAt < Date.now()) {
+    planStepState.delete(sessionId);
+    return { ok: false, reason: 'plan_step_state_expired' };
+  }
+  if (i < 0 || i >= state.expectedSteps) {
+    return { ok: false, reason: `plan_step_out_of_range(got=${i},max=${state.expectedSteps - 1})` };
+  }
+  if (i <= state.lastProcessed) {
+    return { ok: false, reason: `plan_step_replay(got=${i},last=${state.lastProcessed})` };
+  }
+  if (i > state.lastProcessed + 1) {
+    return { ok: false, reason: `plan_step_skip(got=${i},last=${state.lastProcessed})` };
+  }
+  const prior = state.lastProcessed;
+  state.lastProcessed = i;
+  return { ok: true, prior };
+}
+
+/** Release the step cursor on terminal / sweep. */
+function clearPlanStepState(sessionId: string): void {
+  planStepState.delete(sessionId);
+}
+
+/** Best-effort sweep of expired plan-step cursors (called from startSession). */
+function prunePlanStepState(): void {
+  const now = Date.now();
+  for (const [sid, state] of planStepState) {
+    if (state.expiresAt < now) planStepState.delete(sid);
+  }
+}
+
+/** Test hook: clear the module-level plan-step cursor map between runs. */
+export function _resetPlanStepStateForTests(): void {
+  planStepState.clear();
+}
+
+/**
+ * Test hook: seed the cursor for a given sessionId.  Lets tests that
+ * exercise handlePlanResponse directly (without going through
+ * buildPlanForSession) skip the init dance.  Production code does NOT
+ * call this — the cursor is set only via initPlanStepState inside
+ * buildPlanForSession.
+ */
+export function _seedPlanStepStateForTests(
+  sessionId: string,
+  expectedSteps: number,
+  lastProcessed: number = -1,
+): void {
+  planStepState.set(sessionId, {
+    expectedSteps,
+    lastProcessed,
+    expiresAt: Date.now() + PLAN_STEP_STATE_TTL_MS,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Session Manager
 // ---------------------------------------------------------------------------
 
@@ -195,9 +314,11 @@ export class SessionManager {
    * Validates the card has a READY SAD record, creates a ProvisioningSession.
    */
   async startSession(proxyCardId: string): Promise<SessionState> {
-    // Opportunistic sweep of expired cache entries so the Map doesn't
-    // accumulate stale plaintext when mobiles abandon sessions.
+    // Opportunistic sweep of expired cache entries so the maps don't
+    // accumulate stale plaintext / step-cursors when mobiles abandon
+    // sessions.  Both are in-memory Maps, cheap to iterate.
     pruneSadCache();
+    prunePlanStepState();
 
     // Find the SAD record
     const sadRecord = await prisma.sadRecord.findUnique({
@@ -344,7 +465,13 @@ export class SessionManager {
       session.sadRecord,
       sessionId,
     );
-    return buildProvisioningPlan(ctx);
+    const plan = buildProvisioningPlan(ctx);
+    // Patent C5: arm the per-session step cursor BEFORE the plan goes on
+    // the wire.  Any inbound plan-mode response must then match the
+    // cursor (step index must strictly increment by 1 starting at 0) —
+    // the server rejects anything else at handlePlanResponse.
+    initPlanStepState(sessionId, plan.steps.length);
+    return plan;
   }
 
   /**
@@ -830,6 +957,38 @@ export class SessionManager {
     const i = msg.i ?? -1;
     const appErrored = rawSw.length !== 4 && rawHex.length < 4;
 
+    // Patent C5 step-cursor enforcement.  `advancePlanStep` rejects:
+    //   - first message arriving with i != 0
+    //   - any replay (i <= lastProcessed)
+    //   - any skip (i > lastProcessed + 1) — prevents bypassing step 1
+    //     (attestation verify) or step 3 (FINAL_STATUS decode) by
+    //     jumping forward
+    //   - out-of-range indices (< 0 or >= expectedSteps)
+    //   - unknown session (server restart lost cursor, or no prior plan)
+    //   - expired session
+    // On reject we FAIL the session so any subsequent in-flight
+    // responses from the same WS are also rejected on the phase guard.
+    const advance = advancePlanStep(sessionId, i);
+    if (!advance.ok) {
+      console.warn(
+        `[rca] plan-mode step rejected for session ${redactSid(sessionId)}: i=${i} reason=${advance.reason}`,
+      );
+      await prisma.provisioningSession.update({
+        where: { id: sessionId },
+        data: {
+          phase: 'FAILED',
+          failedAt: new Date(),
+          failureReason: advance.reason,
+        },
+      }).catch(() => { /* best-effort; session may already be gone */ });
+      clearPlanStepState(sessionId);
+      return [{
+        type: 'error',
+        code: 'plan_step_invalid',
+        message: `plan step rejected: ${advance.reason}`,
+      }];
+    }
+
     let sw: number;
     if (rawSw.length === 4) {
       sw = parseInt(rawSw, 16);
@@ -1030,6 +1189,10 @@ export class SessionManager {
       `[rca] plan-mode provisioning complete: session=${redactSid(sessionId)}, card=${redactSid(session.cardId)}`,
     );
 
+    // Release the step cursor — session is terminal, any further plan
+    // responses for this sessionId must fail at advancePlanStep.
+    clearPlanStepState(sessionId);
+
     // Fire callback to activation service (async, non-blocking).
     this.fireCallback(session.card.cardRef, session.card.chipSerial ?? '').catch((err) =>
       console.error('[rca] callback failed:', err),
@@ -1053,6 +1216,10 @@ export class SessionManager {
         failureReason: msg.code ?? 'APP_ERROR',
       },
     });
+    // Terminal transition — release plan-step cursor if this was a
+    // plan-mode session.  Safe to call on classical sessions too (Map
+    // delete of a non-existent key is a no-op).
+    clearPlanStepState(sessionId);
     console.warn(
       `[rca] session error: ${sessionId} — ${msg.code}` +
       (msg.message ? `: ${msg.message}` : ''),
