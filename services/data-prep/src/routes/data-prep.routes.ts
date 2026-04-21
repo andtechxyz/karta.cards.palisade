@@ -42,7 +42,13 @@ export function createDataPrepRouter(): Router {
 
     const startedAt = Date.now();
     try {
-      const result = await service.prepareCard(parsed.data);
+      // Use the router — routes to prepareCard (SAD_LEGACY, default) or
+      // prepareParamBundle (PARAM_BUNDLE) based on the programId's
+      // ChipProfile.provisioningMode.  Every existing programId has
+      // SAD_LEGACY so this is byte-identical to the old behaviour for
+      // legacy callers; only cards whose ChipProfile was flipped get the
+      // new path.
+      const result = await service.prepare(parsed.data);
       metrics().counter('data-prep.prepare.ok', 1);
       metrics().timing('data-prep.prepare.duration_ms', Date.now() - startedAt);
       res.status(201).json(result);
