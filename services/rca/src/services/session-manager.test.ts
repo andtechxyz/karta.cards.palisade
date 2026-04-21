@@ -17,7 +17,11 @@ vi.mock('@palisade/db', () => {
     },
     sadRecord: {
       findUnique: vi.fn(),
+      findFirst: vi.fn(),
       update: vi.fn(),
+    },
+    paramRecord: {
+      findUnique: vi.fn(),
     },
     card: {
       update: vi.fn(),
@@ -163,7 +167,9 @@ describe('SessionManager', () => {
   // -------------------------------------------------------------------------
 
   describe('startSession', () => {
-    it('creates ProvisioningSession and returns sessionId on valid proxyCardId', async () => {
+    it('creates ProvisioningSession and returns sessionId on valid proxyCardId (legacy SAD path)', async () => {
+      // ParamRecord lookup misses → fall through to SadRecord
+      (prisma.paramRecord.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       (prisma.sadRecord.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(FAKE_SAD_RECORD);
       (prisma.provisioningSession.create as ReturnType<typeof vi.fn>).mockResolvedValue({
         id: 'session_01',
@@ -180,7 +186,48 @@ describe('SessionManager', () => {
       expect(prisma.provisioningSession.create).toHaveBeenCalledOnce();
     });
 
-    it('throws when no READY SAD record exists', async () => {
+    it('routes prototype proxyCardId (pxy_*) through the ParamRecord path + SadRecord FK placeholder', async () => {
+      // ParamRecord hit — prototype path
+      (prisma.paramRecord.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 'param_01',
+        cardId: 'card_01',
+        status: 'READY',
+      });
+      // Historical SadRecord used purely for FK placeholder — any status OK
+      (prisma.sadRecord.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 'sad_historical_01',
+      });
+      (prisma.provisioningSession.create as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 'session_p_01',
+        cardId: 'card_01',
+        sadRecordId: 'sad_historical_01',
+        phase: 'INIT',
+      });
+
+      const result = await mgr.startSession('pxy_proto_01');
+
+      expect(result.sessionId).toBe('session_p_01');
+      expect(result.proxyCardId).toBe('pxy_proto_01');
+      // SAD findUnique must NOT have been called — prototype dispatch
+      expect(prisma.sadRecord.findUnique).not.toHaveBeenCalled();
+      // Session insert must carry the historical sad id as FK
+      const call = (prisma.provisioningSession.create as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(call.data.sadRecordId).toBe('sad_historical_01');
+    });
+
+    it('throws when ParamRecord exists but is CONSUMED', async () => {
+      (prisma.paramRecord.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 'param_01',
+        cardId: 'card_01',
+        status: 'CONSUMED',
+      });
+      await expect(mgr.startSession('pxy_consumed_01')).rejects.toThrow(
+        /ParamRecord.*is CONSUMED, expected READY/,
+      );
+    });
+
+    it('throws when no READY SAD record exists (legacy path)', async () => {
+      (prisma.paramRecord.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       (prisma.sadRecord.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
 
       await expect(mgr.startSession('pxy_missing')).rejects.toThrow(
@@ -188,7 +235,8 @@ describe('SessionManager', () => {
       );
     });
 
-    it('throws when SAD record exists but status is not READY', async () => {
+    it('throws when SAD record exists but status is not READY (legacy path)', async () => {
+      (prisma.paramRecord.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       (prisma.sadRecord.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
         ...FAKE_SAD_RECORD,
         status: 'CONSUMED',

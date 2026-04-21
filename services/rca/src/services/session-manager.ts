@@ -473,59 +473,116 @@ export class SessionManager {
     pruneSadCache();
     prunePlanStepState();
 
-    // Find the SAD record
-    const sadRecord = await prisma.sadRecord.findUnique({
+    // The proxyCardId on the wire can be either namespace:
+    //   - pxy_xxx  : ParamRecord.proxyCardId (prototype, PARAM_BUNDLE)
+    //   - proxy_xxx: SadRecord.proxyCardId   (legacy, TRANSFER_SAD)
+    // Try ParamRecord first so hybrid cards (both rows linked to the
+    // same card) get the prototype path.  Both tables have @unique
+    // constraints on proxyCardId, so at most one hit in each.
+    const paramRecord = await prisma.paramRecord.findUnique({
       where: { proxyCardId },
+      select: { id: true, cardId: true, status: true },
     });
-    if (!sadRecord || sadRecord.status !== 'READY') {
-      throw new Error(`No READY SAD record for proxyCardId: ${proxyCardId}`);
+
+    let cardId: string;
+    let sadRecordId: string;
+
+    if (paramRecord) {
+      if (paramRecord.status !== 'READY') {
+        throw new Error(
+          `ParamRecord for proxyCardId ${proxyCardId} is ${paramRecord.status}, expected READY`,
+        );
+      }
+      cardId = paramRecord.cardId;
+      // ProvisioningSession.sadRecordId is still NOT NULL in the
+      // schema; use any historic SadRecord for this card as the FK
+      // placeholder.  Prototype flow doesn't consume the SAD bytes —
+      // wrap happens from ParamRecord.bundleEncrypted (+ the per-
+      // column envelopes once PARAMS_PER_COLUMN=1) via
+      // buildTransferParamsApduChunks.  See schema.prisma TODO for
+      // the proper sadRecordId-nullable migration.
+      const placeholder = await prisma.sadRecord.findFirst({
+        where: { cardId: paramRecord.cardId },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true },
+      });
+      if (!placeholder) {
+        throw new Error(
+          `[rca] prototype session for ${proxyCardId} has no SadRecord for FK placeholder — card was never SAD-registered`,
+        );
+      }
+      sadRecordId = placeholder.id;
+    } else {
+      const sadRecord = await prisma.sadRecord.findUnique({
+        where: { proxyCardId },
+      });
+      if (!sadRecord || sadRecord.status !== 'READY') {
+        throw new Error(`No READY SAD record for proxyCardId: ${proxyCardId}`);
+      }
+      cardId = sadRecord.cardId;
+      sadRecordId = sadRecord.id;
+
+      // Legacy-only: prefetch + decrypt the SAD blob so the plaintext
+      // is ready by the time the mobile hits SAD_TRANSFER.  Prototype
+      // flow skips this — decryption there happens later inside
+      // buildTransferParamsApduChunks against ParamRecord data.
+      const config = getRcaConfig();
+      const encryptedBuf = Buffer.isBuffer(sadRecord.sadEncrypted)
+        ? sadRecord.sadEncrypted
+        : Buffer.from(sadRecord.sadEncrypted);
+      const ttlMs = (config.WS_TIMEOUT_SECONDS ?? 60) * 1000;
+      const sessionIdForCache = ''; // set below after session.create
+      void sessionIdForCache; // appease no-unused-vars; captured via closure on `session.id`
+      const prefetch = DataPrepService.decryptSad(
+        encryptedBuf,
+        config.KMS_SAD_KEY_ARN ?? '',
+        sadRecord.sadKeyVersion,
+      );
+      // Chain the cache-store to session creation below so we can key
+      // the cache by the real session id rather than a stub.
+      (this as unknown as { __prefetchSad?: { p: Promise<Buffer>; ttlMs: number } }).__prefetchSad = {
+        p: prefetch,
+        ttlMs,
+      };
     }
 
-    // Create provisioning session
     const session = await prisma.provisioningSession.create({
       data: {
-        cardId: sadRecord.cardId,
-        sadRecordId: sadRecord.id,
+        cardId,
+        sadRecordId,
         phase: 'INIT',
       },
     });
 
-    console.log(`[rca] session created: ${session.id} for card ${sadRecord.cardId}`);
-    metrics().counter('rca.session.started', 1);
+    console.log(
+      `[rca] session created: ${session.id} for card ${cardId} (path=${paramRecord ? 'param' : 'sad'})`,
+    );
+    metrics().counter('rca.session.started', 1, {
+      path: paramRecord ? 'param' : 'sad',
+    });
 
-    // Fire-and-forget KMS decrypt so the plaintext is ready by the time
-    // the mobile app finishes TLS + WS open + attestation.  On failure
-    // we log and move on — the synchronous path in buildPlanContext
-    // will retry the decrypt with a proper error surface.  Saves
-    // 150-400ms off the critical SAD_TRANSFER window (patent C5 keeps
-    // the MK derivation pipeline asynchronous; this extends the same
-    // async pattern to the plaintext SAD fetch).
-    const config = getRcaConfig();
-    const encryptedBuf = Buffer.isBuffer(sadRecord.sadEncrypted)
-      ? sadRecord.sadEncrypted
-      : Buffer.from(sadRecord.sadEncrypted);
-    const ttlMs = (config.WS_TIMEOUT_SECONDS ?? 60) * 1000;
-    const sessionId = session.id;
-    // Don't await — we want the decrypt running concurrently with the
-    // response write + the mobile's WS handshake.  Errors are swallowed
-    // here but replayed inline on cache miss.
-    DataPrepService.decryptSad(
-      encryptedBuf,
-      config.KMS_SAD_KEY_ARN ?? '',
-      sadRecord.sadKeyVersion,
-    )
-      .then((payload) => storeSadInCache(sessionId, payload, ttlMs))
-      .catch((err) => {
-        console.warn(
-          `[rca] SAD pre-decrypt failed for ${redactSid(sessionId)}: ${err instanceof Error ? err.message : err} — will retry inline`,
-        );
-      });
+    // Wire up the legacy prefetch-into-cache once we have the real
+    // session id.  Errors are swallowed here but replayed inline on
+    // cache miss inside buildPlanContext.
+    const stash = (this as unknown as {
+      __prefetchSad?: { p: Promise<Buffer>; ttlMs: number };
+    }).__prefetchSad;
+    if (stash) {
+      delete (this as unknown as { __prefetchSad?: unknown }).__prefetchSad;
+      stash.p
+        .then((payload) => storeSadInCache(session.id, payload, stash.ttlMs))
+        .catch((err) => {
+          console.warn(
+            `[rca] SAD pre-decrypt failed for ${redactSid(session.id)}: ${err instanceof Error ? err.message : err} — will retry inline`,
+          );
+        });
+    }
 
     return {
       sessionId: session.id,
       proxyCardId,
-      cardId: sadRecord.cardId,
-      sadRecordId: sadRecord.id,
+      cardId,
+      sadRecordId,
       phase: 'INIT',
     };
   }
