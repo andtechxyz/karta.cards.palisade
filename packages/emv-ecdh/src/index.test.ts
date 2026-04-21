@@ -115,6 +115,107 @@ describe('wrap / unwrap — round-trip (AES-CBC + HMAC-SHA256)', () => {
     expect(unwrapped.equals(plaintext)).toBe(true);
   });
 
+  it('patent C4: with chipNonce, wrap binds to nonce and round-trips with matching unwrap', () => {
+    const chip = generateTestKeypair();
+    const plaintext = Buffer.from('DEADBEEFCAFEBABE0102030405060708', 'hex');
+    const chipNonce = Buffer.alloc(16, 0xA5);
+
+    const wrapped = wrapParamBundle({
+      chipPubUncompressed: chip.pubUncompressed,
+      plaintext,
+      sessionId: 'test-session-c4',
+      chipNonce,
+    });
+
+    // Unwrap with matching nonce → ok.
+    const unwrapped = unwrapParamBundle({
+      ...wrapped,
+      chipPriv: chip.priv,
+      sessionId: 'test-session-c4',
+      chipNonce,
+    });
+    expect(unwrapped.equals(plaintext)).toBe(true);
+  });
+
+  it('patent C4: unwrap without the nonce that wrap used fails HMAC tag check (info mismatch)', () => {
+    const chip = generateTestKeypair();
+    const plaintext = Buffer.from('DEADBEEFCAFEBABE0102030405060708', 'hex');
+    const chipNonce = Buffer.alloc(16, 0xBE);
+
+    const wrapped = wrapParamBundle({
+      chipPubUncompressed: chip.pubUncompressed,
+      plaintext,
+      sessionId: 'test-session-c4',
+      chipNonce,
+    });
+
+    // Replay: attacker has the wrapped bundle but tries to unwrap WITHOUT
+    // the chip's nonce.  HKDF info differs → AES/IV/HMAC differ →
+    // IV-mismatch or HMAC-tag-fail BEFORE decryption.
+    expect(() =>
+      unwrapParamBundle({
+        ...wrapped,
+        chipPriv: chip.priv,
+        sessionId: 'test-session-c4',
+        // chipNonce omitted on purpose
+      }),
+    ).toThrow(/IV does not match|HMAC tag verification/);
+  });
+
+  it('patent C4: unwrap with a DIFFERENT nonce fails (per-session freshness)', () => {
+    const chip = generateTestKeypair();
+    const plaintext = Buffer.from('DEADBEEFCAFEBABE0102030405060708', 'hex');
+    const nonceA = Buffer.alloc(16, 0x11);
+    const nonceB = Buffer.alloc(16, 0x22);
+
+    const wrapped = wrapParamBundle({
+      chipPubUncompressed: chip.pubUncompressed,
+      plaintext,
+      sessionId: 'test-session-c4',
+      chipNonce: nonceA,
+    });
+
+    expect(() =>
+      unwrapParamBundle({
+        ...wrapped,
+        chipPriv: chip.priv,
+        sessionId: 'test-session-c4',
+        chipNonce: nonceB,
+      }),
+    ).toThrow(/IV does not match|HMAC tag verification/);
+  });
+
+  it('patent C4: wrap with and without chipNonce produce different HKDF outputs', () => {
+    // Same inputs except chipNonce — ciphertext must differ because the
+    // HKDF-derived AES key + IV differ.  Guards against a future refactor
+    // that silently drops the nonce from the info buffer.
+    const chip = generateTestKeypair();
+    const plaintext = Buffer.from('DEADBEEFCAFEBABE0102030405060708', 'hex');
+    const chipNonce = Buffer.alloc(16, 0xCC);
+
+    // Use the deterministic wrap so we're comparing apples-to-apples
+    // (same ephemeral priv on both sides); ciphertext/iv should still
+    // differ because the HKDF info differs.
+    const serverEphemeralPriv = Buffer.alloc(32, 0x01);
+    const withNonce = wrapParamBundleDeterministic({
+      chipPubUncompressed: chip.pubUncompressed,
+      plaintext,
+      sessionId: 'cmp',
+      chipNonce,
+      serverEphemeralPriv,
+    });
+    const withoutNonce = wrapParamBundleDeterministic({
+      chipPubUncompressed: chip.pubUncompressed,
+      plaintext,
+      sessionId: 'cmp',
+      serverEphemeralPriv,
+    });
+
+    expect(withNonce.iv.equals(withoutNonce.iv)).toBe(false);
+    expect(withNonce.ciphertext.equals(withoutNonce.ciphertext)).toBe(false);
+    expect(withNonce.tag.equals(withoutNonce.tag)).toBe(false);
+  });
+
   it('handles larger bundles (240-byte typical ParamBundle)', () => {
     const chip = generateTestKeypair();
     const plaintext = Buffer.alloc(240);

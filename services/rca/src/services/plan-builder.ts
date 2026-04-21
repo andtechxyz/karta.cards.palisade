@@ -388,6 +388,8 @@ export function buildParamBundleApdu(input: {
   plaintextBundle: Buffer;
   chipPubUncompressed: Buffer;
   sessionId: string;
+  /** Patent C4 chip-side nonce; see {@link buildParamBundleApduChunks}. */
+  chipNonce?: Buffer;
 }): Buffer {
   const chunks = buildParamBundleApduChunks(input);
   // Back-compat: single APDU callers still get a single Buffer.
@@ -434,11 +436,19 @@ export function buildParamBundleApduChunks(input: {
   plaintextBundle: Buffer;
   chipPubUncompressed: Buffer;
   sessionId: string;
+  /**
+   * Patent C4 chip-side nonce, returned by the applet in the trailing
+   * 16 bytes of its GEN_KEYS response.  When present, woven into the
+   * HKDF info on both wrap and unwrap sides.  Omit only in legacy /
+   * non-C4 code paths — prod always plumbs this through.
+   */
+  chipNonce?: Buffer;
 }): Buffer[] {
   const wrapped = wrapParamBundle({
     chipPubUncompressed: input.chipPubUncompressed,
     plaintext: input.plaintextBundle,
     sessionId: input.sessionId,
+    chipNonce: input.chipNonce,
   });
   const wire = serializeWrappedBundle(wrapped);
 

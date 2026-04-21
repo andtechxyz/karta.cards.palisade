@@ -136,6 +136,15 @@ public final class Constants {
     public static final short AES_IV_LEN = (short) 16;      // AES block size
     public static final short HMAC_KEY_LEN = (short) 32;    // right-sized HMAC-SHA256 key
     public static final short HMAC_TAG_LEN = (short) 16;    // truncated HMAC-SHA256
+
+    /**
+     * Chip-side nonce width used for patent claim C4 replay binding.
+     * 16 bytes is enough that a collision across a single card's
+     * lifetime is negligible and matches AES-IV / HMAC-tag sizing
+     * patterns already in the ECDH wire format — so callers can
+     * reuse the same scratch buffers interchangeably.
+     */
+    public static final short CHIP_NONCE_LEN = (short) 16;
     /** HKDF-SHA256 output: aesKey(16) || iv(16) || hmacKey(32) = 64 bytes. */
     public static final short HKDF_OUTPUT_LEN =
         (short) (AES_KEY_LEN + AES_IV_LEN + HMAC_KEY_LEN);

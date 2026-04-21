@@ -31,6 +31,7 @@ import {
 } from './plan-builder.js';
 import {
   AttestationVerifier,
+  ICC_PUBKEY_LEN,
   type AttestationMode,
   type AttestationVerifierConfig,
 } from './attestation-verifier.js';
@@ -265,6 +266,10 @@ function advanceParamChunk(sessionId: string): { done: boolean; next: Buffer | n
   q.sentIdx += 1;
   if (q.sentIdx >= q.chunks.length) {
     paramChunkCache.delete(sessionId);
+    // Drain paired nonce material — chip has accepted the bundle, the
+    // nonce has now served its C4 replay-binding purpose and must not
+    // be reused if the session somehow cycles.
+    clearChipNonce(sessionId);
     return { done: true, next: null };
   }
   return { done: false, next: q.chunks[q.sentIdx] };
@@ -274,6 +279,63 @@ function advanceParamChunk(sessionId: string): { done: boolean; next: Buffer | n
 export function _resetSadCacheForTests(): void {
   for (const [, entry] of sadCache) entry.payload.fill(0);
   sadCache.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Chip-nonce cache — patent C4 (chip-side replay binding)
+// ---------------------------------------------------------------------------
+//
+// The applet emits a fresh 16-byte nonce in the trailing bytes of its
+// GENERATE_KEYS response and appends the same nonce to its own
+// sessionId[] buffer before the HKDF-expand that derives the
+// TRANSFER_PARAMS AES/IV/HMAC triple.  For the wrap side to produce
+// bytes the chip will accept, we need to remember the nonce between
+// handleKeygenResponse (when we first see it) and the moment we call
+// buildParamBundleApduChunks (minutes later at most — typically <2 s
+// of wall-clock).  Short-lived Map keyed by sessionId matches the
+// existing paramChunkCache pattern; no DB column needed.
+//
+// Entries expire on: successful chunk queue drain (paired delete in
+// handleSadResponse), session FAILED transition, WS disconnect TTL,
+// or the reaper-sad-sessions sweep.  Missing entry at wrap time is
+// treated as "card is running an older applet that doesn't emit a
+// nonce" — we fall back to the legacy HKDF info (sessionId only) so
+// permissive deploys during rollout don't break mid-tap.
+
+interface ChipNonceEntry {
+  nonce: Buffer;
+  expiresAt: number;
+}
+const chipNonceCache = new Map<string, ChipNonceEntry>();
+
+function putChipNonce(sessionId: string, nonce: Buffer, ttlMs: number): void {
+  chipNonceCache.set(sessionId, {
+    nonce,
+    expiresAt:
+      Date.now() + Math.min(Math.max(ttlMs, 10_000), SAD_CACHE_MAX_TTL_MS),
+  });
+}
+
+function getChipNonce(sessionId: string): Buffer | undefined {
+  const e = chipNonceCache.get(sessionId);
+  if (!e) return undefined;
+  if (Date.now() > e.expiresAt) {
+    chipNonceCache.delete(sessionId);
+    return undefined;
+  }
+  return e.nonce;
+}
+
+function clearChipNonce(sessionId: string): void {
+  const e = chipNonceCache.get(sessionId);
+  if (e) e.nonce.fill(0);
+  chipNonceCache.delete(sessionId);
+}
+
+/** Test hook: clear the chip-nonce cache between runs. */
+export function _resetChipNonceCacheForTests(): void {
+  for (const [, e] of chipNonceCache) e.nonce.fill(0);
+  chipNonceCache.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -866,6 +928,23 @@ export class SessionManager {
     // and accepts.  See services/rca/src/services/attestation-verifier.ts.
     const extracted = AttestationVerifier.extract(respData);
     const { iccPubkey, attestation } = extracted;
+
+    // Patent C4 chip-side nonce binding: pa-v3 writes the 16-byte nonce
+    // immediately after the 65-byte iccPubkey in the GEN_KEYS response.
+    // Cache it by sessionId for the TRANSFER_PARAMS wrap (minutes later
+    // at most).  Older applets that don't emit a nonce produce a shorter
+    // response, in which case this subarray is empty and we fall back
+    // to the legacy HKDF info shape (sessionId alone) at wrap time.
+    const CHIP_NONCE_LEN = 16;
+    if (
+      respData.length >= ICC_PUBKEY_LEN + CHIP_NONCE_LEN &&
+      respData.length !== ICC_PUBKEY_LEN  // legacy pubkey-only response shape
+    ) {
+      const nonce = Buffer.from(
+        respData.subarray(ICC_PUBKEY_LEN, ICC_PUBKEY_LEN + CHIP_NONCE_LEN),
+      );
+      putChipNonce(sessionId, nonce, getRcaConfig().WS_TIMEOUT_SECONDS * 1000);
+    }
     const mode = getRcaConfig().PALISADE_ATTESTATION_MODE;
     const verifyResult = AttestationVerifier.verify(extracted, mode, attestationConfigFor(mode));
     metrics().counter('rca.attestation.verify', 1, {
@@ -996,12 +1075,20 @@ export class SessionManager {
       pr.bundleKeyVersion,
     );
 
+    // Patent C4: feed the chip-side nonce (captured in
+    // handleKeygenResponse) into the wrap's HKDF info so the AES/IV/HMAC
+    // triple binds to the specific GEN_KEYS session.  getChipNonce
+    // returns undefined for older applets; wrapParamBundle then falls
+    // back to legacy info shape (sessionId alone).
+    const chipNonce = getChipNonce(sessionId);
+
     let chunks: Buffer[];
     try {
       chunks = buildParamBundleApduChunks({
         plaintextBundle,
         chipPubUncompressed,
         sessionId,
+        chipNonce,
       });
     } finally {
       plaintextBundle.fill(0);

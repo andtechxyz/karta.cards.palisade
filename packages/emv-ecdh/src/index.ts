@@ -73,6 +73,14 @@ const HKDF_OUTPUT_LEN = AES_KEY_LEN + AES_IV_LEN + HMAC_KEY_LEN;
 
 /** Uncompressed SEC1 P-256 pubkey: 0x04 || X(32) || Y(32). */
 const SEC1_UNCOMPRESSED_LEN = 65;
+/**
+ * Patent claim C4 chip-side nonce width (16 bytes).  Must stay in sync
+ * with applets/pa-v3/src/main/java/com/palisade/pa/Constants.java's
+ * CHIP_NONCE_LEN — the applet writes exactly this many random bytes
+ * after the iccPubkey in its GEN_KEYS response and appends the same
+ * bytes to its own sessionId buffer for HKDF info.
+ */
+export const CHIP_NONCE_LEN = 16;
 
 /** SEC1 P-256 curve name — Node's `createECDH('prime256v1')`. */
 const CURVE = 'prime256v1';
@@ -154,6 +162,18 @@ export interface WrapInput {
    * Typically the ProvisioningSession.id (cuid string).
    */
   sessionId: string;
+  /**
+   * Patent claim C4: chip-side nonce returned in the GENERATE_KEYS
+   * response trailer.  When present, concatenated to sessionId in the
+   * HKDF info input — the chip does the same on its side, so any
+   * replayed TRANSFER_PARAMS that was bound to a prior nonce derives
+   * different AES/HMAC keys and fails closed at the HMAC tag check.
+   *
+   * Omit only for the legacy byte-parity tests that were written
+   * before C4 landed; prod always passes this.  Must be 16 bytes —
+   * see {@link CHIP_NONCE_LEN}.
+   */
+  chipNonce?: Buffer;
 }
 
 export interface WrappedParamBundle {
@@ -191,15 +211,28 @@ export function wrapParamBundle(input: WrapInput): WrappedParamBundle {
     );
   }
 
+  if (input.chipNonce !== undefined && input.chipNonce.length !== CHIP_NONCE_LEN) {
+    throw new Error(
+      `wrapParamBundle: chipNonce must be ${CHIP_NONCE_LEN} bytes, got ${input.chipNonce.length}`,
+    );
+  }
+
   const ecdh = createECDH(CURVE);
   ecdh.generateKeys();
   const serverEphemeralPub = ecdh.getPublicKey(null, 'uncompressed'); // 65 bytes
   const shared = ecdh.computeSecret(input.chipPubUncompressed); // 32-byte X coord
 
+  // HKDF info = sessionId (ASCII) || chipNonce (if present).  The
+  // chip side stores the same concatenation in its sessionId[] buffer
+  // at GEN_KEYS time (see applets/pa-v3/.../processGenerateKeys) so
+  // both sides end up producing the same AES/IV/HMAC triple.
+  const hkdfInfo = input.chipNonce
+    ? Buffer.concat([Buffer.from(input.sessionId, 'ascii'), input.chipNonce])
+    : Buffer.from(input.sessionId, 'ascii');
   const okm = hkdfSha256(
     shared,
     HKDF_SALT,
-    Buffer.from(input.sessionId, 'ascii'),
+    hkdfInfo,
     HKDF_OUTPUT_LEN,
   );
   const aesKey = okm.subarray(0, AES_KEY_LEN);
@@ -259,6 +292,8 @@ export interface UnwrapInput {
   chipPriv: Buffer;
   /** Same sessionId that was mixed into wrap's HKDF info. */
   sessionId: string;
+  /** Same 16-byte chip nonce the wrap side used, if any. */
+  chipNonce?: Buffer;
 }
 
 /**
@@ -291,15 +326,23 @@ export function unwrapParamBundle(input: UnwrapInput): Buffer {
       `unwrapParamBundle: ciphertext length ${input.ciphertext.length} is not a positive multiple of ${AES_IV_LEN} (CBC block size)`,
     );
   }
+  if (input.chipNonce !== undefined && input.chipNonce.length !== CHIP_NONCE_LEN) {
+    throw new Error(
+      `unwrapParamBundle: chipNonce must be ${CHIP_NONCE_LEN} bytes, got ${input.chipNonce.length}`,
+    );
+  }
 
   const ecdh = createECDH(CURVE);
   ecdh.setPrivateKey(input.chipPriv);
   const shared = ecdh.computeSecret(input.serverEphemeralPub);
 
+  const hkdfInfo = input.chipNonce
+    ? Buffer.concat([Buffer.from(input.sessionId, 'ascii'), input.chipNonce])
+    : Buffer.from(input.sessionId, 'ascii');
   const okm = hkdfSha256(
     shared,
     HKDF_SALT,
-    Buffer.from(input.sessionId, 'ascii'),
+    hkdfInfo,
     HKDF_OUTPUT_LEN,
   );
   const aesKey  = okm.subarray(0, AES_KEY_LEN);
@@ -445,15 +488,24 @@ export function wrapParamBundleDeterministic(
     );
   }
 
+  if (input.chipNonce !== undefined && input.chipNonce.length !== CHIP_NONCE_LEN) {
+    throw new Error(
+      `wrapParamBundleDeterministic: chipNonce must be ${CHIP_NONCE_LEN} bytes, got ${input.chipNonce.length}`,
+    );
+  }
+
   const ecdh = createECDH(CURVE);
   ecdh.setPrivateKey(input.serverEphemeralPriv);
   const serverEphemeralPub = ecdh.getPublicKey(null, 'uncompressed');
   const shared = ecdh.computeSecret(input.chipPubUncompressed);
 
+  const hkdfInfo = input.chipNonce
+    ? Buffer.concat([Buffer.from(input.sessionId, 'ascii'), input.chipNonce])
+    : Buffer.from(input.sessionId, 'ascii');
   const okm = hkdfSha256(
     shared,
     HKDF_SALT,
-    Buffer.from(input.sessionId, 'ascii'),
+    hkdfInfo,
     HKDF_OUTPUT_LEN,
   );
   const aesKey  = okm.subarray(0, AES_KEY_LEN);

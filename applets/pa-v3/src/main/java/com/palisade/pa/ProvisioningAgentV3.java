@@ -10,6 +10,7 @@ import javacard.security.ECPrivateKey;
 import javacard.security.ECPublicKey;
 import javacard.security.KeyBuilder;
 import javacard.security.KeyPair;
+import javacard.security.RandomData;
 
 /**
  * Palisade Provisioning Agent v3 — chip-computed-DGI prototype.
@@ -175,6 +176,14 @@ public class ProvisioningAgentV3 extends Applet {
 
     private final KeyPair iccKeyPair;
 
+    /**
+     * RNG for chip-side nonce generation (patent claim C4).  Uses
+     * JCOP 5's hardware TRNG via ALG_SECURE_RANDOM — cryptographically
+     * strong per JC spec.  Reused across sessions; internal state is
+     * self-reseeding.
+     */
+    private final RandomData rng;
+
     // -----------------------------------------------------------------
     // Constructor + install
     // -----------------------------------------------------------------
@@ -200,7 +209,14 @@ public class ProvisioningAgentV3 extends Applet {
         // Bumped to 512 B to cover typical 1408-bit RSA paths and
         // 2048-bit cert paths with some slack, still well inside the
         // JCOP 5 EEPROM budget.
-        sessionId  = new byte[64];  // cuid2 is 24 chars; 64 = generous
+        // sessionId stores incoming server session id (typ 24 B cuid2)
+        // followed by the 16-byte chip-side nonce generated at GEN_KEYS.
+        // 96 B leaves ample headroom for future id schemes without
+        // risking an off-by-one when the nonce is appended.  See
+        // processGenerateKeys for the C4 nonce binding that extends
+        // sessionIdLen by 16 after keygen and uses the combined buffer
+        // as HKDF info during TRANSFER_PARAMS.
+        sessionId  = new byte[96];
         dgi0101Nvm = new byte[256]; // bumped from 128 for Track 2 + long PANs
         // DGI 0102 = 1B tag(0x94) + 1B len + AFL bytes.  The karta-platinum
         // seed sets AFL = 16 B (32 hex chars), so DGI 0102 = 18 B — the
@@ -240,6 +256,8 @@ public class ProvisioningAgentV3 extends Applet {
         iccKeyPair = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);
         initP256Params((ECPublicKey) iccKeyPair.getPublic());
         initP256Params((ECPrivateKey) iccKeyPair.getPrivate());
+
+        rng = RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
 
         state = Constants.STATE_IDLE;
         register();
@@ -388,15 +406,41 @@ public class ProvisioningAgentV3 extends Applet {
         ECPublicKey pub = (ECPublicKey) iccKeyPair.getPublic();
 
         // Write the 65-byte uncompressed public key (0x04 || X(32) || Y(32))
-        // into the APDU response buffer.  TODO(jc-dev): once the factory
-        // attestation key is provisioned at install time, append the
-        // signature + CPLC trailer here so rca's AttestationVerifier has
-        // real material to verify in strict mode.  Until then permissive
-        // mode accepts pubkey-only responses, which is what this emits.
+        // into the APDU response buffer.
         short wLen = pub.getW(buf, (short) 0);
 
+        // --- Patent C4: chip-side nonce binding -----------------------
+        //
+        // Generate a fresh 16-byte nonce and emit it right after the
+        // public key in the GEN_KEYS response.  The same bytes get
+        // APPENDED to our own sessionId[] buffer so the HKDF info for
+        // the subsequent TRANSFER_PARAMS expand becomes
+        //   info = incoming_sessionId || chip_nonce
+        //
+        // The server MUST concatenate the same chip_nonce into its
+        // wrap-side info; if it forgets (or if an attacker replays a
+        // recorded TRANSFER_PARAMS whose info was bound to a PRIOR
+        // chip_nonce), HKDF produces different keys and the unwrap
+        // HMAC tag fails closed.  No explicit comparison on-chip
+        // needed — the crypto itself enforces freshness.
+        //
+        // Replay across sessions also fails for a second reason: every
+        // GEN_KEYS regenerates the ephemeral ICC keypair, so the ECDH
+        // shared secret is different → HKDF PRK is different → unwrap
+        // fails.  C4 adds defence-in-depth against replay to the SAME
+        // live session (e.g. attacker tamper-reply-relay) which the
+        // ephemeral keypair alone doesn't cover.
+        final short nonceOff = wLen;
+        rng.generateData(sessionId, sessionIdLen, Constants.CHIP_NONCE_LEN);
+        Util.arrayCopyNonAtomic(
+            sessionId, sessionIdLen, buf, nonceOff, Constants.CHIP_NONCE_LEN
+        );
+        sessionIdLen = (short) (sessionIdLen + Constants.CHIP_NONCE_LEN);
+
         state = Constants.STATE_KEYGEN_COMPLETE;
-        apdu.setOutgoingAndSend((short) 0, wLen);
+        apdu.setOutgoingAndSend(
+            (short) 0, (short) (wLen + Constants.CHIP_NONCE_LEN)
+        );
     }
 
     // -----------------------------------------------------------------
@@ -607,6 +651,25 @@ public class ProvisioningAgentV3 extends Applet {
         //    between decrypt and deselect could read residual state;
         //    the explicit zero pass shortens the window.
         Util.arrayFillNonAtomic(bundleBuf, (short) 0, bundleLen, (byte) 0);
+
+        // 5b. Patent C4: zero the chip-side nonce so a replayed
+        //     TRANSFER_PARAMS against the same live session can't
+        //     succeed.  State machine already prevents reuse (next
+        //     TRANSFER_PARAMS on STATE_PARAMS_COMMITTED is rejected
+        //     with SW_WRONG_STATE), but defence-in-depth: if state
+        //     tracking ever regresses, the HKDF info for a second
+        //     unwrap against the same sessionId+zeros nonce would
+        //     differ from what the server wraps, so the crypto still
+        //     fails closed.  Also shrinks sessionIdLen back to the
+        //     incoming-server-id portion only — any future re-init
+        //     starts clean.
+        final short nonceStart = (short) (sessionIdLen - Constants.CHIP_NONCE_LEN);
+        if (nonceStart >= 0) {
+            Util.arrayFillNonAtomic(
+                sessionId, nonceStart, Constants.CHIP_NONCE_LEN, (byte) 0
+            );
+            sessionIdLen = nonceStart;
+        }
 
         // Clear the chain accumulator so the next provisioning attempt
         // (after WIPE + GENERATE_KEYS) starts from wireBuf[0].  Also
