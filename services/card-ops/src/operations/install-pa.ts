@@ -27,8 +27,9 @@ import {
 } from '../gp/apdu-builder.js';
 import { establishScp03, type DriveIO } from './scp03-drive.js';
 import { getGpStaticKeys } from '../gp/static-keys.js';
-import { loadCap, CapFileMissingError } from '../gp/cap-loader.js';
+import { loadCap, CapFileMissingError, type CapKey } from '../gp/cap-loader.js';
 import { SECURITY_LEVEL } from '../gp/scp03.js';
+import { getCardOpsConfig } from '../env.js';
 import type { WSMessage } from '../ws/messages.js';
 
 type CardOpSessionWithCard = Prisma.CardOpSessionGetPayload<{ include: { card: true } }>;
@@ -36,14 +37,58 @@ type CardOpSessionWithCard = Prisma.CardOpSessionGetPayload<{ include: { card: t
 const PA_PACKAGE_AID = Buffer.from('A0000000625041', 'hex');
 const PA_INSTANCE_AID = Buffer.from('A00000006250414C', 'hex');
 
+/**
+ * Decide which PA CAP to install on this card.
+ *
+ * Priority (highest → lowest):
+ *   1. Card → Program → IssuerProfile → ChipProfile.provisioningMode.
+ *      Same field that gates the server-side RCA dispatch (SAD_LEGACY
+ *      vs PARAM_BUNDLE).  Tying the CAP choice to this field means the
+ *      applet bytecode and the server flow can't drift — an admin who
+ *      flips the ChipProfile to PARAM_BUNDLE also gets the pa-v3 applet
+ *      installed next time they hit "install PA".
+ *   2. CARD_OPS_DEFAULT_PA_CAP env var — fleet-wide default for cards
+ *      that don't yet have a ChipProfile row (or whose ChipProfile
+ *      predates the field).  Defaults to 'pa' (legacy).
+ *
+ * Returns the CAP key to pass to `loadCap()`.  Throws only on an
+ * internal contract break (unknown enum value).
+ */
+export async function resolvePaCapKey(cardId: string): Promise<CapKey> {
+  // One hop: Card → Program → IssuerProfile → ChipProfile.  We don't
+  // need the full ChipProfile payload, just the enum.
+  const row = await prisma.card.findUnique({
+    where: { id: cardId },
+    select: {
+      program: {
+        select: {
+          issuerProfile: {
+            select: {
+              chipProfile: { select: { provisioningMode: true } },
+            },
+          },
+        },
+      },
+    },
+  });
+  const mode = row?.program?.issuerProfile?.chipProfile?.provisioningMode;
+  if (mode === 'PARAM_BUNDLE') return 'pa-v3';
+  if (mode === 'SAD_LEGACY') return 'pa';
+
+  // No ChipProfile on the chain — fall back to the env default.  Covers
+  // the migration window when some programs haven't been backfilled.
+  return getCardOpsConfig().CARD_OPS_DEFAULT_PA_CAP === 'pa-v3' ? 'pa-v3' : 'pa';
+}
+
 export async function runInstallPa(
   session: CardOpSessionWithCard,
   io: DriveIO,
 ): Promise<WSMessage> {
   // Guard: CAP file must be present.
+  const capKey = await resolvePaCapKey(session.cardId);
   let cap;
   try {
-    cap = loadCap('pa');
+    cap = loadCap(capKey);
   } catch (err) {
     if (err instanceof CapFileMissingError) {
       return {
@@ -70,6 +115,11 @@ export async function runInstallPa(
   // `scrub()` is idempotent, so calling it here is safe even though the
   // operation-runner's terminal write also clears `scpState` in the DB.
   try {
+    // Emit the chosen CAP early so the admin's WS log shows it even
+    // on failure.  `phase: 'CAP_SELECTED'` is observational — the
+    // actual first APDU is the DELETE below.
+    io.send({ type: 'apdu', hex: '', phase: 'CAP_SELECTED', progress: 0.05, capKey });
+
     io.send({ type: 'apdu', hex: '', phase: 'DELETE_OLD', progress: 0.1 });
 
     // Best-effort DELETE of old instance + package.  6A88 (referenced
@@ -161,6 +211,11 @@ export async function runInstallPa(
       progress: 1.0,
       packageAid: cap.packageAid,
       instanceAid: PA_INSTANCE_AID.toString('hex').toUpperCase(),
+      // Which CAP actually ended up on the card — pa (legacy, TRANSFER_SAD)
+      // or pa-v3 (dual-mode, accepts both TRANSFER_SAD and
+      // TRANSFER_PARAMS).  Admin UI surfaces this so operators see which
+      // flavour is running before kicking off provisioning.
+      capKey,
     };
   } finally {
     scrub();

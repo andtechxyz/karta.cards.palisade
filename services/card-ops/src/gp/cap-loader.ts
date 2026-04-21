@@ -15,7 +15,16 @@ import { parseCapFile, type CapFile } from './cap-parser.js';
 import { getCardOpsConfig } from '../env.js';
 
 const CAP_NAMES = {
+  /** Legacy PA v1 applet — accepts INS_TRANSFER_SAD (pre-ECDH SAD blob). */
   pa: 'pa.cap',
+  /**
+   * PA v3 applet — accepts INS_TRANSFER_PARAMS (ECDH-wrapped ParamBundle,
+   * chip-computed DGIs).  Dual-mode: if the APDU body starts with 0x04
+   * (SEC1 uncompressed EC point) it's a ParamBundle; otherwise it falls
+   * through to the legacy SAD path inside the applet so fleet migration
+   * can be tracked per-card instead of big-bang.
+   */
+  'pa-v3': 'pa-v3.cap',
   t4t: 'PalisadeT4T.cap',
   receiver: 'test-receiver.cap',
 } as const;
