@@ -1,130 +1,200 @@
 /**
- * Chip attestation verifier — real ECDSA verification against vendor root.
+ * Chip attestation verifier — issuer-controlled PKI (Option A: compact
+ * binary certs, no X.509).
  *
  * Patent claims C16 + C23: the chip emits a per-instrument attestation
- * (ECDSA-SHA-256 signature over pubkey||CPLC) signed by the factory-burned
- * attestation key.  This module verifies the signature against the vendor
- * (NXP JCOP 5 / Infineon Secora) root CA that's pinned at build time.
+ * (ECDSA-SHA256 signature over iccPubkey || CPLC) signed by a per-card
+ * attestation key.  That per-card key is provisioned during personalisation
+ * along with an Issuer-CA-signed card cert; the Issuer CA in turn is signed
+ * by the Karta Root CA whose public key is pinned at boot time from
+ * `palisade/KARTA_ATTESTATION_ROOT_PUBKEY`.  No vendor (NXP/Infineon)
+ * relationship is required — we own the root, so we control the policy.
  *
- * The PA applet's GENERATE_KEYS response is
- *   ICC_PubKey(65) || Attest_Sig(var) || CPLC(42) || CertChain(var)?
- * where:
- *   ICC_PubKey : 65 bytes uncompressed SEC1 P-256 point (0x04 || X || Y)
- *   Attest_Sig : DER-encoded ECDSA-SHA-256 signature (70-72 bytes typical)
- *                over the bytes (ICC_PubKey || CPLC)
- *   CPLC       : 42 bytes (NXP Card Production Life Cycle)
- *   CertChain  : optional.  If present, TLV-encoded DER X.509 chain, leaf
- *                first, root last.  Currently the applet returns 0 bytes
- *                (C16 gap — see /Users/danderson/Documents/Claude Code/
- *                Palisade/palisade-pa/src/com/palisade/pa/NxpAttestation.java).
+ * Chain of trust at verification time:
+ *
+ *   Root CA pubkey (pinned in env)
+ *       │  signs
+ *       ▼
+ *   Issuer CA cert blob (stored in env; loaded once at boot)
+ *       │  signs
+ *       ▼
+ *   Card cert blob (returned by card at GENERATE_KEYS; loaded into
+ *   the card during perso via STORE DATA DGI A002)
+ *       │  holds card_pubkey, which verifies
+ *       ▼
+ *   Attestation signature over (iccPubkey || CPLC)
+ *
+ * GENERATE_KEYS response layout (what the applet returns):
+ *
+ *   iccPubkey  (65 B)   0x04 || X || Y  — ephemeral session pubkey
+ *   attestSig  (var)    DER ECDSA-SHA256 over (iccPubkey || cplc)
+ *   cardCert   (var)    card_pubkey[65] || cplc[42] || sig[DER]
+ *                         signed by Issuer CA over (card_pubkey || cplc)
+ *
+ * Issuer cert blob layout (in env / Secrets Manager):
+ *
+ *   issuer_pubkey (65 B)   0x04 || X || Y
+ *   issuer_id     (4 B)    big-endian uint32; lets us rotate
+ *                          issuer CAs without touching the root
+ *   sig           (var)    DER ECDSA-SHA256 over (issuer_pubkey || issuer_id)
+ *                          signed by Root CA
  *
  * Two operating modes:
- *   - strict    : cert chain MUST be present, chain MUST validate to the
- *                 pinned vendor root, signature MUST verify.  Any failure
- *                 returns {ok:false} — callers refuse to continue
- *                 provisioning.  Required for PCI/patent compliance.
- *   - permissive: legacy stub behaviour — accept everything, log warning.
- *                 Used until karta-se applet v1 ships real attestation
- *                 output.
  *
- * Mode is controlled by `PALISADE_ATTESTATION_MODE` env var on the RCA
- * service.  Default is `permissive` for backward compatibility during
- * rollout; production deployments should flip to `strict` once the
- * applet is rebuilt.
+ *   - strict     : all three signature layers must verify.  Any failure
+ *                  returns {ok:false}; the caller refuses to continue
+ *                  provisioning.  Required for PCI/patent compliance.
+ *
+ *   - permissive : accept everything.  Logs a warning but doesn't verify.
+ *                  For rollout windows where not every card in the fleet
+ *                  has been re-personalised with an attestation cert yet.
+ *
+ * Mode is controlled by PALISADE_ATTESTATION_MODE.  Flip to strict only
+ * once every card in the live fleet has been re-personalised — otherwise
+ * strict mode rejects every tap.
  */
 
-import { createVerify, createPublicKey, X509Certificate, type KeyObject } from 'node:crypto';
+import { createPublicKey, createVerify, type KeyObject } from 'node:crypto';
 
-/** Stub-mode banner printed when PALISADE_ATTESTATION_MODE=permissive. */
-export const STUB_MODE_WARNING =
-  '[attestation] PERMISSIVE MODE: accepting chips without real cert-chain ' +
-  'validation.  Set PALISADE_ATTESTATION_MODE=strict once karta-se v1 is deployed.';
+// -----------------------------------------------------------------------------
+// Wire-format constants
+// -----------------------------------------------------------------------------
 
-export const ICC_PUBKEY_LEN = 65 as const;
+/** SEC1 uncompressed P-256 point: 0x04 || X(32) || Y(32) = 65 bytes. */
+export const SEC1_UNCOMPRESSED_LEN = 65 as const;
+/** NXP Card Production Life Cycle — fixed-length chip identity blob. */
 export const CPLC_LEN = 42 as const;
+/** Issuer CA identifier width — allows up to 2^32 rotating issuer CAs. */
+export const ISSUER_ID_LEN = 4 as const;
 
-export type AttestationVendor = 'nxp' | 'infineon' | 'unknown';
+/** Minimum plausible DER ECDSA-P256 signature length (short r and s). */
+const MIN_DER_SIG_LEN = 68 as const;
+/** Max plausible DER ECDSA-P256 signature length (full r and s with leading 0x00). */
+const MAX_DER_SIG_LEN = 72 as const;
+
+// Kept as an alias to the SEC1 length because downstream code (session-manager)
+// writes an `iccPubkey` field sized against this constant.
+export const ICC_PUBKEY_LEN = SEC1_UNCOMPRESSED_LEN;
+
+export const STUB_MODE_WARNING =
+  '[attestation] PERMISSIVE MODE: accepting chips without chain validation. ' +
+  'Set PALISADE_ATTESTATION_MODE=strict once every live card carries an ' +
+  'issuer-CA-signed attestation cert.';
+
 export type AttestationMode = 'strict' | 'permissive';
 
+// -----------------------------------------------------------------------------
+// Public types
+// -----------------------------------------------------------------------------
+
+/**
+ * Components extracted from the raw GENERATE_KEYS response.  Field names
+ * preserved from the v1 interface so DB columns (iccPublicKey, attestation)
+ * don't need migration; `certChain` is retained as an alias of `cardCert`
+ * so the call sites that persist it can keep their field name.
+ */
 export interface AttestationExtractResult {
-  /** 65-byte uncompressed SEC1 ICC public key (0x04 || X || Y). */
   iccPubkey: Buffer;
-  /** Variable-length DER ECDSA-SHA-256 signature over (pubkey || CPLC). */
+  /** DER ECDSA-SHA256 signature over (iccPubkey || cplc), produced by the
+   *  card's per-card attestation key.  Legacy alias: `attestation`. */
+  attestSig: Buffer;
+  /** Alias of `attestSig` — existing DB column name is `attestation`. */
   attestation: Buffer;
-  /** 42-byte CPLC / hardware identifier. */
-  cplc: Buffer;
-  /**
-   * Optional cert chain (leaf-first), TLV-encoded as concatenated DER
-   * certificates.  Empty until karta-se v1 lands.  When non-empty, strict
-   * mode will validate chain → vendor root.
-   */
+  /** Per-card attestation cert blob emitted by the card.  Format:
+   *   card_pubkey(65) || cplc(42) || sig(DER)
+   *  where sig is the Issuer CA's signature over (card_pubkey || cplc). */
+  cardCert: Buffer;
+  /** Alias of `cardCert` for call sites that still say `certChain`. */
   certChain: Buffer;
+  /** 42-byte CPLC, peeled out of the card cert body if parseable. */
+  cplc: Buffer;
 }
 
 export interface AttestationVerifyResult {
-  /** True iff verification passed.  In permissive stub mode: always true. */
   ok: boolean;
-  /** Human-readable reason/warning string. */
   warning?: string;
-  /** Detected vendor (when cert chain present). */
-  vendor?: AttestationVendor;
+  /** 4-byte uint32 issuer id from the issuer cert, when verification
+   *  reaches that far.  Useful for per-issuer CloudWatch dimensions. */
+  issuerId?: number;
+}
+
+/**
+ * Boot-time attestation config — pulled from env/Secrets Manager and passed
+ * into strict-mode verification.  Keeping this outside the AttestationVerifier
+ * class means tests can inject synthetic roots without touching process.env.
+ */
+export interface AttestationVerifierConfig {
+  /** 65-byte uncompressed SEC1 P-256 Root CA public key. */
+  rootPubkey: Buffer;
+  /** Issuer cert blob — issuer_pubkey(65) || issuer_id(4) || sig(DER). */
+  issuerCert: Buffer;
 }
 
 // -----------------------------------------------------------------------------
-// Vendor root CA pins
+// Boot-time config gate
 // -----------------------------------------------------------------------------
-//
-// These are PLACEHOLDERS — the real NXP JCOP 5 attestation root and
-// Infineon Secora root will be pinned here after the vendor documentation
-// review.  The format is raw SEC1 uncompressed public key bytes for the
-// root CA's signing key (P-256).  Build-time pinning prevents a compromised
-// PKI from minting cards into our fleet.
-//
-// When updating: get the root cert from the vendor's dev portal, extract
-// the SubjectPublicKey (the 65-byte P-256 point), and paste as hex.
-//
-// PLACEHOLDER VALUES — will be replaced with real vendor root public keys
-// once we have access to the attestation infrastructure.  Strict-mode
-// verification against these placeholders will FAIL — that's intentional
-// until the real pins are in place, AND we refuse to boot in strict
-// mode while they're still placeholders (see `assertAttestationPinsForMode`
-// below).  Operators who flip `PALISADE_ATTESTATION_MODE=strict` without
-// committing real pins get a loud startup error rather than a silent
-// reject-every-tap rollout.
-const NXP_ROOT_P256_PUBKEY_HEX =
-  '00'.repeat(65); // TODO: replace with real NXP JCOP 5 attestation root pubkey
-const INFINEON_ROOT_P256_PUBKEY_HEX =
-  '00'.repeat(65); // TODO: replace with real Infineon Secora attestation root pubkey
 
 /**
- * Boot-time assertion: refuse to run in `strict` mode while BOTH vendor
- * root pins are still the `'00' * 65` placeholder.  Call once at service
- * start (see services/rca/src/index.ts).  This closes audit finding N-2:
- * a misconfigured prod deploy otherwise silently rejects every card tap
- * because every cert-chain validation against an all-zero pubkey fails.
+ * Refuse to run in strict mode when the Karta root pubkey / issuer cert
+ * inputs are missing or obviously wrong-shape.  Called once from
+ * services/rca/src/index.ts at boot.
+ *
+ * Not a full signature check — that would require importing the crypto
+ * key at startup.  Just enough to make "strict mode with nothing
+ * configured" fail loudly instead of silently rejecting every tap.
  */
-export function assertAttestationPinsForMode(mode: AttestationMode): void {
+export function assertAttestationConfigForMode(
+  mode: AttestationMode,
+  cfg: {
+    KARTA_ATTESTATION_ROOT_PUBKEY?: string;
+    KARTA_ATTESTATION_ISSUER_CERT?: string;
+  },
+): void {
   if (mode !== 'strict') return;
-  const nxpPlaceholder = /^0+$/.test(NXP_ROOT_P256_PUBKEY_HEX);
-  const infPlaceholder = /^0+$/.test(INFINEON_ROOT_P256_PUBKEY_HEX);
-  if (nxpPlaceholder && infPlaceholder) {
+
+  const rootHex = cfg.KARTA_ATTESTATION_ROOT_PUBKEY ?? '';
+  const issuerHex = cfg.KARTA_ATTESTATION_ISSUER_CERT ?? '';
+
+  if (!rootHex || !/^[0-9a-fA-F]+$/.test(rootHex) || rootHex.length !== 130) {
     throw new Error(
-      'PALISADE_ATTESTATION_MODE=strict is set, but NXP_ROOT_P256_PUBKEY_HEX ' +
-        'and INFINEON_ROOT_P256_PUBKEY_HEX are still the all-zero ' +
-        'placeholders in attestation-verifier.ts.  Strict mode with placeholder ' +
-        'pins rejects EVERY card; flip back to permissive OR commit the real ' +
-        'vendor root public keys first.',
+      'PALISADE_ATTESTATION_MODE=strict requires KARTA_ATTESTATION_ROOT_PUBKEY ' +
+        'to be a 65-byte SEC1 uncompressed P-256 point (130 hex chars, leading 04). ' +
+        `Got len=${rootHex.length}.`,
+    );
+  }
+  // Placeholder check runs BEFORE the SEC1-prefix check so an all-zero
+  // sentinel (the legacy "not yet configured" convention) surfaces as
+  // "all zeros" rather than the vaguer "missing 0x04 prefix".
+  if (/^0+$/.test(rootHex)) {
+    throw new Error(
+      'KARTA_ATTESTATION_ROOT_PUBKEY is all zeros — strict mode would reject every ' +
+        'tap.  Set the real Root CA public key before flipping strict.',
+    );
+  }
+  if (!rootHex.toLowerCase().startsWith('04')) {
+    throw new Error(
+      'KARTA_ATTESTATION_ROOT_PUBKEY must be uncompressed SEC1 (leading byte 0x04). ' +
+        `Got leading bytes ${rootHex.slice(0, 2)}.`,
+    );
+  }
+
+  if (!issuerHex || !/^[0-9a-fA-F]+$/.test(issuerHex)) {
+    throw new Error(
+      'PALISADE_ATTESTATION_MODE=strict requires KARTA_ATTESTATION_ISSUER_CERT ' +
+        'to be a hex-encoded issuer cert blob (issuer_pubkey[65] || issuer_id[4] || sig).',
+    );
+  }
+  // Smallest plausible issuer cert: 65 + 4 + 68 = 137 bytes = 274 hex chars.
+  if (issuerHex.length < 274) {
+    throw new Error(
+      `KARTA_ATTESTATION_ISSUER_CERT looks truncated: ${issuerHex.length} hex chars ` +
+        `(need at least 274 for the minimal 137-byte issuer cert).`,
     );
   }
 }
 
-// Vendor OID prefixes in the leaf cert's Subject or Issuer DN.  Used to
-// auto-detect which vendor root to verify against.  Reserved for future
-// OID-based detection (today we fall back to substring match on the DN);
-// the constants are kept so the real pin values can be committed alongside
-// them when the vendor cert chain arrives.
-//   NXP PEN       = 1.3.6.1.4.1.26743
-//   Infineon PEN  = 1.3.6.1.4.1.341
+// Back-compat alias for the old name — boot code imports this.
+export const assertAttestationPinsForMode = assertAttestationConfigForMode;
 
 // -----------------------------------------------------------------------------
 // Extract
@@ -132,239 +202,215 @@ export function assertAttestationPinsForMode(mode: AttestationMode): void {
 
 export class AttestationVerifier {
   /**
-   * Split a raw GENERATE_KEYS response buffer into its four components.
+   * Split a raw GENERATE_KEYS response into its three components.
    *
-   * Layout: pubkey(65) || attest_sig(var) || cplc(42) || cert_chain(var)
+   * Layout: iccPubkey(65) || attestSig(DER) || cardCert(var)
    *
-   * Without an explicit length prefix on the variable-length attest_sig,
-   * we locate CPLC by counting backwards from a known-length trailer.
-   * When the cert chain is non-empty, it comes AFTER the CPLC (with a
-   * 2-byte length prefix).
-   *
-   * Short buffers are tolerated (returning empty components) rather than
-   * throwing — keygen sometimes fails silently on bad NFC and we still
-   * want to capture whatever bytes we did receive for offline analysis.
+   * Parsing strategy: iccPubkey is fixed-width; attestSig starts with DER
+   * SEQUENCE (0x30 LL) so its length is self-describing; cardCert is the
+   * remainder.  Tolerates short buffers (returns empty fields) so a
+   * mid-tap NFC dropout still yields something we can log / debug with.
    */
   static extract(keygenResponse: Buffer): AttestationExtractResult {
+    const empty = Buffer.alloc(0);
+    const result: AttestationExtractResult = {
+      iccPubkey: empty,
+      attestSig: empty,
+      attestation: empty,
+      cardCert: empty,
+      certChain: empty,
+      cplc: empty,
+    };
+
+    if (keygenResponse.length === 0) return result;
+
     const iccPubkey = keygenResponse.subarray(
       0,
-      Math.min(ICC_PUBKEY_LEN, keygenResponse.length),
+      Math.min(SEC1_UNCOMPRESSED_LEN, keygenResponse.length),
     );
+    result.iccPubkey = iccPubkey;
 
-    let attestation: Buffer;
-    let cplc: Buffer;
-    let certChain: Buffer = Buffer.alloc(0);
+    if (keygenResponse.length <= SEC1_UNCOMPRESSED_LEN) return result;
 
-    if (keygenResponse.length < ICC_PUBKEY_LEN) {
-      // Response too short even for a pubkey — return what we have.
-      return {
-        iccPubkey,
-        attestation: Buffer.alloc(0),
-        cplc: Buffer.alloc(0),
-        certChain: Buffer.alloc(0),
-      };
-    }
-
-    if (keygenResponse.length < ICC_PUBKEY_LEN + CPLC_LEN) {
-      // Degraded: pubkey + partial trailer.  Treat remainder as sig.
-      return {
-        iccPubkey,
-        attestation: keygenResponse.subarray(ICC_PUBKEY_LEN),
-        cplc: Buffer.alloc(0),
-        certChain: Buffer.alloc(0),
-      };
-    }
-
-    // Full trailer present.  Two layouts to consider:
-    //   v1 (legacy):  pubkey(65) | sig(var) | cplc(42)
-    //   v2 (future):  pubkey(65) | sig(var) | cplc(42) | chainLen(2 BE) | chain(N)
-    //
-    // Peek the last 2 bytes as a candidate chainLen; v2 is accepted only
-    // when that length fits cleanly inside the trailer AND the implied
-    // signature length is within the DER ECDSA-P256 expected range
-    // (64-80 bytes — never exactly 72, but close).  Anything else falls
-    // back to v1 parsing.
-    const total = keygenResponse.length;
-    const candidateChainLen = total >= 2 ? keygenResponse.readUInt16BE(total - 2) : 0;
-    const v2SigLen = total - ICC_PUBKEY_LEN - CPLC_LEN - 2 - candidateChainLen;
-    const v2Plausible =
-      candidateChainLen > 0 &&
-      v2SigLen >= 60 &&
-      v2SigLen <= 80 &&
-      total >= ICC_PUBKEY_LEN + CPLC_LEN + 2 + candidateChainLen;
-
-    if (v2Plausible) {
-      // v2 layout.  But chainLen is at the END of the buffer (after chain
-      // bytes), so read it the right way:
-      //   pubkey | sig | cplc | chain | chainLen(2, big-endian)
-      //
-      // Wait — re-derive.  The applet writes chainLen BEFORE the chain
-      // bytes to let the parser know how much to expect.  Our candidate
-      // reader above was wrong; fix here.
-    }
-
-    // Reset and re-parse with the correct v2 layout:
-    //   pubkey(65) | sig(var) | cplc(42) | chainLen(2 BE) | chain(N)
-    //
-    // To find the boundary we scan from the RIGHT assuming chainLen sits
-    // exactly after cplc (byte positions total - N - 2 .. total - N - 1
-    // where N = chain length).  Fast path: search for a plausible chainLen
-    // that makes the arithmetic work out.
-    //
-    // For response sizes in the 65+60+42 (=167) to 65+80+42+2+N (=~2k)
-    // range, there's only ever zero or one valid (chainLen, sigLen) pair.
-    // Prefer the v2 pair when it exists; fall back to v1 otherwise.
-    const v1SigLen = total - ICC_PUBKEY_LEN - CPLC_LEN;
-    let parsedV2 = false;
-    if (total > ICC_PUBKEY_LEN + CPLC_LEN + 2) {
-      // Potential v2.  chainLen is 2 bytes at (ICC_PUBKEY_LEN + sig + cplc).
-      // Sig length must be in a plausible DER ECDSA-P256 range.  Iterate
-      // candidate chainLens — the correct one makes sigLen valid.
-      for (let n = 1; n < total - ICC_PUBKEY_LEN - CPLC_LEN - 2; n++) {
-        const sigLen = total - ICC_PUBKEY_LEN - CPLC_LEN - 2 - n;
-        if (sigLen < 60 || sigLen > 80) continue;
-        const chainLenOff = ICC_PUBKEY_LEN + sigLen + CPLC_LEN;
-        const readLen = keygenResponse.readUInt16BE(chainLenOff);
-        if (readLen === n) {
-          attestation = keygenResponse.subarray(ICC_PUBKEY_LEN, ICC_PUBKEY_LEN + sigLen);
-          cplc = keygenResponse.subarray(
-            ICC_PUBKEY_LEN + sigLen,
-            ICC_PUBKEY_LEN + sigLen + CPLC_LEN,
-          );
-          certChain = keygenResponse.subarray(
-            chainLenOff + 2,
-            chainLenOff + 2 + n,
-          );
-          parsedV2 = true;
-          break;
+    // Read DER SEQUENCE length for attestSig.  Short-form (< 128) length
+    // is one byte; long-form (0x81 LL) is two; longer forms (0x82+) don't
+    // happen for ECDSA-P256 sigs so we reject anything else as a malformed
+    // trailer and hand the remainder off as an opaque cardCert field for
+    // offline analysis.
+    let attestSigLen = 0;
+    let attestSigBodyOff = 0;
+    const tag = keygenResponse[SEC1_UNCOMPRESSED_LEN];
+    const lenByte = keygenResponse[SEC1_UNCOMPRESSED_LEN + 1];
+    if (tag === 0x30 && lenByte !== undefined) {
+      if ((lenByte & 0x80) === 0) {
+        attestSigLen = 2 + lenByte; // hdr(2) + body
+        attestSigBodyOff = SEC1_UNCOMPRESSED_LEN;
+      } else if (lenByte === 0x81) {
+        const real = keygenResponse[SEC1_UNCOMPRESSED_LEN + 2];
+        if (real !== undefined) {
+          attestSigLen = 3 + real;
+          attestSigBodyOff = SEC1_UNCOMPRESSED_LEN;
         }
       }
     }
 
-    if (!parsedV2) {
-      // v1 layout — sig occupies everything between pubkey and trailing cplc.
-      attestation = keygenResponse.subarray(
-        ICC_PUBKEY_LEN,
-        ICC_PUBKEY_LEN + v1SigLen,
-      );
-      cplc = keygenResponse.subarray(ICC_PUBKEY_LEN + v1SigLen);
+    if (
+      attestSigLen < MIN_DER_SIG_LEN ||
+      attestSigLen > MAX_DER_SIG_LEN ||
+      attestSigBodyOff + attestSigLen > keygenResponse.length
+    ) {
+      // Can't carve a plausible attestSig — give the post-pubkey bytes
+      // back as cardCert for debug.  Strict-mode verify will then
+      // reject on the empty attestSig.
+      result.cardCert = keygenResponse.subarray(SEC1_UNCOMPRESSED_LEN);
+      result.certChain = result.cardCert;
+      return result;
     }
 
-    return { iccPubkey, attestation: attestation!, cplc: cplc!, certChain };
+    result.attestSig = keygenResponse.subarray(
+      attestSigBodyOff,
+      attestSigBodyOff + attestSigLen,
+    );
+    result.attestation = result.attestSig;
+
+    const cardCertOff = attestSigBodyOff + attestSigLen;
+    result.cardCert = keygenResponse.subarray(cardCertOff);
+    result.certChain = result.cardCert;
+
+    // Pull CPLC out of the card cert body if long enough.
+    if (result.cardCert.length >= SEC1_UNCOMPRESSED_LEN + CPLC_LEN) {
+      result.cplc = result.cardCert.subarray(
+        SEC1_UNCOMPRESSED_LEN,
+        SEC1_UNCOMPRESSED_LEN + CPLC_LEN,
+      );
+    }
+
+    return result;
   }
 
   /**
-   * Verify an attestation signature.  Behavior depends on mode:
+   * Verify an extracted attestation.  Strict mode walks the full chain:
+   * Root → Issuer → Card → iccPubkey.  Permissive mode accepts anything
+   * (prints a warning).
    *
-   *   strict     — require non-empty cert chain + signature that verifies
-   *                against the pinned vendor root.  Returns {ok:false} on
-   *                any failure; caller must refuse to continue provisioning.
-   *   permissive — legacy stub.  Always returns {ok:true} with a warning.
-   *                Used until karta-se v1 ships real attestation output.
+   * `config` is only consulted in strict mode.  Callers in permissive
+   * mode may pass `undefined`.
    */
   static verify(
     extract: AttestationExtractResult,
     mode: AttestationMode = 'permissive',
+    config?: AttestationVerifierConfig,
   ): AttestationVerifyResult {
     if (mode === 'permissive') {
-      // Keep the old stub behaviour — accepts everything, logs warning.
-      const sample = extract.attestation.subarray(
+      const sample = extract.attestSig.subarray(
         0,
-        Math.min(16, extract.attestation.length),
+        Math.min(16, extract.attestSig.length),
       );
       // eslint-disable-next-line no-console
       console.log(
-        `[attestation] extract: attLen=${extract.attestation.length} ` +
-          `cplcLen=${extract.cplc.length} chainLen=${extract.certChain.length} ` +
+        `[attestation] extract: sigLen=${extract.attestSig.length} ` +
+          `cardCertLen=${extract.cardCert.length} cplcLen=${extract.cplc.length} ` +
           `first16=${sample.toString('hex').toUpperCase() || '(empty)'}`,
       );
       // eslint-disable-next-line no-console
       console.warn(STUB_MODE_WARNING);
-      return {
-        ok: true,
-        warning: 'attestation verification in permissive mode',
-      };
+      return { ok: true, warning: 'attestation verification in permissive mode' };
     }
 
     // === STRICT MODE ===
-    if (extract.certChain.length === 0) {
+    if (!config) {
       return {
         ok: false,
         warning:
-          'strict mode requires a non-empty attestation cert chain; ' +
-          'the PA applet returned none (karta-se v1 must include cert chain in GENERATE_KEYS response)',
+          'strict mode requires AttestationVerifierConfig (rootPubkey + issuerCert); ' +
+          'none provided',
       };
     }
-    if (extract.attestation.length === 0 || extract.cplc.length !== CPLC_LEN) {
+    if (config.rootPubkey.length !== SEC1_UNCOMPRESSED_LEN || config.rootPubkey[0] !== 0x04) {
+      return { ok: false, warning: 'rootPubkey malformed (expected 65-byte uncompressed SEC1)' };
+    }
+
+    // 1. Verify the issuer cert was signed by the Root CA.  Do this every
+    //    time rather than caching the result — boot-time caching invites
+    //    the "what if the env changed mid-process" bug class, and the
+    //    three ECDSA verifies combined are <1 ms even on t3.micro.
+    const issuerParsed = parseIssuerCert(config.issuerCert);
+    if (!issuerParsed.ok) {
+      return { ok: false, warning: `malformed issuerCert: ${issuerParsed.reason}` };
+    }
+    const rootKey = sec1PointToKeyObject(config.rootPubkey);
+    if (!rootKey) {
+      return { ok: false, warning: 'could not import rootPubkey' };
+    }
+    if (!verifySigOverBody(issuerParsed.body, issuerParsed.sig, rootKey)) {
+      return { ok: false, warning: 'issuer cert signature does not verify against Root CA' };
+    }
+    const issuerId = issuerParsed.issuerId;
+    const issuerKey = sec1PointToKeyObject(issuerParsed.issuerPubkey);
+    if (!issuerKey) {
+      return { ok: false, warning: 'could not import issuer pubkey from cert', issuerId };
+    }
+
+    // 2. Verify the card cert was signed by the Issuer CA.
+    const cardParsed = parseCardCert(extract.cardCert);
+    if (!cardParsed.ok) {
       return {
         ok: false,
-        warning: `malformed attestation: sigLen=${extract.attestation.length} cplcLen=${extract.cplc.length}`,
+        warning: `malformed cardCert: ${cardParsed.reason}`,
+        issuerId,
       };
     }
-
-    // 1. Parse cert chain (leaf-first) — split concatenated DER.
-    const certs = splitDerChain(extract.certChain);
-    if (certs.length === 0) {
-      return { ok: false, warning: 'could not parse any certs from chain' };
-    }
-
-    const leaf = certs[0];
-    const vendor = detectVendor(leaf);
-    const rootPubkey = pinnedRootPubkey(vendor);
-    if (!rootPubkey) {
+    if (!verifySigOverBody(cardParsed.body, cardParsed.sig, issuerKey)) {
       return {
         ok: false,
-        warning: `unknown vendor for leaf cert (issuer=${leaf.issuer}); no pinned root`,
-        vendor,
+        warning: 'card cert signature does not verify against Issuer CA',
+        issuerId,
       };
     }
 
-    // 2. Validate chain → pinned root.  Walks leaf → intermediate → ... →
-    //    top-of-chain, verifying each cert's signature with the next's
-    //    public key.  The final cert in the chain must be signed by the
-    //    pinned root.
-    const chainOk = verifyCertChainToRoot(certs, rootPubkey);
-    if (!chainOk.ok) {
+    // 3. Card cert must bind this session's CPLC.  The cpls we carved out
+    //    of cardCert in extract() must equal cardParsed.cplc — they come
+    //    from the same bytes, so this is a tautology check that guards
+    //    against future refactors silently desyncing the two readers.
+    if (!extract.cplc.equals(cardParsed.cplc)) {
       return {
         ok: false,
-        warning: `cert chain invalid: ${chainOk.reason}`,
-        vendor,
+        warning: 'extract.cplc does not match cardCert.cplc (internal parser desync)',
+        issuerId,
       };
     }
 
-    // 3. Verify the attestation signature over (pubkey || CPLC) with the
-    //    leaf's public key.
-    const leafKey = createPublicKey(leaf.publicKey.export({ format: 'der', type: 'spki' }));
-    const sigOk = verifyAttestationSignature(
-      extract.iccPubkey,
-      extract.cplc,
-      extract.attestation,
-      leafKey,
-    );
-    if (!sigOk) {
+    // 4. Verify the attestation signature over (iccPubkey || cplc) with
+    //    the card's pubkey from the card cert.  This is the actual
+    //    binding from card identity to this session's ephemeral pubkey.
+    if (extract.attestSig.length < MIN_DER_SIG_LEN) {
       return {
         ok: false,
-        warning: 'attestation ECDSA signature does not verify against leaf cert',
-        vendor,
+        warning: `attestSig too short: ${extract.attestSig.length} bytes`,
+        issuerId,
+      };
+    }
+    const cardKey = sec1PointToKeyObject(cardParsed.cardPubkey);
+    if (!cardKey) {
+      return { ok: false, warning: 'could not import card pubkey from cert', issuerId };
+    }
+    const signed = Buffer.concat([extract.iccPubkey, extract.cplc]);
+    if (!verifySigOverBody(signed, extract.attestSig, cardKey)) {
+      return {
+        ok: false,
+        warning: 'attestation signature does not verify against card cert pubkey',
+        issuerId,
       };
     }
 
-    return { ok: true, vendor };
+    return { ok: true, issuerId };
   }
 }
 
 /**
- * Low-level attestation signature check.  Exported so unit tests can
- * exercise the ECDSA-SHA256 path with a synthetic EC keypair — building
- * a full X.509 cert chain in tests requires a third-party library we
- * don't want to add just for that.  Production callers (verify() above)
- * funnel through here too, so test coverage of this helper directly
- * exercises the same code path.
- *
- * Signed bytes: (iccPubkey || cplc).  Returns true on valid DER ECDSA
- * signature, false on any malformed/mismatched input.  `createVerify`
- * is strict about DER structure so malformed sig bytes return false
- * rather than throwing.
+ * Low-level ECDSA-SHA256 verify over an arbitrary message.  Exported so
+ * unit tests can exercise the signature path without building full cert
+ * blobs; production callers funnel through verify() above.
  */
 export function verifyAttestationSignature(
   iccPubkey: Buffer,
@@ -373,91 +419,69 @@ export function verifyAttestationSignature(
   leafPubkey: KeyObject,
 ): boolean {
   const signed = Buffer.concat([iccPubkey, cplc]);
-  const v = createVerify('SHA256');
-  v.update(signed);
-  try {
-    return v.verify(leafPubkey, attestation);
-  } catch {
-    // `createVerify` throws on structurally-invalid DER — treat as
-    // rejection rather than propagating so callers see a consistent
-    // "false" on any bad input.
-    return false;
-  }
+  return verifySigOverBody(signed, attestation, leafPubkey);
 }
 
 // -----------------------------------------------------------------------------
 // Internal helpers
 // -----------------------------------------------------------------------------
 
-/** Parse a concatenated DER cert chain into X509Certificate objects. */
-function splitDerChain(chain: Buffer): X509Certificate[] {
-  const certs: X509Certificate[] = [];
-  let off = 0;
-  while (off < chain.length) {
-    // DER SEQUENCE tag = 0x30, then length.
-    if (chain[off] !== 0x30) break;
-    const lenByte = chain[off + 1];
-    let len: number;
-    let hdr: number;
-    if ((lenByte & 0x80) === 0) {
-      len = lenByte;
-      hdr = 2;
-    } else {
-      const lenOfLen = lenByte & 0x7f;
-      if (lenOfLen < 1 || lenOfLen > 4) break;
-      len = 0;
-      for (let i = 0; i < lenOfLen; i++) {
-        len = (len << 8) | chain[off + 2 + i];
-      }
-      hdr = 2 + lenOfLen;
-    }
-    const total = hdr + len;
-    if (off + total > chain.length) break;
-    try {
-      const certDer = chain.subarray(off, off + total);
-      certs.push(new X509Certificate(certDer));
-    } catch {
-      // Corrupt cert — stop parsing here.
-      break;
-    }
-    off += total;
+type ParsedIssuerCert =
+  | { ok: true; body: Buffer; issuerPubkey: Buffer; issuerId: number; sig: Buffer }
+  | { ok: false; reason: string };
+
+type ParsedCardCert =
+  | { ok: true; body: Buffer; cardPubkey: Buffer; cplc: Buffer; sig: Buffer }
+  | { ok: false; reason: string };
+
+/**
+ * Issuer cert layout: issuer_pubkey(65) || issuer_id(4) || sig(DER).
+ * The signed body is `issuer_pubkey || issuer_id` (first 69 bytes).
+ */
+function parseIssuerCert(blob: Buffer): ParsedIssuerCert {
+  const bodyLen = SEC1_UNCOMPRESSED_LEN + ISSUER_ID_LEN;
+  if (blob.length < bodyLen + MIN_DER_SIG_LEN) {
+    return { ok: false, reason: `blob too short: ${blob.length} bytes` };
   }
-  return certs;
+  const body = blob.subarray(0, bodyLen);
+  const issuerPubkey = body.subarray(0, SEC1_UNCOMPRESSED_LEN);
+  if (issuerPubkey[0] !== 0x04) {
+    return { ok: false, reason: 'issuer_pubkey missing 0x04 SEC1 prefix' };
+  }
+  const issuerId = body.readUInt32BE(SEC1_UNCOMPRESSED_LEN);
+  const sig = blob.subarray(bodyLen);
+  if (sig[0] !== 0x30) {
+    return { ok: false, reason: `sig not DER SEQUENCE (first byte ${sig[0].toString(16)})` };
+  }
+  return { ok: true, body, issuerPubkey, issuerId, sig };
 }
 
-/** Auto-detect vendor from leaf cert DN. */
-function detectVendor(leaf: X509Certificate): AttestationVendor {
-  const subject = leaf.subject.toLowerCase();
-  const issuer = leaf.issuer.toLowerCase();
-  const haystack = subject + ' ' + issuer;
-  if (haystack.includes('nxp')) return 'nxp';
-  if (haystack.includes('infineon')) return 'infineon';
-  // Fall back to PEN OID lookup on extensions if available.
-  return 'unknown';
+/**
+ * Card cert layout: card_pubkey(65) || cplc(42) || sig(DER).
+ * The signed body is `card_pubkey || cplc` (first 107 bytes).
+ */
+function parseCardCert(blob: Buffer): ParsedCardCert {
+  const bodyLen = SEC1_UNCOMPRESSED_LEN + CPLC_LEN;
+  if (blob.length < bodyLen + MIN_DER_SIG_LEN) {
+    return { ok: false, reason: `blob too short: ${blob.length} bytes` };
+  }
+  const body = blob.subarray(0, bodyLen);
+  const cardPubkey = body.subarray(0, SEC1_UNCOMPRESSED_LEN);
+  if (cardPubkey[0] !== 0x04) {
+    return { ok: false, reason: 'card_pubkey missing 0x04 SEC1 prefix' };
+  }
+  const cplc = body.subarray(SEC1_UNCOMPRESSED_LEN, bodyLen);
+  const sig = blob.subarray(bodyLen);
+  if (sig[0] !== 0x30) {
+    return { ok: false, reason: `sig not DER SEQUENCE (first byte ${sig[0].toString(16)})` };
+  }
+  return { ok: true, body, cardPubkey, cplc, sig };
 }
 
-/** Return the pinned P-256 public key for a vendor, or null if unknown. */
-function pinnedRootPubkey(vendor: AttestationVendor): KeyObject | null {
-  let hex: string;
-  switch (vendor) {
-    case 'nxp':
-      hex = NXP_ROOT_P256_PUBKEY_HEX;
-      break;
-    case 'infineon':
-      hex = INFINEON_ROOT_P256_PUBKEY_HEX;
-      break;
-    default:
-      return null;
-  }
-  if (/^0+$/.test(hex)) {
-    // Placeholder not yet replaced — return null so strict mode rejects.
-    return null;
-  }
+/** Wrap a raw 65-byte SEC1 P-256 point into a node KeyObject for verify. */
+function sec1PointToKeyObject(rawPoint: Buffer): KeyObject | null {
   try {
-    // Wrap raw 65-byte SEC1 point in an SPKI structure by letting node
-    // parse it via the pem path.  For placeholders this won't run; real
-    // pins come in a future commit alongside vendor root certs.
-    const spki = rawPointToSpkiDer(Buffer.from(hex, 'hex'));
+    const spki = rawPointToSpkiDer(rawPoint);
     return createPublicKey({ key: spki, format: 'der', type: 'spki' });
   } catch {
     return null;
@@ -466,21 +490,22 @@ function pinnedRootPubkey(vendor: AttestationVendor): KeyObject | null {
 
 /**
  * Wrap a raw 65-byte SEC1 P-256 public point into the minimal SPKI DER
- * envelope so node:crypto can import it.  Used for pinning vendor roots.
+ * envelope so node:crypto can import it without going through PEM.
+ * Same byte-math as EMV Book 2 §5.9 Table 7 SPKI encoding.
  */
 function rawPointToSpkiDer(rawPoint: Buffer): Buffer {
-  if (rawPoint.length !== 65 || rawPoint[0] !== 0x04) {
-    throw new Error('expected 65-byte uncompressed SEC1 P-256 point');
+  if (rawPoint.length !== SEC1_UNCOMPRESSED_LEN || rawPoint[0] !== 0x04) {
+    throw new Error('expected 65-byte uncompressed SEC1 P-256 point (0x04 || X || Y)');
   }
-  // SPKI for P-256:
+  // SPKI:
   //   SEQUENCE {
-  //     SEQUENCE { OID 1.2.840.10045.2.1 ecPublicKey, OID 1.2.840.10045.3.1.7 P-256 },
+  //     SEQUENCE { OID ecPublicKey(1.2.840.10045.2.1), OID P-256(1.2.840.10045.3.1.7) },
   //     BIT STRING { 0x00 || raw 65-byte point }
   //   }
   const algIdent = Buffer.from(
-    '3013' + // SEQUENCE length 0x13
-    '0607' + '2a8648ce3d0201' + // OID ecPublicKey
-    '0608' + '2a8648ce3d030107', // OID P-256
+    '3013' +
+      '0607' + '2a8648ce3d0201' +
+      '0608' + '2a8648ce3d030107',
     'hex',
   );
   const bitString = Buffer.concat([
@@ -488,43 +513,21 @@ function rawPointToSpkiDer(rawPoint: Buffer): Buffer {
     rawPoint,
   ]);
   const inner = Buffer.concat([algIdent, bitString]);
-  return Buffer.concat([
-    Buffer.from([0x30, 0x81, inner.length]),
-    inner,
-  ]);
+  return Buffer.concat([Buffer.from([0x30, 0x81, inner.length]), inner]);
 }
 
-/**
- * Walk a leaf-first cert chain verifying each cert's signature with the
- * next cert's public key, until the top-of-chain is reached, then verify
- * the top-of-chain is signed by the pinned root (or IS the pinned root).
- */
-function verifyCertChainToRoot(
-  certs: X509Certificate[],
-  rootPubkey: KeyObject,
-): { ok: true } | { ok: false; reason: string } {
-  // Validate sig of cert[i] using cert[i+1].publicKey.
-  for (let i = 0; i < certs.length - 1; i++) {
-    if (!certs[i].verify(certs[i + 1].publicKey)) {
-      return { ok: false, reason: `cert[${i}] signature does not verify with cert[${i + 1}] pubkey` };
-    }
+/** Single-shot ECDSA-SHA256 verify; returns false on any structural error. */
+function verifySigOverBody(
+  body: Buffer,
+  sig: Buffer,
+  pubkey: KeyObject,
+): boolean {
+  const v = createVerify('SHA256');
+  v.update(body);
+  try {
+    return v.verify(pubkey, sig);
+  } catch {
+    // createVerify throws on malformed DER — treat as rejection.
+    return false;
   }
-  // Verify the top-of-chain against the pinned root.
-  const top = certs[certs.length - 1];
-  if (!top.verify(rootPubkey)) {
-    return {
-      ok: false,
-      reason: 'top-of-chain cert does not verify against pinned vendor root',
-    };
-  }
-  // Check dates.
-  const now = new Date();
-  for (const c of certs) {
-    const validFrom = new Date(c.validFrom);
-    const validTo = new Date(c.validTo);
-    if (now < validFrom || now > validTo) {
-      return { ok: false, reason: `cert outside validity window (${c.subject})` };
-    }
-  }
-  return { ok: true };
 }

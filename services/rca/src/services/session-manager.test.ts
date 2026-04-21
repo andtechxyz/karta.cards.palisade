@@ -701,9 +701,16 @@ describe('SessionManager', () => {
     it('persists the attestation bytes on the session row', async () => {
       // Distinctive attestation payload so we can verify it was saved
       // verbatim (byte-for-byte) rather than truncated or reshaped.
+      // DER ECDSA-P256 sig structure:
+      //   SEQUENCE(0x45=69) { INTEGER(0x21, leading-0 || 32×0x11),
+      //                       INTEGER(0x20, leading-0 || 31×0x22) }
+      // The trailing INTEGER needs 31 bytes of 0x22 so the SEQUENCE
+      // length (69) matches the real body length — earlier versions
+      // of this fixture had 30 bytes which was 1 short and only
+      // worked against the old fixed-trailer parser.
       const pub = Buffer.alloc(65, 0x04);
       const sig = Buffer.from(
-        '3045022100' + '11'.repeat(32) + '022000' + '22'.repeat(30),
+        '3045022100' + '11'.repeat(32) + '022000' + '22'.repeat(31),
         'hex',
       );
       const cplc = Buffer.alloc(42, 0xCC);

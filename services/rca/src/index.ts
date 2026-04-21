@@ -22,7 +22,7 @@ import { requireSignedRequest, captureRawBody } from '@palisade/service-auth';
 import { errorMiddleware, apiRateLimit } from '@palisade/core';
 import { prisma } from '@palisade/db';
 import { verifyHandoff, HandoffError } from '@palisade/handoff';
-import { assertAttestationPinsForMode } from './services/attestation-verifier.js';
+import { assertAttestationConfigForMode } from './services/attestation-verifier.js';
 
 import { getRcaConfig } from './env.js';
 import { createProvisionRouter } from './routes/provision.routes.js';
@@ -30,10 +30,14 @@ import { handleRelayConnection } from './ws/relay-handler.js';
 
 const config = getRcaConfig();
 
-// Boot-time invariant: refuse to start in strict attestation mode while
-// the vendor root public-key pins are still placeholders.  Otherwise
-// strict mode silently rejects every tap (N-2 from the PCI audit).
-assertAttestationPinsForMode(config.PALISADE_ATTESTATION_MODE);
+// Boot-time invariant: refuse to start in strict attestation mode when
+// the Karta Root pubkey / Issuer cert blob are missing or malformed —
+// strict mode would otherwise reject every tap silently.  Closes audit
+// finding N-2.  In permissive mode this is a no-op.
+assertAttestationConfigForMode(config.PALISADE_ATTESTATION_MODE, {
+  KARTA_ATTESTATION_ROOT_PUBKEY: config.KARTA_ATTESTATION_ROOT_PUBKEY,
+  KARTA_ATTESTATION_ISSUER_CERT: config.KARTA_ATTESTATION_ISSUER_CERT,
+});
 
 const app = express();
 const server = createServer(app);

@@ -376,6 +376,30 @@ ensure_secret "palisade/WS_TOKEN_SECRET"           "CHANGEME"
 # atomically.  Format: 64 hex chars.
 ensure_secret "palisade/CALLBACK_HMAC_SECRET"      "CHANGEME"
 
+# -------- Attestation PKI (Option A: compact binary certs, no X.509) --------
+# Root CA → Issuer CA → Card cert.  Keys live in KMS, not in app state:
+#   alias/palisade-attestation-root     — Root CA (signs the issuer cert
+#                                          blob; rotate quarterly).
+#   alias/palisade-attestation-issuer   — Issuer CA (signs per-card card
+#                                          cert blobs during perso; rotate
+#                                          monthly; used via kms:Sign).
+#
+# The Root public key is pinned in rca's verifier (env-loaded; see
+# services/rca/src/services/attestation-verifier.ts::assertAttestation
+# ConfigForMode).  The Issuer cert blob is re-verified against the Root
+# on every tap — no boot-time caching to avoid "what if env changed"
+# bug classes.
+#
+# Rotation: when the Root CA key rotates, re-sign the Issuer cert blob
+# with the new Root key and update KARTA_ATTESTATION_ISSUER_CERT +
+# KARTA_ATTESTATION_ROOT_PUBKEY atomically (same ECS deploy).  When the
+# Issuer CA key rotates, update just the Issuer cert blob — Root CA
+# stays pinned.  Existing card certs issued under an old Issuer key
+# keep verifying against the cert blob that was signed at their
+# issuance time.
+ensure_secret "palisade/KARTA_ATTESTATION_ROOT_PUBKEY" "CHANGEME"
+ensure_secret "palisade/KARTA_ATTESTATION_ISSUER_CERT" "CHANGEME"
+
 # -------- Activation service URLs --------
 ensure_secret "palisade/ACTIVATION_SERVICE_URL"    "http://internal-vera-internal-886106335.ap-southeast-2.elb.amazonaws.com:3002"
 # Alias under the rca-facing name.  Same URL, different secret name — kept
@@ -513,6 +537,8 @@ ARN_CARD_OPS_PUBLIC_WS_BASE=$(get_secret_arn "palisade/CARD_OPS_PUBLIC_WS_BASE")
 ARN_RCA_PUBLIC_WS_BASE=$(get_secret_arn "palisade/RCA_PUBLIC_WS_BASE")
 ARN_ACTIVATION_CALLBACK_URL=$(get_secret_arn "palisade/ACTIVATION_CALLBACK_URL")
 ARN_WS_TOKEN_SECRET=$(get_secret_arn "palisade/WS_TOKEN_SECRET")
+ARN_KARTA_ATTESTATION_ROOT_PUBKEY=$(get_secret_arn "palisade/KARTA_ATTESTATION_ROOT_PUBKEY")
+ARN_KARTA_ATTESTATION_ISSUER_CERT=$(get_secret_arn "palisade/KARTA_ATTESTATION_ISSUER_CERT")
 ARN_SFTP_USERS=$(get_secret_arn "palisade/SFTP_USERS")
 ARN_SFTP_POLL_INTERVAL_MS=$(get_secret_arn "palisade/SFTP_POLL_INTERVAL_MS")
 ARN_SFTP_STABILITY_MS=$(get_secret_arn "palisade/SFTP_STABILITY_MS")
@@ -800,11 +826,13 @@ aws ecs register-task-definition --region "$REGION" --cli-input-json "$(cat <<TA
         { "name": "RCA_ENABLE_PARAM_BUNDLE", "value": "1" }
       ],
       "secrets": [
-        { "name": "DATABASE_URL",         "valueFrom": "${ARN_DATABASE_URL}" },
-        { "name": "PROVISION_AUTH_KEYS",  "valueFrom": "${ARN_PROVISION_AUTH_KEYS}" },
-        { "name": "CALLBACK_HMAC_SECRET", "valueFrom": "${ARN_CALLBACK_HMAC_SECRET}" },
-        { "name": "KMS_SAD_KEY_ARN",      "valueFrom": "${ARN_KMS_SAD_KEY_ARN}" },
-        { "name": "WS_TOKEN_SECRET",      "valueFrom": "${ARN_WS_TOKEN_SECRET}" }
+        { "name": "DATABASE_URL",                   "valueFrom": "${ARN_DATABASE_URL}" },
+        { "name": "PROVISION_AUTH_KEYS",            "valueFrom": "${ARN_PROVISION_AUTH_KEYS}" },
+        { "name": "CALLBACK_HMAC_SECRET",           "valueFrom": "${ARN_CALLBACK_HMAC_SECRET}" },
+        { "name": "KMS_SAD_KEY_ARN",                "valueFrom": "${ARN_KMS_SAD_KEY_ARN}" },
+        { "name": "WS_TOKEN_SECRET",                "valueFrom": "${ARN_WS_TOKEN_SECRET}" },
+        { "name": "KARTA_ATTESTATION_ROOT_PUBKEY",  "valueFrom": "${ARN_KARTA_ATTESTATION_ROOT_PUBKEY}" },
+        { "name": "KARTA_ATTESTATION_ISSUER_CERT",  "valueFrom": "${ARN_KARTA_ATTESTATION_ISSUER_CERT}" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",

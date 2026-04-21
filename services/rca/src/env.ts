@@ -73,15 +73,33 @@ const { get: _getRcaConfigRaw, reset: _resetRcaConfigRaw } = defineEnv({
   RCA_ALLOW_MINIMAL_SAD: z.enum(['0', '1']).default('0'),
 
   // --- Attestation mode (patent claim C16/C23) ----------------------------
-  // strict     — require non-empty attestation cert chain from the PA that
-  //              validates to a pinned vendor root (NXP JCOP 5 or Infineon
-  //              Secora).  Refuse to ship TRANSFER_SAD if verification
-  //              fails.  Required for PCI/patent compliance.
-  // permissive — stub mode: accept everything, log a warning banner.  Used
-  //              until karta-se applet v1 ships real attestation output.
-  // Default is `permissive` for backward compatibility during rollout; a
-  // karta-se v1 deployment should flip this to `strict` via ECS task def.
+  // strict     — verify the Root → Issuer → Card → iccPubkey chain on
+  //              every GENERATE_KEYS response.  Root pubkey comes from
+  //              KARTA_ATTESTATION_ROOT_PUBKEY, the issuer cert blob from
+  //              KARTA_ATTESTATION_ISSUER_CERT.  Refuse to ship
+  //              TRANSFER_PARAMS / TRANSFER_SAD if any link fails.
+  //              Required for PCI/patent compliance.
+  // permissive — accept everything; log a warning banner.  Used during
+  //              rollout while re-personalising the live fleet with
+  //              issuer-signed attestation certs.
+  // Default is `permissive`; flip to `strict` via ECS task def once
+  // every card in the fleet carries an issuer cert.
   PALISADE_ATTESTATION_MODE: z.enum(['strict', 'permissive']).default('permissive'),
+
+  // --- Attestation PKI inputs (Option A: compact binary certs, no X.509) ---
+  // KARTA_ATTESTATION_ROOT_PUBKEY: 65-byte SEC1 uncompressed P-256 point
+  // (0x04 || X || Y) of the Karta Root CA.  Verifier pins this; rotation
+  // means updating the secret + re-signing the issuer cert.
+  //
+  // KARTA_ATTESTATION_ISSUER_CERT: issuer_pubkey(65) || issuer_id(4) ||
+  // sig(DER ECDSA-SHA256 over the first 69 bytes, signed by Root CA).
+  // Verifier re-verifies this blob on every request — no boot-time caching.
+  //
+  // Both vars are optional in permissive mode so dev / e2e stays unblocked.
+  // Strict mode requires both present and shape-correct (see
+  // assertAttestationConfigForMode in attestation-verifier.ts).
+  KARTA_ATTESTATION_ROOT_PUBKEY: z.string().default(''),
+  KARTA_ATTESTATION_ISSUER_CERT: z.string().default(''),
 
   // --- ParamBundle prototype flag (patent C17/C22) -----------------------
   // Master kill-switch for the chip-computed-DGI prototype path.

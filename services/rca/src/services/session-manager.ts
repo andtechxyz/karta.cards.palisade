@@ -29,7 +29,27 @@ import {
   type PlanContext,
   type PlanStep,
 } from './plan-builder.js';
-import { AttestationVerifier } from './attestation-verifier.js';
+import {
+  AttestationVerifier,
+  type AttestationMode,
+  type AttestationVerifierConfig,
+} from './attestation-verifier.js';
+
+/**
+ * Build the AttestationVerifier strict-mode config from the rca env.
+ * Returns undefined in permissive mode (verify() accepts undefined
+ * there).  Hex-decode happens on every call — inexpensive for the
+ * handful of attestation verifies per tap and avoids a module-scope
+ * cache that would need test invalidation.
+ */
+function attestationConfigFor(mode: AttestationMode): AttestationVerifierConfig | undefined {
+  if (mode !== 'strict') return undefined;
+  const cfg = getRcaConfig();
+  return {
+    rootPubkey: Buffer.from(cfg.KARTA_ATTESTATION_ROOT_PUBKEY, 'hex'),
+    issuerCert: Buffer.from(cfg.KARTA_ATTESTATION_ISSUER_CERT, 'hex'),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -847,7 +867,7 @@ export class SessionManager {
     const extracted = AttestationVerifier.extract(respData);
     const { iccPubkey, attestation } = extracted;
     const mode = getRcaConfig().PALISADE_ATTESTATION_MODE;
-    const verifyResult = AttestationVerifier.verify(extracted, mode);
+    const verifyResult = AttestationVerifier.verify(extracted, mode, attestationConfigFor(mode));
     metrics().counter('rca.attestation.verify', 1, {
       mode,
       result: verifyResult.ok ? 'ok' : 'fail',
@@ -1286,10 +1306,11 @@ export class SessionManager {
     const { iccPubkey, attestation } = extracted;
     // Patent C23 checkpoint: verify attestation before phone executes the
     // next step of the plan.  In strict mode, a failing verdict aborts the
-    // session so TRANSFER_SAD never runs.  In permissive mode, we log a
-    // warning and continue — this is the legacy path until karta-se v1.
+    // session so TRANSFER_PARAMS / TRANSFER_SAD never runs.  In permissive
+    // mode, we log a warning and continue — rollout path until the live
+    // fleet has been re-personalised with issuer-signed attestation certs.
     const mode = getRcaConfig().PALISADE_ATTESTATION_MODE;
-    const verifyResult = AttestationVerifier.verify(extracted, mode);
+    const verifyResult = AttestationVerifier.verify(extracted, mode, attestationConfigFor(mode));
     metrics().counter('rca.attestation.verify', 1, {
       mode,
       result: verifyResult.ok ? 'ok' : 'fail',
