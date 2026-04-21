@@ -1,9 +1,14 @@
 # Prototype branch — state for review
 
 **Branch:** `prototype/mchip-chip-computed-dgi`
-**Latest commit:** `6209319` (card-ops CAP toggle for pa-v1 / pa-v3 coexistence)
-**Test status:** 91/91 card-ops + 59 prototype-suite tests pass. Full repo run still green.
-**Phase 1–7 complete + applet compiled + CAP toggle wired into card-ops.**
+**Latest commit:** `cde5f8d` (data-prep KMS_SAD_KEY_ARN="none" dev-sentinel)
+**Test status:** 782 passed, 0 failed, 6 skipped — full vitest pass.
+**Deployed:** `palisade-rca` + `palisade-data-prep` running prototype images
+(`cde5f8d`), `RCA_ENABLE_PARAM_BUNDLE=1` on rca.  Post-rename cluster.
+**Trial card (`e2e_fi_2590`) is tap-ready** — pa-v3 installed at AID
+`A0000000625041034C`, ChipProfile flipped to `PARAM_BUNDLE`,
+ParamRecord `cmo89jhp7…` seeded (status=READY, schemeByte=0x01,
+cvnByte=18), Card.paramRecordId linked.
 
 ## What's built (ready for review)
 
