@@ -178,15 +178,23 @@ describe('buildTransferSadApdu — real metadata plumbing', () => {
     const bigSad = Buffer.alloc(300, 0xAB);
     const apdu = buildTransferSadApdu(makeCtx({ sadPayload: bigSad }));
 
-    // Extended header: 80 E2 00 00 00 Lc-hi Lc-lo
+    // Case-4 extended header: 80 E2 00 00 00 Lc-hi Lc-lo ... Le-hi Le-lo
+    // iOS CoreNFC rejects case-3 extended (no Le) at the ISO-DEP layer,
+    // so the builder appends Le=0000 meaning "up to 65536 bytes".  pa-v1
+    // never exercised the extended path on real silicon (SAD blobs
+    // stayed <255 B), so this form is what production has to emit.
     expect(apdu[0]).toBe(0x80);
     expect(apdu[1]).toBe(0xE2);
     expect(apdu[2]).toBe(0x00);
     expect(apdu[3]).toBe(0x00);
     expect(apdu[4]).toBe(0x00); // extended marker
     const lcExt = apdu.readUInt16BE(5);
-    expect(lcExt).toBe(apdu.length - 7); // total - (4-byte header + marker + 2-byte Lc)
+    // total = 4-byte header + marker(1) + Lc(2) + body(Lc) + Le(2) = Lc + 9
+    expect(lcExt).toBe(apdu.length - 9);
     expect(lcExt).toBeGreaterThan(255);
+    // Trailing Le = 00 00.
+    expect(apdu[apdu.length - 2]).toBe(0x00);
+    expect(apdu[apdu.length - 1]).toBe(0x00);
   });
 
   it('rejects a postProvisionUrl longer than 255 bytes', () => {

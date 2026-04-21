@@ -63,11 +63,20 @@ describe('buildParamBundleApdu — TRANSFER_PARAMS wire shape', () => {
     expect(apdu[1]).toBe(0xE2);
     expect(apdu[2]).toBe(0x00);
     expect(apdu[3]).toBe(0x00);
-    // Extended APDU: byte 4 = 0x00, bytes 5-6 = big-endian Lc.
+    // Case-4 extended APDU:
+    //   byte 4        = 0x00 (ext marker)
+    //   bytes 5-6     = big-endian Lc
+    //   bytes 7..7+Lc = body
+    //   last 2 bytes  = Le = 0x00 0x00 ("up to 65536 bytes of response")
     expect(apdu[4]).toBe(0x00);
     const lc = (apdu[5] << 8) | apdu[6];
     expect(lc).toBe(513);
-    expect(apdu.length).toBe(7 + 513);
+    expect(apdu.length).toBe(7 + 513 + 2);
+    // Trailing Le = 00 00.  Forces case-4 extended — iOS CoreNFC rejects
+    // case-3 extended at the ISO-DEP layer (SW=6700 was the first
+    // real-chip manifestation of that reject).
+    expect(apdu[apdu.length - 2]).toBe(0x00);
+    expect(apdu[apdu.length - 1]).toBe(0x00);
   });
 
   it('round-trips through unwrap — proves the APDU is consumable by pa-v3', () => {

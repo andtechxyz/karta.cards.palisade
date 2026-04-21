@@ -95,6 +95,11 @@ public class ProvisioningAgentV3 extends Applet {
     private byte[] sessionId;
     private short sessionIdLen;
 
+    /** Accumulated byte count when receiving TRANSFER_PARAMS as a
+     *  series of chained short APDUs (CLA bit 0x10 set on non-final
+     *  chunks).  Reset to 0 on the final chunk AFTER processing. */
+    private short chainOff;
+
     /** NVM storage for each DGI's TLV payload. */
     private byte[] dgi0101Nvm;
     private short dgi0101Len;
@@ -186,11 +191,17 @@ public class ProvisioningAgentV3 extends Applet {
         dgi9201Nvm = new byte[64];
 
         // Transient RAM — auto-cleared on deselect.  We need the full
-        // APDU body in RAM for ECDH unwrap since AES-GCM's tag verify
-        // needs the full ciphertext in one pass.  500+ bytes is fine
-        // on JCOP 5 (typical RAM is 4-8 KB).
-        wireBuf    = JCSystem.makeTransientByteArray((short) 512, JCSystem.CLEAR_ON_DESELECT);
-        bundleBuf  = JCSystem.makeTransientByteArray((short) 512, JCSystem.CLEAR_ON_DESELECT);
+        // APDU body in RAM for ECDH unwrap since the HMAC tag verify
+        // needs the full ciphertext in one pass.  Real TRANSFER_PARAMS
+        // bodies run ~700-800 B (65 pubkey + 16 IV + 16 HMAC + ct
+        // where ct is the AES-CBC-padded bundle ~ 600 B).  1024 B
+        // leaves headroom for larger ParamBundles (iCVV rotation,
+        // post-provisioning URLs longer than 64 B, etc.).
+        //
+        // JCOP 5 transient RAM budget is 4-8 KB so 1024 B here plus
+        // the 1024 B bundleBuf stays well inside budget.
+        wireBuf    = JCSystem.makeTransientByteArray((short) 1024, JCSystem.CLEAR_ON_DESELECT);
+        bundleBuf  = JCSystem.makeTransientByteArray((short) 1024, JCSystem.CLEAR_ON_DESELECT);
         dgiWorkBuf = JCSystem.makeTransientByteArray((short) 256, JCSystem.CLEAR_ON_DESELECT);
         scratch    = JCSystem.makeTransientShortArray((short) 2, JCSystem.CLEAR_ON_DESELECT);
 
@@ -345,35 +356,93 @@ public class ProvisioningAgentV3 extends Applet {
             ISOException.throwIt(Constants.SW_WRONG_STATE);
         }
 
-        // 1. Receive the full APDU body into wireBuf.
-        //    Extended APDUs or chained short APDUs both land here —
-        //    APDU.setIncomingAndReceive() handles the chaining for us.
-        short totalLen = apdu.setIncomingAndReceive();
+        // Receive the APDU body into wireBuf.  Two framings supported,
+        // matching whatever the host middleware decides to emit:
+        //
+        //   (a) Single extended APDU up to wireBuf.length.  Use the
+        //       setIncomingAndReceive + receiveBytes loop per JC 3.0.4
+        //       spec §3.3 so bodies larger than the JCOP 5 APDU buffer
+        //       (typically 261 B) still land fully in wireBuf.
+        //
+        //   (b) A chain of short APDUs where the non-final chunks have
+        //       CLA bit 0x10 set (ISO 7816-4 §5.1.1.1 "command
+        //       chaining").  Each chunk returns SW=9000, data is
+        //       appended to wireBuf.  The final chunk has the chain bit
+        //       cleared and triggers the unwrap/parse/commit path.
+        //       This matches pa-v1's TRANSFER_SAD accumulator pattern
+        //       and is the belt-and-suspenders fallback if the iOS
+        //       CoreNFC stack or JC runtime rejects extended APDUs at
+        //       the ISO-DEP layer (observed SW=6700 before chaining
+        //       support landed).
+        //
+        // chainOff tracks the write cursor into wireBuf across calls.
+        // 0 means "start of a fresh bundle".  The ACCUMULATOR IS RESET
+        // TO 0 AT EVERY EXIT PATH — success, failure, or ISO exception
+        // — so a retried provisioning attempt always starts clean.
         byte[] apduBuf = apdu.getBuffer();
+        boolean isChained = (apduBuf[ISO7816.OFFSET_CLA] & (byte) 0x10) != 0;
 
-        if (totalLen > (short) wireBuf.length) {
+        short bytesRead  = apdu.setIncomingAndReceive();
+        short declaredLc = apdu.getIncomingLength();
+
+        if ((short) (chainOff + declaredLc) > (short) wireBuf.length) {
+            chainOff = 0;
             ISOException.throwIt(Constants.SW_DATA_INVALID);
         }
-        Util.arrayCopyNonAtomic(
-            apduBuf, ISO7816.OFFSET_CDATA,
-            wireBuf, (short) 0, totalLen
-        );
 
-        // 2. ECDH + HKDF + AES-GCM unwrap into bundleBuf.
-        //    Throws SW_PARAM_BUNDLE_GCM_FAILED on tag verify failure.
-        short bundleLen = EcdhUnwrapper.unwrap(
-            wireBuf, (short) 0, totalLen,
-            sessionId, (short) 0, sessionIdLen,
-            bundleBuf, (short) 0
-        );
+        // Copy first chunk from APDU buffer into wireBuf at chainOff.
+        Util.arrayCopyNonAtomic(apduBuf, ISO7816.OFFSET_CDATA,
+            wireBuf, chainOff, bytesRead);
+        short received = bytesRead;
+
+        // Extended APDU: read remaining chunks via receiveBytes().
+        while (received < declaredLc) {
+            short more = apdu.receiveBytes(ISO7816.OFFSET_CDATA);
+            if (more <= 0) {
+                chainOff = 0;
+                ISOException.throwIt(Constants.SW_DATA_INVALID);
+            }
+            Util.arrayCopyNonAtomic(apduBuf, ISO7816.OFFSET_CDATA,
+                wireBuf, (short) (chainOff + received), more);
+            received += more;
+        }
+        chainOff = (short) (chainOff + declaredLc);
+
+        if (isChained) {
+            // Intermediate short APDU — return 9000, keep the
+            // accumulator for the next chunk.
+            return;
+        }
+
+        // Final (or only) chunk — wireBuf[0..chainOff) is the full body.
+        final short totalLen = chainOff;
+
+        // 2. ECDH + HKDF + AES-CBC + HMAC unwrap into bundleBuf.
+        //    Throws SW_PARAM_BUNDLE_GCM_FAILED on HMAC tag verify fail
+        //    (or CBC unpad fail).  Reset chainOff + scrub wire on error
+        //    so a retry with the correct keys/session gets a fresh slate.
+        short bundleLen;
+        try {
+            bundleLen = EcdhUnwrapper.unwrap(
+                wireBuf, (short) 0, totalLen,
+                sessionId, (short) 0, sessionIdLen,
+                bundleBuf, (short) 0
+            );
+        } catch (ISOException e) {
+            Util.arrayFillNonAtomic(wireBuf, (short) 0, chainOff, (byte) 0);
+            chainOff = 0;
+            throw e;
+        }
 
         // 3. Validate the bundle has all required tags for MChip CVN 18.
         short validateSw = ParamBundleParser.validateMChipCvn18(
             bundleBuf, (short) 0, bundleLen, scratch
         );
         if (validateSw != (short) 0x9000) {
-            // Scrub before throwing.
+            // Scrub before throwing — bundle + wire accumulator.
             Util.arrayFillNonAtomic(bundleBuf, (short) 0, bundleLen, (byte) 0);
+            Util.arrayFillNonAtomic(wireBuf, (short) 0, chainOff, (byte) 0);
+            chainOff = 0;
             ISOException.throwIt(validateSw);
         }
 
@@ -416,6 +485,8 @@ public class ProvisioningAgentV3 extends Applet {
         } catch (Exception e) {
             JCSystem.abortTransaction();
             Util.arrayFillNonAtomic(bundleBuf, (short) 0, bundleLen, (byte) 0);
+            Util.arrayFillNonAtomic(wireBuf, (short) 0, chainOff, (byte) 0);
+            chainOff = 0;
             throw (e instanceof ISOException) ? (ISOException) e
                                                : new ISOException(Constants.SW_DATA_INVALID);
         }
@@ -425,6 +496,14 @@ public class ProvisioningAgentV3 extends Applet {
         //    between decrypt and deselect could read residual state;
         //    the explicit zero pass shortens the window.
         Util.arrayFillNonAtomic(bundleBuf, (short) 0, bundleLen, (byte) 0);
+
+        // Clear the chain accumulator so the next provisioning attempt
+        // (after WIPE + GENERATE_KEYS) starts from wireBuf[0].  Also
+        // scrub wireBuf — it still holds the wrapped bundle which
+        // carries the server ephemeral pubkey + ciphertext; clearing
+        // gets rid of it ahead of the deselect auto-clear.
+        Util.arrayFillNonAtomic(wireBuf, (short) 0, chainOff, (byte) 0);
+        chainOff = 0;
 
         // No response body — SW=9000 signals success.
     }

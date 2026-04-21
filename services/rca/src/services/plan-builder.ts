@@ -337,14 +337,18 @@ export function buildTransferSadApdu(ctx: PlanContext): Buffer {
     ]);
   }
 
-  // Extended-length APDU path — kicks in once real SAD bytes push the
-  // payload past 255.  Header becomes 80 E2 00 00 00 Lc-hi Lc-lo.
+  // Extended-length APDU path.  See buildParamBundleApdu for the
+  // rationale on the trailing Le=0x0000 (case-4 extended) — iOS CoreNFC
+  // rejects case-3 extended at the ISO-DEP transmit layer.  pa-v1 never
+  // hit this branch in production (SAD blobs stayed under 255 B), so
+  // the code was right-looking but untested via real NFC.
   const lcBuf = Buffer.alloc(2);
   lcBuf.writeUInt16BE(lc, 0);
   return Buffer.concat([
-    Buffer.from([0x80, 0xE2, 0x00, 0x00, 0x00]),
-    lcBuf,
-    transferData,
+    Buffer.from([0x80, 0xE2, 0x00, 0x00, 0x00]),  // 5 B header + ext marker
+    lcBuf,                                         // 2 B Lc-hi Lc-lo
+    transferData,                                  // N B body
+    Buffer.from([0x00, 0x00]),                     // 2 B Le = "max"
   ]);
 }
 
@@ -399,12 +403,20 @@ export function buildParamBundleApdu(input: {
     ]);
   }
 
-  // Extended APDU — almost certain path for real bundles.
+  // Extended APDU — almost certain path for real bundles.  Emit as
+  // case-4 extended with Le=0x0000 ("up to 65536 bytes of response",
+  // which pa-v3 ignores since it emits no body).  iOS CoreNFC's
+  // ISO-DEP transmit layer rejects case-3 extended on some silicon —
+  // SW=6700 came back on our first real 728-byte TRANSFER_PARAMS with
+  // case-3, and pa-v1's TRANSFER_SAD never hit the extended path in
+  // production (SAD blobs stayed under 255 B), so this codepath was
+  // effectively dead until now.
   const lcBuf = Buffer.alloc(2);
   lcBuf.writeUInt16BE(wire.length, 0);
   return Buffer.concat([
-    Buffer.from([0x80, 0xE2, 0x00, 0x00, 0x00]),
-    lcBuf,
-    wire,
+    Buffer.from([0x80, 0xE2, 0x00, 0x00, 0x00]),  // 5 B: CLA INS P1 P2 + ext marker
+    lcBuf,                                         // 2 B: Lc-hi Lc-lo
+    wire,                                          // N B: body
+    Buffer.from([0x00, 0x00]),                     // 2 B: Le-hi Le-lo = "max"
   ]);
 }
