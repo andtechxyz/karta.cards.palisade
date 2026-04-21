@@ -1,9 +1,9 @@
 # Prototype branch — state for review
 
 **Branch:** `prototype/mchip-chip-computed-dgi`
-**Latest commit:** `7dbbb0d` (Phase 7 rca TRANSFER_PARAMS wiring)
-**Test status:** 776 tests pass (717 on `main` + 59 new prototype tests)
-**All 7 phases complete.**
+**Latest commit:** `6209319` (card-ops CAP toggle for pa-v1 / pa-v3 coexistence)
+**Test status:** 91/91 card-ops + 59 prototype-suite tests pass. Full repo run still green.
+**Phase 1–7 complete + applet compiled + CAP toggle wired into card-ops.**
 
 ## What's built (ready for review)
 
@@ -19,11 +19,14 @@
 | `5dfde41` | 4 | `data-prep.prepare()` router + `prepareParamBundle()` method, 3 tests — routes on `ChipProfile.provisioningMode` |
 | `7dbbb0d` | 7 | `rca` `handleKeygenResponse` dispatch + `buildTransferParamsApdu` + `RCA_ENABLE_PARAM_BUNDLE` env flag, 4 tests |
 
-### JavaCard applet — source ready (compilation deferred to JC dev)
+### JavaCard applet — compiled + installable
 
 | Commit | Deliverable | Status |
 |---|---|---|
-| `f576a68` | `applets/pa-v3/` — full source tree | Design-complete, not compiled |
+| `f576a68` | `applets/pa-v3/` — full source tree | Design-complete |
+| `e8eb699` | Switch emv-ecdh + pa-v3 to AES-CBC+HMAC-SHA256 | JC 3.0.4 Classic lacks `AEADCipher`; wire format + HKDF output adjusted (64 B, 2×HKDF iterations). Round-trip + KATs still pass. |
+| `e8eb699` | `applets/pa-v3/build/pa-v3.cap` — 28 KB compiled binary | ✅ Built locally via `ant -f applets/pa-v3/build.xml` (JDK 11 + JCDK 3.0.4 Classic). Package AID `A0000000625041`, applet instance AID `A00000006250414C` (same as pa-v1, so one card runs one or the other). |
+| `6209319` | `services/card-ops/cap-files/pa-v3.cap` + CAP toggle in `install_pa` | ✅ Copied into card-ops' CAP directory. `install_pa` picks pa-v3.cap vs pa.cap from `ChipProfile.provisioningMode`, falling back to `CARD_OPS_DEFAULT_PA_CAP` env. 7 resolver tests green. |
 
 **Applet files for the JC dev:**
 
@@ -72,10 +75,10 @@ legacy branch regardless of env flag state.
 
 | Prerequisite | How it's obtained |
 |---|---|
-| `pa-v3.cap` compiled | JC dev + JCOP 5 SDK (deferred — source is ready) |
-| `pa-v3.cap` installed on a **virgin** card | `gp --install pa-v3.cap --applet A0000000625041034C --create A0000000625041034C` |
-| `ChipProfile.provisioningMode = 'PARAM_BUNDLE'` row | Admin UI or one-off SQL (new ChipProfile row; don't touch existing ones) |
-| `IssuerProfile` + `Program` pointing at the new ChipProfile | Admin UI |
+| ~~`pa-v3.cap` compiled~~ | ✅ Built and checked in at `services/card-ops/cap-files/pa-v3.cap` (28 KB) |
+| `pa-v3.cap` installed on a card | Hit `install_pa` via card-ops admin UI (WS relay through the mobile app / reader); the CAP toggle auto-picks pa-v3.cap when ChipProfile.provisioningMode=PARAM_BUNDLE. Direct `gp.jar` install also works if the operator has the per-card SCP03 keys. |
+| `ChipProfile.provisioningMode = 'PARAM_BUNDLE'` row | `tsx scripts/flip-card-to-pa-v3.ts --card-ref <ref> --apply` (clones the existing profile into a program-scoped copy, flips the enum, repoints IssuerProfile — no blast radius on other FIs) |
+| `IssuerProfile` + `Program` pointing at the new ChipProfile | Handled automatically by `flip-card-to-pa-v3.ts`; or manual via admin UI / psql |
 | Card registered against that Program → triggers `data-prep.prepare()` → routes to `prepareParamBundle` → writes ParamRecord | Existing register flow unchanged; dispatch is data-driven |
 | `RCA_ENABLE_PARAM_BUNDLE=1` on the rca task def serving the prototype card | Task-def env var (can be a separate dev task-def alongside prod's at `'0'`) |
 | Tap + provisioning flow runs → rca dispatches to prototype path | Automatic via Card.paramRecordId + env flag |
@@ -89,9 +92,8 @@ flag is `'1'`.
 
 When ready to actually run the prototype:
 
-1. **Wait for pa-v3.cap** from the JC dev.  (Server side doesn't
-   need this to deploy — can land pa-v3 on `main` via this branch
-   ahead of time.)
+1. ~~**Wait for pa-v3.cap** from the JC dev.~~  ✅ Compiled and checked
+   in at `services/card-ops/cap-files/pa-v3.cap` (commit `e8eb699`).
 
 2. **Run the migration** — `prisma migrate deploy` against the RDS
    instance.  Additive, safe during live traffic.  Verified on staging
@@ -104,22 +106,34 @@ When ready to actually run the prototype:
    (the default).  Zero behaviour change for any existing card.
    Verified on staging with a full legacy tap test before prod.
 
-5. **Create a new ChipProfile + IssuerProfile + Program** with
-   `provisioningMode='PARAM_BUNDLE'`, pointing at the pa-v3 AID.
-   Bound to ONE test card that's been physically flashed with pa-v3.
+5. **Deploy card-ops** with the CAP toggle (commit `6209319`) and the
+   new `pa-v3.cap` in `cap-files/`.  `CARD_OPS_DEFAULT_PA_CAP` stays at
+   `'pa'` (the schema default), so no card gets pa-v3 by accident.
 
-6. **Spin up a separate rca task-def revision** with
+6. **Flip the trial card's ChipProfile** via
+   `tsx scripts/flip-card-to-pa-v3.ts --card-ref <ref> --apply`.
+   Creates a program-scoped clone with `provisioningMode=PARAM_BUNDLE`,
+   repoints the IssuerProfile at it, and leaves every other program's
+   ChipProfile untouched.
+
+7. **Install pa-v3 on the trial card** via the card-ops admin UI
+   ("Install PA" on the card's detail page).  The CAP toggle resolves
+   `pa-v3.cap` because of step 6; progress stream shows a
+   `CAP_SELECTED` frame with `capKey: 'pa-v3'` as confirmation.
+
+8. **Spin up a separate rca task-def revision** with
    `RCA_ENABLE_PARAM_BUNDLE='1'`.  Route the prototype test card's
    traffic to this task-def (via ALB listener rule path, dedicated
    internal DNS, or just mobile-side URL override).
 
-7. **Run the isolated tap test.**  Register → tap → provision → POS.
+9. **Run the isolated tap test.**  Register → tap → provision → POS.
    Verify: mobile sees `type:'complete'`, chip NVM has 4 DGIs byte-
    matching the byte-parity goldens, POS reader issues GENERATE_AC
    successfully.
 
-8. **Legacy fleet continues unaffected** on the production rca task-
-   def with flag `='0'`.
+10. **Legacy fleet continues unaffected** on the production rca task-
+    def with flag `='0'`, and any card that still points at a
+    `SAD_LEGACY` ChipProfile will still get `pa.cap` installed.
 
 ## Summary of all prototype commits on branch
 
