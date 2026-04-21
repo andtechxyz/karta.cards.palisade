@@ -93,22 +93,21 @@ jobs:
       fail-fast: false
       matrix:
         # Single-cluster AWS reality: we share Vera's AWS account + ECS
-        # cluster + RDS + ECR registry.  For fastest tap-test deploy
-        # Palisade pushes to the EXISTING vera-* ECR repos + updates
-        # the EXISTING vera-* ECS services.  Renaming to palisade-*
-        # is a later cleanup (creates new service copies + DNS move).
+        # cluster + RDS.  As of 2026-04-20 the ECR repos + ECS services
+        # were renamed from `vera-*` → `palisade-*` (blue/green swap;
+        # see ops_ecs_rename_tonight.md for the runbook).  Old vera-*
+        # services are kept at desired-count=0 for 24h rollback.
         #
-        # card-ops + admin deliberately NOT in this matrix for the
-        # first-tap-after-split deploy:
-        #   - card-ops has no vera-card-ops ECS service yet; needs
-        #     explicit provisioning
-        #   - admin lives on Vera and backends via dual-backend SPA;
-        #     Palisade-admin deploys separately post-tap-test
+        # admin now has palisade-admin in this cluster.  card-ops
+        # still has no ECS service of its own — it's invoked via
+        # admin's WS relay, not a standalone container.
         include:
           - service: tap
             port: 3001
           - service: activation
             port: 3002
+          - service: admin
+            port: 3003
           - service: data-prep
             port: 3006
           - service: rca
@@ -121,8 +120,8 @@ jobs:
 
     env:
       IMAGE_TAG: ${{ github.sha }}
-      # Reuse existing vera-* ECR repos (see header comment).
-      ECR_REPO: vera-${{ matrix.service }}
+      # Post-rename: push to palisade-* ECR repos + update palisade-* ECS.
+      ECR_REPO: palisade-${{ matrix.service }}
 
     steps:
       # Early-skip for workflow_dispatch: if the operator narrowed the
@@ -195,8 +194,8 @@ jobs:
       - name: Update ECS task definition and deploy
         if: steps.filter.outputs.run == 'true'
         run: |
-          # Reuse existing vera-* ECS services (single-cluster).
-          SERVICE_NAME=vera-${{ matrix.service }}
+          # Post-rename: services are palisade-* in the shared vera cluster.
+          SERVICE_NAME=palisade-${{ matrix.service }}
           FULL_IMAGE=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.sha.outputs.short }}
 
           # Fetch the current task definition

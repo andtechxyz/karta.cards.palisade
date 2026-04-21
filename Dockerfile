@@ -57,7 +57,7 @@ COPY scripts/  scripts/
 RUN npx prisma generate --schema packages/db/prisma/schema.prisma
 
 # Compile all TypeScript (backend — project references)
-RUN npx tsc -b
+RUN npx tsc -b --force
 
 # Rewrite package exports from ./src/index.ts → ./dist/index.js so `node`
 # (not tsx) can resolve workspace packages at runtime.

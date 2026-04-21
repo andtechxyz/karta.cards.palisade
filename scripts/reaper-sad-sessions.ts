@@ -68,7 +68,7 @@
  *
  * Docker invocation (override the service CMD):
  *
- *   docker run --env-file .env vera-rca tsx scripts/reaper-sad-sessions.ts
+ *   docker run --env-file .env palisade-rca tsx scripts/reaper-sad-sessions.ts
  *
  * ECS scheduled task (EventBridge → RunTask):
  *
