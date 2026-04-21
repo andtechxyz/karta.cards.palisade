@@ -12,6 +12,7 @@
     "@palisade/data-prep": "*",
     "@palisade/db": "*",
     "@palisade/emv": "*",
+    "@palisade/emv-ecdh": "^0.0.1",
     "@palisade/handoff": "*",
     "@palisade/metrics": "^0.0.1",
     "@palisade/service-auth": "*",

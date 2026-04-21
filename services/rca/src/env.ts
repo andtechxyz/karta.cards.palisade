@@ -63,6 +63,21 @@ const { get: getRcaConfig, reset: _resetRcaConfig } = defineEnv({
   // karta-se v1 deployment should flip this to `strict` via ECS task def.
   PALISADE_ATTESTATION_MODE: z.enum(['strict', 'permissive']).default('permissive'),
 
+  // --- ParamBundle prototype flag (patent C17/C22) -----------------------
+  // Master kill-switch for the chip-computed-DGI prototype path.
+  //   '0' (default): every provisioning session uses the legacy TRANSFER_SAD
+  //                  flow, regardless of Card.paramRecordId.  Prototype code
+  //                  is physically deployed but unreachable — safe to ship
+  //                  to prod without risk to existing fleet.
+  //   '1':           sessions whose Card has a non-null paramRecordId route
+  //                  through the TRANSFER_PARAMS path (ECDH-wrapped
+  //                  parameter bundle sent to pa-v3 applet).  Legacy cards
+  //                  (paramRecordId = null) keep using TRANSFER_SAD
+  //                  unconditionally — both paths coexist at runtime.
+  // Flip to '1' only on the ECS task def servicing prototype cards; keep at
+  // '0' (default) on the main production fleet until graduation.
+  RCA_ENABLE_PARAM_BUNDLE: z.enum(['0', '1']).default('0'),
+
   // --- WS upgrade auth token (patent C3 / PCI 8.3.6) ---------------------
   // HMAC-SHA256 key for the short-lived token appended to wsUrl.  Signer
   // and verifier share the same key; mobile clients round-trip it

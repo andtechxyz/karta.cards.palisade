@@ -23,6 +23,7 @@ import {
   buildProvisioningPlan,
   buildMinimalSadPayload,
   buildTransferSadApdu,
+  buildParamBundleApdu,
   schemeByteForIssuer,
   type Plan,
   type PlanContext,
@@ -794,29 +795,103 @@ export class SessionManager {
       },
     });
 
-    const ctx = await this.buildPlanContext(
-      session.card?.program?.issuerProfile ?? null,
-      session.sadRecord,
-      sessionId,
-    );
+    // Dispatch: ParamBundle prototype path vs legacy SAD path.
+    //
+    // Null-check FIRST — legacy cards have Card.paramRecordId = null
+    // and always fall through to buildTransferSadApdu (unchanged).
+    //
+    // Env flag gates the prototype route.  Even if a card has a
+    // ParamRecord, RCA_ENABLE_PARAM_BUNDLE = '0' (default) forces the
+    // legacy path.  Belt-and-suspenders: two guards must both flip to
+    // '1' / non-null before a single byte of prototype code executes
+    // on a provisioning session.
+    const paramRecordId = session.card?.paramRecordId ?? null;
+    const paramBundleEnabled = getRcaConfig().RCA_ENABLE_PARAM_BUNDLE === '1';
+    const useParamBundle = paramRecordId !== null && paramBundleEnabled;
+
     let transferApdu: Buffer;
-    try {
-      transferApdu = buildTransferSadApdu(ctx);
-    } finally {
-      // PCI 3.5 — S-2 from the post-fix audit: plaintext SAD contains
-      // per-card EMV master keys, PAN, expiry, etc.  After the wire APDU
-      // is built, the plaintext bytes serve no purpose — scrub the Buffer
-      // so a later core dump / memory scrape doesn't leak it.  The
-      // Buffer is the only reference the caller holds; scrub in place.
-      ctx.sadPayload.fill(0);
+    let wirePhase: string;
+    if (useParamBundle) {
+      transferApdu = await this.buildTransferParamsApdu(
+        paramRecordId!,
+        iccPubkey,
+        sessionId,
+      );
+      wirePhase = 'provisioning_param_bundle';
+    } else {
+      const ctx = await this.buildPlanContext(
+        session.card?.program?.issuerProfile ?? null,
+        session.sadRecord,
+        sessionId,
+      );
+      try {
+        transferApdu = buildTransferSadApdu(ctx);
+      } finally {
+        // PCI 3.5 — S-2 from the post-fix audit: plaintext SAD contains
+        // per-card EMV master keys, PAN, expiry, etc.  After the wire APDU
+        // is built, the plaintext bytes serve no purpose — scrub the Buffer
+        // so a later core dump / memory scrape doesn't leak it.  The
+        // Buffer is the only reference the caller holds; scrub in place.
+        ctx.sadPayload.fill(0);
+      }
+      wirePhase = 'provisioning';
     }
 
     return [{
       type: 'apdu',
       hex: transferApdu.toString('hex').toUpperCase(),
-      phase: 'provisioning',
+      phase: wirePhase,
       progress: 0.55,
     }];
+  }
+
+  /**
+   * Build the TRANSFER_PARAMS APDU for a card on the ParamBundle
+   * prototype flow.  Loads the ParamRecord, decrypts the at-rest
+   * bundle (envelope-encrypted via KMS or dev-AES, same pattern as
+   * SadRecord), ECDH-wraps against the chip's pubkey, returns the
+   * wire-ready APDU.
+   *
+   * Scrubs the plaintext ParamBundle after wrap — the wrapped bytes
+   * are the only thing that persists on the wire.  Also marks the
+   * ParamRecord CONSUMED on the way out so a second provisioning
+   * attempt against the same record is rejected upfront.
+   */
+  private async buildTransferParamsApdu(
+    paramRecordId: string,
+    chipPubUncompressed: Buffer,
+    sessionId: string,
+  ): Promise<Buffer> {
+    const pr = await prisma.paramRecord.findUnique({
+      where: { id: paramRecordId },
+    });
+    if (!pr || pr.status !== 'READY') {
+      throw badRequest(
+        'param_record_not_ready',
+        `ParamRecord ${paramRecordId} is ${pr?.status ?? 'missing'}, expected READY`,
+      );
+    }
+
+    const config = getRcaConfig();
+    const plaintextBundle = await DataPrepService.decryptSad(
+      Buffer.isBuffer(pr.bundleEncrypted)
+        ? pr.bundleEncrypted
+        : Buffer.from(pr.bundleEncrypted),
+      config.KMS_SAD_KEY_ARN ?? '',
+      pr.bundleKeyVersion,
+    );
+
+    let apdu: Buffer;
+    try {
+      apdu = buildParamBundleApdu({
+        plaintextBundle,
+        chipPubUncompressed,
+        sessionId,
+      });
+    } finally {
+      plaintextBundle.fill(0);
+    }
+    return apdu;
   }
 
   /**

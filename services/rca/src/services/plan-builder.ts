@@ -33,6 +33,8 @@
  * step 2.  Deferred; not needed yet.
  */
 
+import { wrapParamBundle, serializeWrappedBundle } from '@palisade/emv-ecdh';
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -339,5 +341,66 @@ export function buildTransferSadApdu(ctx: PlanContext): Buffer {
     Buffer.from([0x80, 0xE2, 0x00, 0x00, 0x00]),
     lcBuf,
     transferData,
+  ]);
+}
+
+// ---------------------------------------------------------------------------
+// TRANSFER_PARAMS assembly (chip-computed-DGI prototype)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the TRANSFER_PARAMS APDU for pa-v3.  Same CLA/INS (0x80 0xE2)
+ * as TRANSFER_SAD but with a wholly different body: an ECDH-wrapped
+ * ParamBundle instead of a pre-built DGI stream.
+ *
+ * Wire body:
+ *   server_ephemeral_pub_uncompressed (65 B)
+ *   || nonce (12 B)
+ *   || ciphertext (variable — ~400 B for a full MChip CVN 18 bundle)
+ *   || gcm_tag (16 B)
+ *
+ * Total body length is typically ~500 B, which forces extended-APDU
+ * encoding (Lc = 0x00 Lc-hi Lc-lo) for most real bundles.
+ *
+ * Inputs:
+ *   - plaintextBundle: the TLV ParamBundle bytes produced by
+ *     @palisade/emv's buildMChipParamBundle (server-side at
+ *     data-prep.prepareParamBundle time), decrypted from
+ *     ParamRecord.bundleEncrypted just before we get here.
+ *   - chipPubUncompressed: the 65-byte SEC1 pubkey returned in the
+ *     GENERATE_KEYS response immediately prior.
+ *   - sessionId: the ProvisioningSession.id — mixed into HKDF info
+ *     so the bundle is bound to a specific session.
+ *
+ * Caller is responsible for scrubbing `plaintextBundle` after this
+ * function returns — same pattern as `buildTransferSadApdu` scrubbing
+ * `ctx.sadPayload` in the rca handler.
+ */
+export function buildParamBundleApdu(input: {
+  plaintextBundle: Buffer;
+  chipPubUncompressed: Buffer;
+  sessionId: string;
+}): Buffer {
+  const wrapped = wrapParamBundle({
+    chipPubUncompressed: input.chipPubUncompressed,
+    plaintext: input.plaintextBundle,
+    sessionId: input.sessionId,
+  });
+  const wire = serializeWrappedBundle(wrapped);
+
+  if (wire.length <= 255) {
+    return Buffer.concat([
+      Buffer.from([0x80, 0xE2, 0x00, 0x00, wire.length]),
+      wire,
+    ]);
+  }
+
+  // Extended APDU — almost certain path for real bundles.
+  const lcBuf = Buffer.alloc(2);
+  lcBuf.writeUInt16BE(wire.length, 0);
+  return Buffer.concat([
+    Buffer.from([0x80, 0xE2, 0x00, 0x00, 0x00]),
+    lcBuf,
+    wire,
   ]);
 }
