@@ -83,7 +83,7 @@ model PartnerCredential {
   financialInstitution   FinancialInstitution @relation(fields: [financialInstitutionId], references: [id], onDelete: Cascade)
 
   // Partner-supplied identifier (e.g. "incomm-embossing-prod")
-  keyId      String @unique
+  keyId      String  @unique
   // scrypt(secret, salt) — one-way.  Was previously DOUBLE-DUTY as the
   // HMAC signing key, which made a DB dump = partner impersonation
   // (PCI H-6 audit finding).  Now it's ONLY a one-way hash for audit
@@ -362,7 +362,7 @@ model Card {
   // MASTER keys live in the HSM.  The chip is personalised with the same
   // derivation so the server can reproduce the keys given only its UID.
   // See @palisade/sdm-keys.
-  keyVersion              Int // VaultEncryptionKey.version used to wrap uidEncrypted above
+  keyVersion Int // VaultEncryptionKey.version used to wrap uidEncrypted above
 
   // Monotonic SDM read counter.  Each successful SUN-tap must present a
   // counter strictly greater than this; the verify path advances atomically
@@ -383,6 +383,19 @@ model Card {
   // Palisade cards that somehow share a PAN (unusual, but allowed so the
   // insert doesn't fail).  Pay reaches the vault via this token.
   vaultToken String?
+
+  // --- Prototype path: chip-computed-DGI (C17/C22 patent alignment) --------
+  // Nullable pointer to ParamRecord.  Only populated when a card is
+  // provisioned via the new ParamBundle flow (pa-v3 applet + ECDH-
+  // wrapped parameter bundle).  Legacy cards have this = null and
+  // continue routing through the SadRecord/TRANSFER_SAD path.
+  //
+  // One card has EITHER proxyCardId (legacy SadRecord) OR paramRecordId
+  // (prototype) — not both.  Decided at registration time from the
+  // ChipProfile.provisioningMode of the card's program.  See the
+  // PROTOTYPE_PLAN.md at the worktree root for the full dispatch story.
+  paramRecordId String?      @unique
+  paramRecord   ParamRecord? @relation(fields: [paramRecordId], references: [id])
 
   // --- Display-safe PAN metadata ------------------------------------------
   // Mirrored from the registerCard caller — NOT secrets (PCI-DSS allows full
@@ -538,6 +551,15 @@ model ChipProfile {
   // with the EMV AID (IssuerProfile.aid) as the instance AID.
   paymentAppletCapFilename String?
 
+  // Selects which provisioning flow cards built from this ChipProfile
+  // use.  Default SAD_LEGACY for backward compat — every existing
+  // ChipProfile row continues routing through data-prep's prepareCard
+  // + rca's TRANSFER_SAD.  PARAM_BUNDLE is for prototype cards with
+  // pa-v3 installed (AID A0000000625041034C) and an encrypted
+  // parameter bundle instead of a full SAD image.  See
+  // PROTOTYPE_PLAN.md for the C17/C22 patent context.
+  provisioningMode ProvisioningMode @default(SAD_LEGACY)
+
   // Optional scoping — when set, this profile is only visible to this program.
   // Null means the profile is global/catalog (shared across all programs).
   programId String?
@@ -657,6 +679,59 @@ model SadRecord {
   @@index([expiresAt])
 }
 
+/// Selects the provisioning flow a ChipProfile routes its cards
+/// through.  Default `SAD_LEGACY` for every existing row — no
+/// behaviour change until a ChipProfile is explicitly flipped to
+/// `PARAM_BUNDLE`.
+enum ProvisioningMode {
+  /// Legacy flow: data-prep builds full DGI image server-side,
+  /// ships as `SadRecord.sadEncrypted`, rca decrypts + sends via
+  /// `TRANSFER_SAD` APDU to PA v1.
+  SAD_LEGACY
+  /// Prototype flow (C17/C22): data-prep builds compact parameter
+  /// bundle, ships as `ParamRecord.bundleEncrypted`, rca wraps via
+  /// ECDH against chip pubkey + sends via `TRANSFER_PARAMS` APDU
+  /// to pa-v3, which decodes + builds DGIs on-chip.  Only used on
+  /// virgin cards with pa-v3 installed.
+  PARAM_BUNDLE
+}
+
+/// Sibling of `SadRecord` for the ParamBundle prototype flow.  One
+/// card has either a SadRecord (legacy) OR a ParamRecord (prototype),
+/// never both.  data-prep.prepareParamBundle populates this; rca's
+/// TRANSFER_PARAMS handler consumes it.
+///
+/// Wire format of `bundleEncrypted`:
+///   AES-256-GCM(payload) where payload is the TLV ParamBundle bytes
+///   from @palisade/emv's buildParamBundle().  Data key is KMS-wrapped
+///   (envelope encryption, same pattern as SadRecord.sadEncrypted).
+///   Chip-side ECDH wrap happens at provisioning time, not at rest.
+model ParamRecord {
+  id               String   @id @default(cuid())
+  proxyCardId      String   @unique
+  cardId           String   @unique
+  bundleEncrypted  Bytes
+  bundleKeyVersion Int
+  /// Scheme byte mirrored from ParamBundle tag 0x06 (0x01 = MChip,
+  /// 0x02 = VSDC — reserved, not yet implemented).
+  schemeByte       Int
+  /// CVN byte mirrored from ParamBundle tag 0x07.  Prototype is
+  /// MChip CVN 18 (0x12) only.
+  cvnByte          Int
+  chipSerial       String?
+  /// READY → CONSUMED | EXPIRED | REVOKED.  Same state machine as
+  /// SadRecord.status so the existing retention reaper works
+  /// unchanged.
+  status           String   @default("READY")
+  expiresAt        DateTime
+  createdAt        DateTime @default(now())
+
+  card Card?
+
+  @@index([status])
+  @@index([expiresAt])
+}
+
 // Real-time provisioning session — short-lived (~30 seconds).
 // Tracks the 6-phase state machine as the RCA relays APDUs between
 // the mobile app and the card's Provisioning Agent.
@@ -717,9 +792,9 @@ model ProvisioningSession {
 // outlive the session.  `apduLog` is an append-only audit of every
 // APDU pair exchanged, kept for compliance (who did what, to which card).
 model CardOpSession {
-  id       String @id @default(cuid())
-  cardId   String
-  card     Card   @relation(fields: [cardId], references: [id])
+  id     String @id @default(cuid())
+  cardId String
+  card   Card   @relation(fields: [cardId], references: [id])
 
   // One of: list_applets | install_pa | install_t4t | install_receiver |
   //         reset_pa_state | uninstall_pa | uninstall_t4t |
