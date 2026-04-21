@@ -133,10 +133,12 @@ public final class Constants {
 
     public static final short SEC1_UNCOMPRESSED_LEN = (short) 65;
     public static final short AES_KEY_LEN = (short) 16;
-    public static final short GCM_NONCE_LEN = (short) 12;
-    public static final short GCM_TAG_LEN = (short) 16;
-    /** HKDF-SHA256 output: aesKey(16) || nonce(12) = 28 bytes. */
-    public static final short HKDF_OUTPUT_LEN = (short) (AES_KEY_LEN + GCM_NONCE_LEN);
+    public static final short AES_IV_LEN = (short) 16;      // AES block size
+    public static final short HMAC_KEY_LEN = (short) 32;    // right-sized HMAC-SHA256 key
+    public static final short HMAC_TAG_LEN = (short) 16;    // truncated HMAC-SHA256
+    /** HKDF-SHA256 output: aesKey(16) || iv(16) || hmacKey(32) = 64 bytes. */
+    public static final short HKDF_OUTPUT_LEN =
+        (short) (AES_KEY_LEN + AES_IV_LEN + HMAC_KEY_LEN);
 
     // -----------------------------------------------------------------
     // EMV tag numbers (2-byte big-endian for tags >= 0x5F)

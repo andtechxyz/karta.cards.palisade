@@ -1,6 +1,6 @@
 /**
- * @palisade/emv-ecdh — ECDH + HKDF + AES-128-GCM wrapper for ParamBundle
- * transport to the PA v3 applet.
+ * @palisade/emv-ecdh — ECDH + HKDF + AES-128-CBC + HMAC-SHA256 wrapper
+ * for ParamBundle transport to the PA v3 applet.
  *
  * Protocol (matches PA v3 applet's processTransferParams):
  *
@@ -8,38 +8,42 @@
  *   2. Server computes shared = ECDH(server_eph_priv, chip_pub) where
  *      chip_pub came from the chip's GENERATE_KEYS response (65-byte
  *      uncompressed SEC1: 0x04 || X || Y).
- *   3. Server derives (aesKey, nonce) via HKDF-SHA256:
+ *   3. Server derives (aesKey, iv, hmacKey) via HKDF-SHA256:
  *        salt = "paramBundleV1" ASCII
  *        ikm  = shared.X (32 bytes)
  *        info = sessionId (ASCII, variable length)
- *        okm  = 16 bytes key || 12 bytes nonce
- *   4. Server AES-128-GCM encrypts the ParamBundle TLV blob with
- *      (aesKey, nonce); empty AAD.
- *   5. Wire format:
- *        [0x04 || server_eph_pub.X (32)]  // 33-byte SEC1 compressed
- *                                          // OR 65-byte uncompressed —
- *                                          // prototype uses uncompressed
- *                                          // to match chip SDK.
- *        || nonce (12)
- *        || ciphertext (variable)
- *        || gcmTag (16)
+ *        okm  = 16 bytes AES key || 16 bytes IV || 32 bytes HMAC key
+ *   4. Server AES-128-CBC encrypts the ParamBundle TLV blob with
+ *      (aesKey, iv) using PKCS#7 padding.
+ *   5. Server computes tag = HMAC-SHA256(hmacKey, iv || ciphertext)
+ *      truncated to the leftmost 16 bytes.
+ *   6. Wire format:
+ *        [0x04 || server_eph_pub.X (32) || server_eph_pub.Y (32)]  // 65B SEC1 uncompressed
+ *        || iv (16)
+ *        || ciphertext (variable, multiple of 16 after PKCS#7 pad)
+ *        || tag (16)  // HMAC-SHA256 truncated
  *
- * Chip mirrors the derivation using chip_priv + received server_eph_pub
- * and verifies the GCM tag before acting on any parameter.
+ * Chip mirrors the derivation using chip_priv + received server_eph_pub.
+ * It re-derives (aesKey, iv, hmacKey) via the same HKDF, recomputes
+ * HMAC over (iv || ct), constant-time compares with the received tag,
+ * then AES-CBC decrypts + removes PKCS#7 padding.
  *
  * Security choices:
  *   - HKDF salt fixed per protocol version ("paramBundleV1") so a future
  *     revision can bump the salt to reject old-format bundles.
  *   - sessionId in HKDF info binds the bundle to a specific provisioning
- *     session so a bundle issued for session A cannot be replayed to a
- *     chip expecting session B.  Chip enforces by including its session
- *     context in its own HKDF call.
- *   - AES-128-GCM (not CCM) for authenticated encryption.  JavaCard 3.0.5+
- *     supports GCM natively on JCOP 5 / Infineon Secora hardware.
+ *     session — a bundle issued for session A cannot be replayed to a
+ *     chip expecting session B (HKDF output differs → AES key + IV +
+ *     HMAC key all diverge, HMAC tag won't verify).
+ *   - AES-128-CBC + HMAC-SHA256 (encrypt-then-MAC) instead of AES-GCM
+ *     because JavaCard 3.0.4 Classic SDK has AES-CBC + SHA-256 but
+ *     no AEADCipher (GCM was added in JC 3.1).  Security-equivalent
+ *     when implemented correctly: the tag is computed over IV || CT
+ *     and verified BEFORE decryption.
  *   - Ephemeral server keypair per ParamBundle build — forward secrecy.
  *     Even if the KMS-wrapped ParamBundle-at-rest is stolen, the
- *     attacker cannot re-derive the AES key without the chip's private
- *     key (which never leaves the SE).
+ *     attacker cannot re-derive the AES/HMAC keys without the chip's
+ *     private key (which never leaves the SE).
  */
 
 import {
@@ -47,6 +51,7 @@ import {
   createHmac,
   createCipheriv,
   createDecipheriv,
+  timingSafeEqual,
   randomBytes,
   type BinaryLike,
 } from 'node:crypto';
@@ -58,11 +63,13 @@ import {
 /** HKDF salt — bump on protocol revision. */
 const HKDF_SALT = Buffer.from('paramBundleV1', 'ascii');
 
-/** HKDF output: 16-byte AES-128 key + 12-byte GCM nonce = 28 bytes. */
-const HKDF_OUTPUT_LEN = 16 + 12;
-const AES_KEY_LEN = 16;
-const GCM_NONCE_LEN = 12;
-const GCM_TAG_LEN = 16;
+const AES_KEY_LEN = 16;   // AES-128
+const AES_IV_LEN  = 16;   // AES block size
+const HMAC_KEY_LEN = 32;  // SHA-256 internal state; "right-sized" HMAC key
+const HMAC_TAG_LEN = 16;  // truncated HMAC-SHA256 (leftmost 16 of 32 bytes)
+
+/** HKDF output: AES key || IV || HMAC key = 64 bytes. */
+const HKDF_OUTPUT_LEN = AES_KEY_LEN + AES_IV_LEN + HMAC_KEY_LEN;
 
 /** Uncompressed SEC1 P-256 pubkey: 0x04 || X(32) || Y(32). */
 const SEC1_UNCOMPRESSED_LEN = 65;
@@ -155,21 +162,22 @@ export interface WrappedParamBundle {
    * Chip uses this to compute the shared secret on its side.
    */
   serverEphemeralPub: Buffer;
-  /** 12-byte AES-GCM nonce (randomly generated per wrap). */
-  nonce: Buffer;
-  /** AES-128-GCM ciphertext (same length as plaintext). */
+  /** 16-byte AES-CBC IV (derived from HKDF; sent verbatim on the wire). */
+  iv: Buffer;
+  /** AES-128-CBC ciphertext (multiple of 16 bytes after PKCS#7 padding). */
   ciphertext: Buffer;
-  /** 16-byte AES-GCM authentication tag. */
+  /**
+   * 16-byte HMAC-SHA256 tag, truncated to the leftmost 16 bytes.
+   * Computed over (iv || ciphertext).
+   */
   tag: Buffer;
 }
 
 /**
  * Wrap a ParamBundle for delivery to the chip.  Generates a fresh
- * ephemeral keypair per call (forward secrecy).
- *
- * Returns the four components the chip needs: server ephemeral pubkey,
- * nonce, ciphertext, and GCM tag.  Caller concatenates these into the
- * TRANSFER_PARAMS APDU body.
+ * ephemeral keypair per call (forward secrecy).  Encrypt-then-MAC:
+ * encrypt with AES-128-CBC + PKCS#7, authenticate iv||ct with
+ * HMAC-SHA256, truncate tag to 16 bytes.
  */
 export function wrapParamBundle(input: WrapInput): WrappedParamBundle {
   if (input.chipPubUncompressed.length !== SEC1_UNCOMPRESSED_LEN) {
@@ -195,44 +203,43 @@ export function wrapParamBundle(input: WrapInput): WrappedParamBundle {
     HKDF_OUTPUT_LEN,
   );
   const aesKey = okm.subarray(0, AES_KEY_LEN);
-  const nonce = okm.subarray(AES_KEY_LEN, AES_KEY_LEN + GCM_NONCE_LEN);
+  const iv = okm.subarray(AES_KEY_LEN, AES_KEY_LEN + AES_IV_LEN);
+  const hmacKey = okm.subarray(AES_KEY_LEN + AES_IV_LEN);
 
-  const cipher = createCipheriv('aes-128-gcm', aesKey, nonce);
+  const cipher = createCipheriv('aes-128-cbc', aesKey, iv);
   const ciphertext = Buffer.concat([cipher.update(input.plaintext), cipher.final()]);
-  const tag = cipher.getAuthTag();
 
-  // Copy out the nonce BEFORE scrubbing — `nonce` is a view into
-  // `okm`, and we're about to zero the whole backing buffer.  The
-  // returned nonce is the same bytes the chip will derive via HKDF on
-  // its side, so it's not secret per se, but we still send it on the
-  // wire for belt-and-suspenders parity.
-  const nonceCopy = Buffer.from(nonce);
+  // Encrypt-then-MAC: authenticate IV + ciphertext (NOT plaintext).
+  const fullTag = createHmac('sha256', hmacKey)
+    .update(iv)
+    .update(ciphertext)
+    .digest();
+  const tag = fullTag.subarray(0, HMAC_TAG_LEN);
 
-  // Scrub transient key material.  `shared`, `okm`, `aesKey`, `nonce`
-  // views all reference the same backing Buffers — zero them before
-  // returning so GC doesn't hold plaintext key bytes.  The returned
-  // `serverEphemeralPub`, `nonceCopy`, `ciphertext`, and `tag` are the
-  // only values that may persist.
+  // Copy out iv + tag BEFORE scrubbing — iv is a view into okm.
+  const ivCopy  = Buffer.from(iv);
+  const tagCopy = Buffer.from(tag);
+
   shared.fill(0);
   okm.fill(0);
-  // aesKey and nonce are views into okm; already scrubbed.
+  fullTag.fill(0);
 
   return {
     serverEphemeralPub,
-    nonce: nonceCopy,
+    iv: ivCopy,
     ciphertext,
-    tag,
+    tag: tagCopy,
   };
 }
 
 export interface UnwrapInput {
   /** Server's ephemeral pubkey from the wrap (65 bytes SEC1 uncompressed). */
   serverEphemeralPub: Buffer;
-  /** 12-byte GCM nonce from the wrap. */
-  nonce: Buffer;
-  /** Ciphertext to decrypt. */
+  /** 16-byte AES-CBC IV (from wire). */
+  iv: Buffer;
+  /** Ciphertext to decrypt (multiple of 16 bytes). */
   ciphertext: Buffer;
-  /** 16-byte GCM authentication tag. */
+  /** 16-byte truncated HMAC-SHA256 tag (from wire). */
   tag: Buffer;
   /** Chip's private key (32-byte raw P-256 scalar). */
   chipPriv: Buffer;
@@ -245,8 +252,10 @@ export interface UnwrapInput {
  * server-side byte-parity tests (we can verify round-trip without a
  * real chip) and by the PA v3 applet's equivalent Java implementation.
  *
- * Throws if the GCM tag doesn't verify (tampering, wrong key, wrong
- * session).  On success returns the plaintext ParamBundle bytes.
+ * Encrypt-then-MAC verification: re-derives (aesKey, iv, hmacKey) via
+ * HKDF, recomputes HMAC-SHA256 over (iv || ct), compares against the
+ * received tag with timingSafeEqual.  On tag mismatch rejects BEFORE
+ * decryption (classical encrypt-then-MAC order).
  */
 export function unwrapParamBundle(input: UnwrapInput): Buffer {
   if (input.serverEphemeralPub.length !== SEC1_UNCOMPRESSED_LEN) {
@@ -257,11 +266,16 @@ export function unwrapParamBundle(input: UnwrapInput): Buffer {
   if (input.chipPriv.length !== 32) {
     throw new Error(`unwrapParamBundle: chipPriv must be 32 bytes`);
   }
-  if (input.nonce.length !== GCM_NONCE_LEN) {
-    throw new Error(`unwrapParamBundle: nonce must be ${GCM_NONCE_LEN} bytes`);
+  if (input.iv.length !== AES_IV_LEN) {
+    throw new Error(`unwrapParamBundle: iv must be ${AES_IV_LEN} bytes`);
   }
-  if (input.tag.length !== GCM_TAG_LEN) {
-    throw new Error(`unwrapParamBundle: tag must be ${GCM_TAG_LEN} bytes`);
+  if (input.tag.length !== HMAC_TAG_LEN) {
+    throw new Error(`unwrapParamBundle: tag must be ${HMAC_TAG_LEN} bytes`);
+  }
+  if (input.ciphertext.length === 0 || input.ciphertext.length % AES_IV_LEN !== 0) {
+    throw new Error(
+      `unwrapParamBundle: ciphertext length ${input.ciphertext.length} is not a positive multiple of ${AES_IV_LEN} (CBC block size)`,
+    );
   }
 
   const ecdh = createECDH(CURVE);
@@ -274,41 +288,52 @@ export function unwrapParamBundle(input: UnwrapInput): Buffer {
     Buffer.from(input.sessionId, 'ascii'),
     HKDF_OUTPUT_LEN,
   );
-  const aesKey = okm.subarray(0, AES_KEY_LEN);
-  // Note: we recompute the nonce from HKDF and also accept an explicit
-  // nonce from the wire.  They should match.  If they don't, something
-  // tampered with the wire nonce — we prefer the HKDF-derived one and
-  // will fail GCM verification if the attacker tried to swap it.
-  const expectedNonce = okm.subarray(AES_KEY_LEN, AES_KEY_LEN + GCM_NONCE_LEN);
-  if (!input.nonce.equals(expectedNonce)) {
-    // Not an immediate error — the wire-supplied nonce is what we actually
-    // use in GCM.  But we log the mismatch because honest implementations
-    // should send the HKDF-derived nonce verbatim.
-    //
-    // Note: some implementations use the wire nonce directly (random 12 B
-    // per wrap, not HKDF-derived).  The PA v3 applet design uses the
-    // HKDF-derived nonce to reduce RAM pressure.  Server-side, we keep
-    // this check strict for now.
+  const aesKey  = okm.subarray(0, AES_KEY_LEN);
+  const expIv   = okm.subarray(AES_KEY_LEN, AES_KEY_LEN + AES_IV_LEN);
+  const hmacKey = okm.subarray(AES_KEY_LEN + AES_IV_LEN);
+
+  // IV sent on the wire MUST match the HKDF-derived IV — otherwise
+  // someone tampered (or the implementations disagree on HKDF info).
+  if (!input.iv.equals(expIv)) {
+    shared.fill(0);
+    okm.fill(0);
     throw new Error(
-      'unwrapParamBundle: wire nonce does not match HKDF-derived nonce (possible tampering or wrap/unwrap version mismatch)',
+      'unwrapParamBundle: wire IV does not match HKDF-derived IV (tampering or implementation mismatch)',
     );
   }
 
-  const decipher = createDecipheriv('aes-128-gcm', aesKey, input.nonce);
-  decipher.setAuthTag(input.tag);
+  // Encrypt-then-MAC verify FIRST, before attempting decrypt.  This
+  // is the security-correct order — never touch the ciphertext if its
+  // integrity isn't proven.
+  const fullTag = createHmac('sha256', hmacKey)
+    .update(input.iv)
+    .update(input.ciphertext)
+    .digest();
+  const expectedTag = fullTag.subarray(0, HMAC_TAG_LEN);
+
+  if (!timingSafeEqual(expectedTag, input.tag)) {
+    shared.fill(0);
+    okm.fill(0);
+    fullTag.fill(0);
+    throw new Error('unwrapParamBundle: HMAC tag verification failed');
+  }
+
+  const decipher = createDecipheriv('aes-128-cbc', aesKey, input.iv);
   let plaintext: Buffer;
   try {
     plaintext = Buffer.concat([decipher.update(input.ciphertext), decipher.final()]);
   } catch (err) {
     shared.fill(0);
     okm.fill(0);
+    fullTag.fill(0);
     throw new Error(
-      `unwrapParamBundle: GCM verification failed — ${err instanceof Error ? err.message : err}`,
+      `unwrapParamBundle: AES-CBC decrypt/unpad failed — ${err instanceof Error ? err.message : err}`,
     );
   }
 
   shared.fill(0);
   okm.fill(0);
+  fullTag.fill(0);
 
   return plaintext;
 }
@@ -321,12 +346,12 @@ export function unwrapParamBundle(input: UnwrapInput): Buffer {
  * Serialize a WrappedParamBundle into the exact bytes the chip expects
  * in the TRANSFER_PARAMS APDU data field:
  *
- *   serverEphemeralPub(65) || nonce(12) || ciphertext(var) || tag(16)
+ *   serverEphemeralPub(65) || iv(16) || ciphertext(var, multiple of 16) || tag(16)
  *
- * Total length: 65 + 12 + plaintext.length + 16 = plaintext.length + 93.
+ * Total length: 97 + ciphertext.length.
  */
 export function serializeWrappedBundle(b: WrappedParamBundle): Buffer {
-  return Buffer.concat([b.serverEphemeralPub, b.nonce, b.ciphertext, b.tag]);
+  return Buffer.concat([b.serverEphemeralPub, b.iv, b.ciphertext, b.tag]);
 }
 
 /**
@@ -335,25 +360,30 @@ export function serializeWrappedBundle(b: WrappedParamBundle): Buffer {
  * that inspects captured APDUs.
  */
 export function parseWireBundle(wire: Buffer): WrappedParamBundle {
-  if (wire.length < SEC1_UNCOMPRESSED_LEN + GCM_NONCE_LEN + GCM_TAG_LEN) {
+  const minLen = SEC1_UNCOMPRESSED_LEN + AES_IV_LEN + HMAC_TAG_LEN;
+  if (wire.length < minLen) {
     throw new Error(
-      `parseWireBundle: wire blob too short (${wire.length} bytes, min ${
-        SEC1_UNCOMPRESSED_LEN + GCM_NONCE_LEN + GCM_TAG_LEN
-      })`,
+      `parseWireBundle: wire blob too short (${wire.length} bytes, min ${minLen})`,
+    );
+  }
+  const ctLen = wire.length - SEC1_UNCOMPRESSED_LEN - AES_IV_LEN - HMAC_TAG_LEN;
+  if (ctLen === 0 || ctLen % AES_IV_LEN !== 0) {
+    throw new Error(
+      `parseWireBundle: ciphertext length ${ctLen} must be a positive multiple of ${AES_IV_LEN}`,
     );
   }
   const serverEphemeralPub = wire.subarray(0, SEC1_UNCOMPRESSED_LEN);
-  const nonce = wire.subarray(
+  const iv = wire.subarray(
     SEC1_UNCOMPRESSED_LEN,
-    SEC1_UNCOMPRESSED_LEN + GCM_NONCE_LEN,
+    SEC1_UNCOMPRESSED_LEN + AES_IV_LEN,
   );
-  const tagStart = wire.length - GCM_TAG_LEN;
+  const tagStart = wire.length - HMAC_TAG_LEN;
   const ciphertext = wire.subarray(
-    SEC1_UNCOMPRESSED_LEN + GCM_NONCE_LEN,
+    SEC1_UNCOMPRESSED_LEN + AES_IV_LEN,
     tagStart,
   );
   const tag = wire.subarray(tagStart);
-  return { serverEphemeralPub, nonce, ciphertext, tag };
+  return { serverEphemeralPub, iv, ciphertext, tag };
 }
 
 // ---------------------------------------------------------------------------
@@ -406,22 +436,24 @@ export function wrapParamBundleDeterministic(
     Buffer.from(input.sessionId, 'ascii'),
     HKDF_OUTPUT_LEN,
   );
-  const aesKey = okm.subarray(0, AES_KEY_LEN);
-  const nonce = okm.subarray(AES_KEY_LEN, AES_KEY_LEN + GCM_NONCE_LEN);
+  const aesKey  = okm.subarray(0, AES_KEY_LEN);
+  const iv      = okm.subarray(AES_KEY_LEN, AES_KEY_LEN + AES_IV_LEN);
+  const hmacKey = okm.subarray(AES_KEY_LEN + AES_IV_LEN);
 
-  const cipher = createCipheriv('aes-128-gcm', aesKey, nonce);
+  const cipher = createCipheriv('aes-128-cbc', aesKey, iv);
   const ciphertext = Buffer.concat([cipher.update(input.plaintext), cipher.final()]);
-  const tag = cipher.getAuthTag();
 
-  // Copy out before any potential scrub.  Deterministic wrap does not
-  // scrub (test code) but keep the pattern identical to production wrap.
-  const nonceCopy = Buffer.from(nonce);
+  const fullTag = createHmac('sha256', hmacKey)
+    .update(iv)
+    .update(ciphertext)
+    .digest();
+  const tag = fullTag.subarray(0, HMAC_TAG_LEN);
 
   return {
     serverEphemeralPub,
-    nonce: nonceCopy,
+    iv: Buffer.from(iv),
     ciphertext,
-    tag,
+    tag: Buffer.from(tag),
   };
 }
 
@@ -430,8 +462,9 @@ export const ECDH_PROTOCOL = {
   SALT: Buffer.from(HKDF_SALT),
   HKDF_OUTPUT_LEN,
   AES_KEY_LEN,
-  GCM_NONCE_LEN,
-  GCM_TAG_LEN,
+  AES_IV_LEN,
+  HMAC_KEY_LEN,
+  HMAC_TAG_LEN,
   SEC1_UNCOMPRESSED_LEN,
   CURVE,
 } as const;

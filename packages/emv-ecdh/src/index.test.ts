@@ -6,9 +6,9 @@
  *   1. HKDF-SHA256 against RFC 5869 test case #1 — proves our HKDF
  *      matches the standard, which the PA v3 applet must also implement
  *      byte-identically for interop.
- *   2. ECDH + HKDF + AES-GCM round-trip — server wraps, "chip"
- *      (simulated by test keypair) unwraps back to the original bytes.
- *      Tampered wire bytes must fail unwrap.
+ *   2. ECDH + HKDF + AES-CBC + HMAC-SHA256 round-trip — server wraps,
+ *      "chip" (simulated by test keypair) unwraps back to the original
+ *      bytes.  Tampered wire bytes must fail unwrap.
  *   3. Wire-format parse/serialize round-trip.
  */
 
@@ -26,7 +26,6 @@ import {
 
 describe('hkdfSha256 — RFC 5869 compliance', () => {
   it('matches RFC 5869 test case 1', () => {
-    // RFC 5869 §A.1 — Test Case 1 (Basic test case with SHA-256).
     const ikm = Buffer.from('0b'.repeat(22), 'hex');
     const salt = Buffer.from('000102030405060708090a0b0c', 'hex');
     const info = Buffer.from('f0f1f2f3f4f5f6f7f8f9', 'hex');
@@ -43,7 +42,6 @@ describe('hkdfSha256 — RFC 5869 compliance', () => {
   });
 
   it('matches RFC 5869 test case 2 (longer inputs)', () => {
-    // RFC 5869 §A.2 — Test Case 2 (longer inputs/outputs).
     const ikm = Buffer.from(
       '000102030405060708090a0b0c0d0e0f' +
         '101112131415161718191a1b1c1d1e1f' +
@@ -84,14 +82,13 @@ describe('hkdfSha256 — RFC 5869 compliance', () => {
   });
 
   it('throws on absurd output length', () => {
-    // HKDF max output is 255 * 32 = 8160 bytes (SHA-256).
     expect(() => hkdfSha256(Buffer.alloc(32), Buffer.alloc(0), Buffer.alloc(0), 10_000)).toThrow(
       /exceeds HKDF max/,
     );
   });
 });
 
-describe('wrap / unwrap — round-trip', () => {
+describe('wrap / unwrap — round-trip (AES-CBC + HMAC-SHA256)', () => {
   it('wraps a ParamBundle and the chip can unwrap it', () => {
     const chip = generateTestKeypair();
     const plaintext = Buffer.from('DEADBEEFCAFEBABE0102030405060708', 'hex');
@@ -104,9 +101,10 @@ describe('wrap / unwrap — round-trip', () => {
 
     expect(wrapped.serverEphemeralPub.length).toBe(ECDH_PROTOCOL.SEC1_UNCOMPRESSED_LEN);
     expect(wrapped.serverEphemeralPub[0]).toBe(0x04);
-    expect(wrapped.nonce.length).toBe(ECDH_PROTOCOL.GCM_NONCE_LEN);
-    expect(wrapped.tag.length).toBe(ECDH_PROTOCOL.GCM_TAG_LEN);
-    expect(wrapped.ciphertext.length).toBe(plaintext.length);
+    expect(wrapped.iv.length).toBe(ECDH_PROTOCOL.AES_IV_LEN);
+    expect(wrapped.tag.length).toBe(ECDH_PROTOCOL.HMAC_TAG_LEN);
+    // AES-CBC PKCS#7 pads a 16-byte plaintext to 32 bytes (full pad block).
+    expect(wrapped.ciphertext.length).toBe(32);
 
     const unwrapped = unwrapParamBundle({
       ...wrapped,
@@ -119,7 +117,6 @@ describe('wrap / unwrap — round-trip', () => {
 
   it('handles larger bundles (240-byte typical ParamBundle)', () => {
     const chip = generateTestKeypair();
-    // 240 bytes — upper end of a realistic ParamBundle
     const plaintext = Buffer.alloc(240);
     for (let i = 0; i < plaintext.length; i++) plaintext[i] = (i * 17 + 3) & 0xff;
 
@@ -138,7 +135,7 @@ describe('wrap / unwrap — round-trip', () => {
     expect(unwrapped.equals(plaintext)).toBe(true);
   });
 
-  it('fails unwrap when sessionId does not match (info binding)', () => {
+  it('fails unwrap when sessionId does not match (HKDF info binding)', () => {
     const chip = generateTestKeypair();
     const plaintext = Buffer.from('11'.repeat(32), 'hex');
 
@@ -152,12 +149,12 @@ describe('wrap / unwrap — round-trip', () => {
       unwrapParamBundle({
         ...wrapped,
         chipPriv: chip.priv,
-        sessionId: 'session-B', // different sessionId → different AES key
+        sessionId: 'session-B', // different sessionId → different HKDF output
       }),
     ).toThrow();
   });
 
-  it('fails unwrap when ciphertext is tampered (GCM tag mismatch)', () => {
+  it('fails unwrap when ciphertext is tampered (HMAC tag mismatch)', () => {
     const chip = generateTestKeypair();
     const plaintext = Buffer.from('22'.repeat(32), 'hex');
 
@@ -178,13 +175,36 @@ describe('wrap / unwrap — round-trip', () => {
         chipPriv: chip.priv,
         sessionId: 'session-X',
       }),
-    ).toThrow(/GCM verification failed/);
+    ).toThrow(/HMAC tag verification failed/);
+  });
+
+  it('fails unwrap when tag itself is tampered', () => {
+    const chip = generateTestKeypair();
+    const plaintext = Buffer.from('33'.repeat(32), 'hex');
+
+    const wrapped = wrapParamBundle({
+      chipPubUncompressed: chip.pubUncompressed,
+      plaintext,
+      sessionId: 'session-Y',
+    });
+
+    const tamperedTag = Buffer.from(wrapped.tag);
+    tamperedTag[0] ^= 0x01;
+
+    expect(() =>
+      unwrapParamBundle({
+        ...wrapped,
+        tag: tamperedTag,
+        chipPriv: chip.priv,
+        sessionId: 'session-Y',
+      }),
+    ).toThrow(/HMAC tag verification failed/);
   });
 
   it('fails unwrap when chipPriv is wrong (ECDH shared differs)', () => {
     const chipA = generateTestKeypair();
     const chipB = generateTestKeypair();
-    const plaintext = Buffer.from('33'.repeat(32), 'hex');
+    const plaintext = Buffer.from('44'.repeat(32), 'hex');
 
     const wrapped = wrapParamBundle({
       chipPubUncompressed: chipA.pubUncompressed,
@@ -203,7 +223,7 @@ describe('wrap / unwrap — round-trip', () => {
 
   it('fresh wrap produces different ciphertext each call (forward secrecy via ephemeral)', () => {
     const chip = generateTestKeypair();
-    const plaintext = Buffer.from('44'.repeat(32), 'hex');
+    const plaintext = Buffer.from('55'.repeat(32), 'hex');
 
     const w1 = wrapParamBundle({
       chipPubUncompressed: chip.pubUncompressed,
@@ -216,16 +236,33 @@ describe('wrap / unwrap — round-trip', () => {
       sessionId: 'same-session',
     });
 
-    // Different ephemeral keys → different ciphertexts even though
-    // sessionId + plaintext + chip pubkey are identical.
     expect(w1.serverEphemeralPub.equals(w2.serverEphemeralPub)).toBe(false);
     expect(w1.ciphertext.equals(w2.ciphertext)).toBe(false);
 
-    // But both unwrap to the same plaintext.
     const p1 = unwrapParamBundle({ ...w1, chipPriv: chip.priv, sessionId: 'same-session' });
     const p2 = unwrapParamBundle({ ...w2, chipPriv: chip.priv, sessionId: 'same-session' });
     expect(p1.equals(plaintext)).toBe(true);
     expect(p2.equals(plaintext)).toBe(true);
+  });
+
+  it('handles plaintext not aligned to block boundary (PKCS#7 pad adds up to 16 B)', () => {
+    const chip = generateTestKeypair();
+    const plaintext = Buffer.from('ABCDE', 'hex'); // 2.5 bytes, weird but valid
+
+    const wrapped = wrapParamBundle({
+      chipPubUncompressed: chip.pubUncompressed,
+      plaintext,
+      sessionId: 'pad-test',
+    });
+    // After PKCS#7 padding, CT length = 16 (one full block).
+    expect(wrapped.ciphertext.length).toBe(16);
+
+    const unwrapped = unwrapParamBundle({
+      ...wrapped,
+      chipPriv: chip.priv,
+      sessionId: 'pad-test',
+    });
+    expect(unwrapped.equals(plaintext)).toBe(true);
   });
 });
 
@@ -249,7 +286,7 @@ describe('wrapParamBundleDeterministic — reproducible test vectors', () => {
     });
 
     expect(w1.serverEphemeralPub.equals(w2.serverEphemeralPub)).toBe(true);
-    expect(w1.nonce.equals(w2.nonce)).toBe(true);
+    expect(w1.iv.equals(w2.iv)).toBe(true);
     expect(w1.ciphertext.equals(w2.ciphertext)).toBe(true);
     expect(w1.tag.equals(w2.tag)).toBe(true);
   });
@@ -279,7 +316,7 @@ describe('wrapParamBundleDeterministic — reproducible test vectors', () => {
 describe('wire format serialization', () => {
   it('serialize / parse round-trip', () => {
     const chip = generateTestKeypair();
-    const plaintext = Buffer.from('55'.repeat(64), 'hex');
+    const plaintext = Buffer.alloc(64, 0x55);
 
     const wrapped = wrapParamBundle({
       chipPubUncompressed: chip.pubUncompressed,
@@ -289,19 +326,29 @@ describe('wire format serialization', () => {
 
     const wire = serializeWrappedBundle(wrapped);
 
-    // Expected length: 65 (pubkey) + 12 (nonce) + plaintext (64) + 16 (tag) = 157
-    expect(wire.length).toBe(65 + 12 + 64 + 16);
+    // Expected length: 65 (pubkey) + 16 (iv) + 64 (ct, exact block
+    // alignment — still gets full-block PKCS#7 pad, so 80) + 16 (tag)
+    // = 65 + 16 + 80 + 16 = 177
+    expect(wire.length).toBe(177);
 
     const parsed = parseWireBundle(wire);
 
     expect(parsed.serverEphemeralPub.equals(wrapped.serverEphemeralPub)).toBe(true);
-    expect(parsed.nonce.equals(wrapped.nonce)).toBe(true);
+    expect(parsed.iv.equals(wrapped.iv)).toBe(true);
     expect(parsed.ciphertext.equals(wrapped.ciphertext)).toBe(true);
     expect(parsed.tag.equals(wrapped.tag)).toBe(true);
   });
 
   it('parseWireBundle rejects wire blobs shorter than header+tag', () => {
-    // 65 + 12 + 16 = 93 is the minimum (zero-length ciphertext).
-    expect(() => parseWireBundle(Buffer.alloc(92))).toThrow(/too short/);
+    // 65 + 16 + 16 = 97 minimum (zero-length ciphertext) — but zero CT
+    // also isn't allowed, so any blob under 97+16 is rejected.
+    expect(() => parseWireBundle(Buffer.alloc(96))).toThrow(/too short/);
+  });
+
+  it('parseWireBundle rejects ciphertext length not aligned to 16', () => {
+    // 65 + 16 + 17 + 16 = 114 bytes, CT length 17 (not % 16)
+    const badWire = Buffer.alloc(114);
+    badWire[0] = 0x04; // start with SEC1 marker (not that it matters for length check)
+    expect(() => parseWireBundle(badWire)).toThrow(/multiple of/);
   });
 });

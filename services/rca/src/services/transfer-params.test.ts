@@ -25,6 +25,7 @@ import { buildParamBundleApdu } from './plan-builder.js';
 describe('buildParamBundleApdu — TRANSFER_PARAMS wire shape', () => {
   it('emits a short APDU (Lc <= 255) for a small bundle', () => {
     const chip = generateTestKeypair();
+    // 13 bytes plaintext → 16-byte ciphertext after PKCS#7 padding.
     const plaintext = Buffer.from('DEADBEEFCAFEBABE0102030405', 'hex');
 
     const apdu = buildParamBundleApdu({
@@ -38,17 +39,18 @@ describe('buildParamBundleApdu — TRANSFER_PARAMS wire shape', () => {
     expect(apdu[2]).toBe(0x00); // P1
     expect(apdu[3]).toBe(0x00); // P2
 
-    // For a small bundle (< 255 bytes body), short-form Lc in byte 4.
-    // Body = 65 pubkey + 12 nonce + 13 ciphertext + 16 tag = 106 bytes.
-    expect(apdu[4]).toBe(106);
-    expect(apdu.length).toBe(5 + 106);
+    // Body = 65 pubkey + 16 iv + 16 ct (13 bytes padded to 16) + 16 tag
+    //      = 113 bytes.  Fits in short-form APDU (Lc byte 4 = 113).
+    expect(apdu[4]).toBe(113);
+    expect(apdu.length).toBe(5 + 113);
   });
 
   it('emits an extended APDU (Lc = 00 Lc-hi Lc-lo) for realistic bundle sizes', () => {
     const chip = generateTestKeypair();
-    // 400 bytes ≈ realistic MChip CVN 18 ParamBundle size after TLV
-    // assembly.  Wire body = 400 + 93 = 493 bytes, past the short-
-    // form cap of 255.
+    // 400 bytes ≈ realistic MChip CVN 18 ParamBundle size.
+    // After PKCS#7 pad → 400 bytes already block-aligned so pad is
+    // one full block = 16 bytes, ct = 416.  Wire = 65 + 16 + 416 + 16
+    // = 513 bytes, past short-form cap of 255.
     const plaintext = Buffer.alloc(400, 0xAB);
 
     const apdu = buildParamBundleApdu({
@@ -64,8 +66,8 @@ describe('buildParamBundleApdu — TRANSFER_PARAMS wire shape', () => {
     // Extended APDU: byte 4 = 0x00, bytes 5-6 = big-endian Lc.
     expect(apdu[4]).toBe(0x00);
     const lc = (apdu[5] << 8) | apdu[6];
-    expect(lc).toBe(493);
-    expect(apdu.length).toBe(7 + 493);
+    expect(lc).toBe(513);
+    expect(apdu.length).toBe(7 + 513);
   });
 
   it('round-trips through unwrap — proves the APDU is consumable by pa-v3', () => {
