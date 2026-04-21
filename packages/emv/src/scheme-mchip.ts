@@ -129,7 +129,13 @@ export function mapMChipToParamBundle(input: McipMapperInput): ParamBundleInput 
     expiryYymm: card.expiryDate,
     effectiveYymm: card.effectiveDate,
     serviceCode: card.serviceCode,
-    icvv: Buffer.from(card.icvv, 'hex'),
+    // iCVV is a 3-digit decimal string (e.g. "123") per
+    // @palisade/emv/udk-deriver's deriveIcvv contract.  ParamBundle
+    // tag 0x1E expects 3 BCD-packed bytes = 6 nibbles, so we pad to 6
+    // with leading zeros ("123" → "000123" → 0x00 0x01 0x23).  Same
+    // approach the legacy buildIad uses when it serialises iCVV into
+    // the CVR bit field.
+    icvv: bcdEncode(card.icvv, 6),
 
     // Scheme / CVN / AID
     scheme: 'mchip',
@@ -343,6 +349,25 @@ function bcdToDigits(bcd: Buffer): string {
     out += (bcd[i] & 0x0f).toString(16);
   }
   return out.replace(/f+$/i, '').toUpperCase();
+}
+
+/**
+ * BCD-encode a decimal digit-string to exactly `nibbles` nibbles,
+ * left-padded with '0' so odd-length strings fit.  Used for iCVV
+ * (3-digit decimal → 6-nibble / 3-byte output) and any other BCD
+ * field where the input is raw decimal digits, not hex.
+ */
+function bcdEncode(digits: string, nibbles: number): Buffer {
+  if (!/^\d+$/.test(digits)) {
+    throw new Error(`scheme-mchip: bcdEncode expected digit string, got "${digits}"`);
+  }
+  if (digits.length > nibbles) {
+    throw new Error(
+      `scheme-mchip: bcdEncode input "${digits}" has more digits than fits in ${nibbles} nibbles`,
+    );
+  }
+  const padded = digits.padStart(nibbles, '0');
+  return Buffer.from(padded, 'hex');
 }
 
 /**
