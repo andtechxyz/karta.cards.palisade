@@ -23,7 +23,7 @@ import {
   buildProvisioningPlan,
   buildMinimalSadPayload,
   buildTransferSadApdu,
-  buildParamBundleApdu,
+  buildParamBundleApduChunks,
   schemeByteForIssuer,
   type Plan,
   type PlanContext,
@@ -195,6 +195,59 @@ function pruneSadCache(): void {
       sadCache.delete(sid);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// TRANSFER_PARAMS chunk queue — for chained short APDUs
+// ---------------------------------------------------------------------------
+//
+// When pa-v3's TRANSFER_PARAMS body exceeds 255 B (the real case for any
+// ParamBundle), rca splits the wire into ≤240-byte chunks with the ISO
+// 7816-4 chaining bit (CLA bit 0x10) set on everything but the last.
+// iOS CoreNFC / JCOP 5 JC 3.0.4 reject extended APDUs on this silicon
+// — tested SW=6700 across four consecutive taps despite correct case-4
+// framing — and short APDUs are the only path that got pa-v1's
+// TRANSFER_SAD over the wire too.  The applet-side accumulator (see
+// pa-v3 ProvisioningAgentV3 processTransferParams chainOff) reads
+// chunks into wireBuf and only runs unwrap on the final (non-chained)
+// chunk.
+//
+// Cache entry: ordered array of pre-built APDU buffers ready to emit,
+// plus an index of the next one.  Both produced at handleKeygenResponse
+// time; consumed chunk-by-chunk in handleSadResponse as the chip acks
+// each one with 9000.
+
+interface ParamChunkQueue {
+  /** Ordered APDU bytes, chain-bit-on on all but the last. */
+  chunks: Buffer[];
+  /** Index of the chunk that was just sent (awaiting its ack). */
+  sentIdx: number;
+  expiresAt: number;
+}
+const paramChunkCache = new Map<string, ParamChunkQueue>();
+
+function putParamChunks(sessionId: string, chunks: Buffer[], ttlMs: number): void {
+  paramChunkCache.set(sessionId, {
+    chunks,
+    sentIdx: 0,
+    expiresAt: Date.now() + Math.min(Math.max(ttlMs, 10_000), SAD_CACHE_MAX_TTL_MS),
+  });
+}
+
+/**
+ * Mark the currently-in-flight chunk as acked and return info about
+ * what's next.  Returns `{ done: true }` when the chip just acked the
+ * last chunk — caller should proceed to FINAL_STATUS.
+ */
+function advanceParamChunk(sessionId: string): { done: boolean; next: Buffer | null } {
+  const q = paramChunkCache.get(sessionId);
+  if (!q) return { done: true, next: null };
+  q.sentIdx += 1;
+  if (q.sentIdx >= q.chunks.length) {
+    paramChunkCache.delete(sessionId);
+    return { done: true, next: null };
+  }
+  return { done: false, next: q.chunks[q.sentIdx] };
 }
 
 /** Test hook: clear the module-level SAD cache between runs. */
@@ -628,11 +681,42 @@ export class SessionManager {
       data: { phase: 'KEYGEN' },
     });
 
-    // GENERATE_KEYS = 80 E0 00 00 01 01 — single-byte payload `01`
-    // means "ECC P-256 keypair please".  No session ID — passing one
-    // appends 16 bytes the PA discards (or worse).  Matches the exact
-    // hex in the Palisade SSD e2e trace.
-    const keygenHex = APDUBuilder.generateKeys();
+    // GENERATE_KEYS for pa-v3.  Body layout:
+    //
+    //   byte 0          0x01 = "ECC P-256 keypair please"
+    //   bytes 1..N      sessionId (UTF-8), up to 63 B
+    //
+    // The session ID MUST match the HKDF `info` string that
+    // wrapParamBundle uses at TRANSFER_PARAMS wrap time — pa-v3's
+    // EcdhUnwrapper re-derives the AES/HMAC session keys using the
+    // sessionId bytes stored here; mismatch → HMAC verify fail →
+    // SW=6A80 (SW_PARAM_BUNDLE_GCM_FAILED).  Legacy pa-v1 ignored this
+    // field entirely, which is why the original GENERATE_KEYS APDU
+    // shipped no body beyond the keyType marker.
+    //
+    // Trailing Le = 0x41 (65 — exact pubkey response size) rather than
+    // 0x00 (max 256).  Debug variant hunting iOS ISO-DEP quirks; chip
+    // accepts both equally.  Revert to 0x00 once pa-v3 e2e lands.
+    const sessionIdBytes = Buffer.from(sessionId, 'utf8');
+    if (sessionIdBytes.length > 63) {
+      throw new Error(
+        `[rca] sessionId too long for GENERATE_KEYS body: ${sessionIdBytes.length} B > 63 B max`,
+      );
+    }
+    const keygenBody = Buffer.concat([
+      Buffer.from([0x01]),
+      sessionIdBytes,
+    ]);
+    const keygenApduBuf = Buffer.concat([
+      Buffer.from([0x80, 0xE0, 0x00, 0x00, keygenBody.length]),
+      keygenBody,
+      Buffer.from([0x41]),
+    ]);
+    const keygenHex = keygenApduBuf.toString('hex').toUpperCase();
+
+    // Temporary prototype-debug log so we can confirm on the wire what
+    // bytes rca is handing to the mobile.  Remove once pa-v3 e2e lands.
+    console.log(`[rca][debug] classical keygen APDU → session=${sessionId} hex=${keygenHex} (len=${keygenApduBuf.length}B)`);
 
     return [{
       type: 'apdu',
@@ -812,12 +896,23 @@ export class SessionManager {
     let transferApdu: Buffer;
     let wirePhase: string;
     if (useParamBundle) {
-      transferApdu = await this.buildTransferParamsApdu(
+      // PARAM_BUNDLE path — can span multiple chained short APDUs.
+      // Build all chunks up front, queue the rest for handleSadResponse
+      // to drain, and emit the first chunk now.
+      const chunks = await this.buildTransferParamsApduChunks(
         paramRecordId!,
         iccPubkey,
         sessionId,
       );
-      wirePhase = 'provisioning_param_bundle';
+      if (chunks.length === 0) {
+        throw new Error(`[rca] TRANSFER_PARAMS produced 0 chunks for session ${sessionId}`);
+      }
+      const ttlMs = (getRcaConfig().WS_TIMEOUT_SECONDS ?? 60) * 1000;
+      putParamChunks(sessionId, chunks, ttlMs);
+      transferApdu = chunks[0];
+      wirePhase = chunks.length > 1
+        ? 'provisioning_param_bundle_chain_1_of_' + chunks.length
+        : 'provisioning_param_bundle';
     } else {
       const ctx = await this.buildPlanContext(
         session.card?.program?.issuerProfile ?? null,
@@ -857,11 +952,11 @@ export class SessionManager {
    * ParamRecord CONSUMED on the way out so a second provisioning
    * attempt against the same record is rejected upfront.
    */
-  private async buildTransferParamsApdu(
+  private async buildTransferParamsApduChunks(
     paramRecordId: string,
     chipPubUncompressed: Buffer,
     sessionId: string,
-  ): Promise<Buffer> {
+  ): Promise<Buffer[]> {
     const pr = await prisma.paramRecord.findUnique({
       where: { id: paramRecordId },
     });
@@ -881,9 +976,9 @@ export class SessionManager {
       pr.bundleKeyVersion,
     );
 
-    let apdu: Buffer;
+    let chunks: Buffer[];
     try {
-      apdu = buildParamBundleApdu({
+      chunks = buildParamBundleApduChunks({
         plaintextBundle,
         chipPubUncompressed,
         sessionId,
@@ -891,13 +986,32 @@ export class SessionManager {
     } finally {
       plaintextBundle.fill(0);
     }
-    return apdu;
+    return chunks;
   }
 
   /**
-   * Phase 3: SAD transfer complete → send FINAL_STATUS.
+   * Phase 3: SAD / ParamBundle transfer complete → send FINAL_STATUS.
+   *
+   * For the PARAM_BUNDLE path with a multi-chunk TRANSFER_PARAMS, each
+   * chip ack lands here.  We peek the chunk queue: if there are more
+   * chunks to send, emit the next one and stay in the SAD_TRANSFER
+   * phase; only the last chunk's ack triggers the real transition to
+   * AWAITING_FINAL and the FINAL_STATUS APDU.  Single-APDU flows
+   * (legacy SAD, or PARAM_BUNDLE bodies that fit in 255 B) skip this
+   * entirely and go straight to FINAL_STATUS.
    */
   private async handleSadResponse(sessionId: string): Promise<WSMessage[]> {
+    const advance = advanceParamChunk(sessionId);
+    if (!advance.done && advance.next) {
+      // Still more chained chunks to ship; stay in SAD_TRANSFER.
+      return [{
+        type: 'apdu',
+        hex: advance.next.toString('hex').toUpperCase(),
+        phase: 'provisioning_param_bundle_chain',
+        progress: 0.55,
+      }];
+    }
+
     await prisma.provisioningSession.update({
       where: { id: sessionId },
       data: { phase: 'AWAITING_FINAL' },

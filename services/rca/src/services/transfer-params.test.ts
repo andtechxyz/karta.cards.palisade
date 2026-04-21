@@ -20,7 +20,7 @@ import {
   unwrapParamBundle,
   parseWireBundle,
 } from '@palisade/emv-ecdh';
-import { buildParamBundleApdu } from './plan-builder.js';
+import { buildParamBundleApdu, buildParamBundleApduChunks } from './plan-builder.js';
 
 describe('buildParamBundleApdu — TRANSFER_PARAMS wire shape', () => {
   it('emits a short APDU (Lc <= 255) for a small bundle', () => {
@@ -45,7 +45,7 @@ describe('buildParamBundleApdu — TRANSFER_PARAMS wire shape', () => {
     expect(apdu.length).toBe(5 + 113);
   });
 
-  it('emits an extended APDU (Lc = 00 Lc-hi Lc-lo) for realistic bundle sizes', () => {
+  it('emits N chained short APDUs for realistic (>255 B) bundle sizes', () => {
     const chip = generateTestKeypair();
     // 400 bytes ≈ realistic MChip CVN 18 ParamBundle size.
     // After PKCS#7 pad → 400 bytes already block-aligned so pad is
@@ -53,30 +53,45 @@ describe('buildParamBundleApdu — TRANSFER_PARAMS wire shape', () => {
     // = 513 bytes, past short-form cap of 255.
     const plaintext = Buffer.alloc(400, 0xAB);
 
-    const apdu = buildParamBundleApdu({
+    const chunks = buildParamBundleApduChunks({
       plaintextBundle: plaintext,
       chipPubUncompressed: chip.pubUncompressed,
       sessionId: 'sess_test_02',
     });
 
-    expect(apdu[0]).toBe(0x80);
-    expect(apdu[1]).toBe(0xE2);
-    expect(apdu[2]).toBe(0x00);
-    expect(apdu[3]).toBe(0x00);
-    // Case-4 extended APDU:
-    //   byte 4        = 0x00 (ext marker)
-    //   bytes 5-6     = big-endian Lc
-    //   bytes 7..7+Lc = body
-    //   last 2 bytes  = Le = 0x00 0x00 ("up to 65536 bytes of response")
-    expect(apdu[4]).toBe(0x00);
-    const lc = (apdu[5] << 8) | apdu[6];
-    expect(lc).toBe(513);
-    expect(apdu.length).toBe(7 + 513 + 2);
-    // Trailing Le = 00 00.  Forces case-4 extended — iOS CoreNFC rejects
-    // case-3 extended at the ISO-DEP layer (SW=6700 was the first
-    // real-chip manifestation of that reject).
-    expect(apdu[apdu.length - 2]).toBe(0x00);
-    expect(apdu[apdu.length - 1]).toBe(0x00);
+    // 513 B wire / 240 B chunk → ceil = 3 chunks (240 + 240 + 33).
+    expect(chunks.length).toBe(3);
+
+    // All chunks: 80 E2 00 00 (CLA/INS/P1/P2 with chain-bit variation).
+    // Intermediate chunks are case-3 (5 + Lc bytes).  The last chunk is
+    // case-4 with Le=0x20 so the chip has a 32-byte outgoing slot for
+    // the IV-mismatch diagnostic (6 + Lc bytes).
+    for (let i = 0; i < chunks.length; i++) {
+      const c = chunks[i];
+      const isLast = i === chunks.length - 1;
+      expect(c[0]).toBe(isLast ? 0x80 : 0x90);
+      expect(c[1]).toBe(0xE2);
+      expect(c[2]).toBe(0x00);
+      expect(c[3]).toBe(0x00);
+      const lc = c[4];
+      expect(lc).toBeLessThanOrEqual(240);
+      expect(c.length).toBe(isLast ? 5 + lc + 1 : 5 + lc);
+      if (isLast) {
+        expect(c[c.length - 1]).toBe(0x20);
+      }
+    }
+
+    // Sum of body bytes across chunks == wire length.
+    const totalBody = chunks.reduce((n, c) => n + c[4], 0);
+    expect(totalBody).toBe(513);
+
+    // Single-buffer helper throws for the multi-chunk case so callers
+    // don't silently emit only the first chunk.
+    expect(() => buildParamBundleApdu({
+      plaintextBundle: plaintext,
+      chipPubUncompressed: chip.pubUncompressed,
+      sessionId: 'sess_test_02',
+    })).toThrow(/caller must use buildParamBundleApduChunks/);
   });
 
   it('round-trips through unwrap — proves the APDU is consumable by pa-v3', () => {

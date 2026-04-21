@@ -389,6 +389,52 @@ export function buildParamBundleApdu(input: {
   chipPubUncompressed: Buffer;
   sessionId: string;
 }): Buffer {
+  const chunks = buildParamBundleApduChunks(input);
+  // Back-compat: single APDU callers still get a single Buffer.
+  // Multi-chunk callers (session-manager handleKeygenResponse) should
+  // call buildParamBundleApduChunks directly.
+  if (chunks.length !== 1) {
+    throw new Error(
+      `buildParamBundleApdu: wire body ${/* computed inside */''} bytes split into ${chunks.length} chunks; caller must use buildParamBundleApduChunks`,
+    );
+  }
+  return chunks[0];
+}
+
+/**
+ * Maximum body bytes per chained short APDU chunk.  Per ISO 7816-4 a
+ * short APDU body maxes at 255 B; leaving 15 B of headroom for future
+ * per-chunk metadata (chunk index, total count) if we ever need it —
+ * negligible wire overhead given a full 721 B body fits in 4 chunks
+ * either way (721 / 240 = 4 chunks vs 721 / 255 = 3 chunks).
+ */
+const TRANSFER_PARAMS_CHUNK_SIZE = 240;
+
+/**
+ * Build the TRANSFER_PARAMS APDU(s) for pa-v3.  Returns an ordered
+ * array that the caller emits one at a time over the WS.
+ *
+ * Framing decision is driven by wire body size:
+ *
+ *   - wire <= 255 B  → single short APDU, CLA=0x80
+ *   - wire  > 255 B  → N chained short APDUs, 240 B max body each,
+ *                      CLA=0x90 for all non-final chunks (bit 4 set
+ *                      = "more data follows"), CLA=0x80 for the last.
+ *
+ * Why not case-4 extended (Lc = 00 Lc-hi Lc-lo + Le = 00 00)?
+ * iOS CoreNFC + JCOP 5 JC 3.0.4 silicon reject that framing at the
+ * ISO-DEP transmit layer (observed SW=6700 across four consecutive
+ * real-card taps).  Chained short APDUs work on the same stack that
+ * carries pa-v1's TRANSFER_SAD, so this is the strictly-safer
+ * framing.  pa-v3's processTransferParams handles both (extended via
+ * receiveBytes loop, chained via chainOff accumulator) — we pick the
+ * chained form here because it's the one actually verified on-wire.
+ */
+export function buildParamBundleApduChunks(input: {
+  plaintextBundle: Buffer;
+  chipPubUncompressed: Buffer;
+  sessionId: string;
+}): Buffer[] {
   const wrapped = wrapParamBundle({
     chipPubUncompressed: input.chipPubUncompressed,
     plaintext: input.plaintextBundle,
@@ -396,27 +442,41 @@ export function buildParamBundleApdu(input: {
   });
   const wire = serializeWrappedBundle(wrapped);
 
+  // Single short APDU — use the ≤255 path.
   if (wire.length <= 255) {
-    return Buffer.concat([
-      Buffer.from([0x80, 0xE2, 0x00, 0x00, wire.length]),
-      wire,
-    ]);
+    return [
+      Buffer.concat([
+        Buffer.from([0x80, 0xE2, 0x00, 0x00, wire.length]),
+        wire,
+      ]),
+    ];
   }
 
-  // Extended APDU — almost certain path for real bundles.  Emit as
-  // case-4 extended with Le=0x0000 ("up to 65536 bytes of response",
-  // which pa-v3 ignores since it emits no body).  iOS CoreNFC's
-  // ISO-DEP transmit layer rejects case-3 extended on some silicon —
-  // SW=6700 came back on our first real 728-byte TRANSFER_PARAMS with
-  // case-3, and pa-v1's TRANSFER_SAD never hit the extended path in
-  // production (SAD blobs stayed under 255 B), so this codepath was
-  // effectively dead until now.
-  const lcBuf = Buffer.alloc(2);
-  lcBuf.writeUInt16BE(wire.length, 0);
-  return Buffer.concat([
-    Buffer.from([0x80, 0xE2, 0x00, 0x00, 0x00]),  // 5 B: CLA INS P1 P2 + ext marker
-    lcBuf,                                         // 2 B: Lc-hi Lc-lo
-    wire,                                          // N B: body
-    Buffer.from([0x00, 0x00]),                     // 2 B: Le-hi Le-lo = "max"
-  ]);
+  // Chain the wire body into N chunks.  All chunks share INS/P1/P2;
+  // CLA is 0x90 (chain bit on) for all but the last, 0x80 (chain
+  // bit off) for the last.  Last chunk is CASE-4 (trailing Le) so the
+  // chip has an outgoing slot for the IV-mismatch diagnostic blob
+  // (32 B: chip_iv || wire_iv) — a harmless ~32-byte bump when
+  // everything's working, invaluable when they don't match.
+  const chunks: Buffer[] = [];
+  let off = 0;
+  while (off < wire.length) {
+    const remaining = wire.length - off;
+    const thisLen = Math.min(TRANSFER_PARAMS_CHUNK_SIZE, remaining);
+    const isLast = off + thisLen >= wire.length;
+    const cla = isLast ? 0x80 : 0x90;
+    const parts: Buffer[] = [
+      Buffer.from([cla, 0xE2, 0x00, 0x00, thisLen]),
+      wire.subarray(off, off + thisLen),
+    ];
+    if (isLast) {
+      // Le=0x20 (32 B — exactly what EcdhUnwrapper.DBG_IV_DIAG_LEN
+      // emits on IV mismatch).  Chip returns 0 bytes on success with
+      // this Le; returns 32 B + SW=6AE4 on mismatch.
+      parts.push(Buffer.from([0x20]));
+    }
+    chunks.push(Buffer.concat(parts));
+    off += thisLen;
+  }
+  return chunks;
 }

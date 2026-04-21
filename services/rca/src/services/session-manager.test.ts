@@ -215,9 +215,15 @@ describe('SessionManager', () => {
       expect(responses).toHaveLength(1);
       expect(responses[0].type).toBe('apdu');
       expect(responses[0].phase).toBe('key_generation');
-      // 80 E0 00 00 01 01 00 — case-4, so pa-v3's setOutgoingAndSend(0, 65)
-      // can emit the pubkey response.  Trailing 00 is Le=256.
-      expect(responses[0].hex).toBe('80E00000010100');
+      // GENERATE_KEYS body: 01 (key-type marker) || session_01 (UTF-8).
+      // Trailing Le=0x41 is a debug variant; chip accepts 0x00/0x41 equally.
+      // The session ID bytes inside the APDU MUST match the HKDF `info`
+      // passed to wrapParamBundle at TRANSFER_PARAMS time; pa-v3
+      // persists these at GENERATE_KEYS and re-uses them in
+      // EcdhUnwrapper.  See handlePaFci for the encoding.
+      //   80 E0 00 00 | 0B | 01 73 65 73 73 69 6F 6E 5F 30 31 | 41
+      //               Lc       'session_01' utf8           Le
+      expect(responses[0].hex).toBe('80E000000B0173657373696F6E5F303141');
       expect(prisma.provisioningSession.update).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { id: 'session_01' },
