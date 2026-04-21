@@ -22,6 +22,7 @@ vi.mock('@palisade/db', () => {
     },
     paramRecord: {
       findUnique: vi.fn(),
+      update: vi.fn(),
     },
     card: {
       update: vi.fn(),
@@ -387,11 +388,18 @@ describe('SessionManager', () => {
   // -------------------------------------------------------------------------
 
   describe('handleMessage — response in AWAITING_FINAL with success byte', () => {
-    it('returns CONFIRM + complete, updates card to PROVISIONED', async () => {
-      // The implementation pre-fetches the session (with card + sadRecord
-      // relations) so the response payload is ready before the DB commit
-      // kicks off asynchronously.  AWAITING_FINAL branch on the first
-      // findUnique (phase check) + same enriched shape on the second.
+    it('returns CONFIRM APDU only and advances phase to CONFIRMING (no Card/SAD commit yet)', async () => {
+      // Two-phase finalize contract — see handleFinalStatus block comment.
+      // This phase must NOT commit Card=PROVISIONED / SadRecord=CONSUMED
+      // / send `complete` — those are gated on the chip's CONFIRM 9000
+      // ack and run from handleConfirmResponse.  Committing here is the
+      // race bug we regressed against: if the mobile UI sees `complete`
+      // before the CONFIRM APDU lands, the user lifts the card and the
+      // applet is left stuck in STATE_AWAITING_CONFIRM.
+      //
+      // handleFinalStatus still does ONE DB write: the synchronous
+      // phase=CONFIRMING update (with provenance + fidoCredData).  That
+      // write fails loud on DB outage instead of racing the callback.
       const enriched = {
         ...makeSession('AWAITING_FINAL'),
         cardId: 'card_01',
@@ -401,47 +409,118 @@ describe('SessionManager', () => {
       };
       (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(enriched);
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...makeSession('CONFIRMING'),
+        cardId: 'card_01',
+        sadRecordId: 'sad_01',
+      });
+
+      // 0x01 = success byte, followed by 32 bytes provenance hash +
+      // a zero-length FIDO trailer (len byte = 0x00).  The provenance
+      // extractor requires length > 33 to treat the provenance bytes as
+      // present, hence the trailing byte — matches the real APDU shape.
+      const statusData = Buffer.concat([
+        Buffer.from([0x01]),
+        Buffer.alloc(32, 0xCC),
+        Buffer.from([0x00]),
+      ]);
+      const msg: WSMessage = { type: 'response', hex: statusData.toString('hex'), sw: '9000' };
+      const responses = await mgr.handleMessage('session_01', msg);
+
+      expect(responses).toHaveLength(1);
+      expect(responses[0].type).toBe('apdu');
+      expect(responses[0].hex).toBe('80E8000000'); // CONFIRM APDU
+      expect(responses[0].phase).toBe('confirming');
+      expect(responses[0].progress).toBe(0.95);
+
+      // Phase advance to CONFIRMING happened synchronously with the
+      // captured provenance + fidoCredData payload.
+      expect(prisma.provisioningSession.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'session_01' },
+          data: expect.objectContaining({
+            phase: 'CONFIRMING',
+            provenance: 'cc'.repeat(32),
+          }),
+        }),
+      );
+
+      // CRITICAL: no Card/SAD commit yet — that's the whole point of the
+      // split.  If this ever flips the race regresses.
+      expect(prisma.card.update).not.toHaveBeenCalled();
+      expect(prisma.sadRecord.update).not.toHaveBeenCalled();
+      expect(prisma.paramRecord.update).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // handleMessage — response in CONFIRMING with 9000 (chip CONFIRM ack)
+  // -------------------------------------------------------------------------
+
+  describe('handleMessage — response in CONFIRMING with 9000', () => {
+    it('runs the atomic commit (session COMPLETE + Card PROVISIONED + SAD CONSUMED) and emits `complete`', async () => {
+      // The phase guard in handleCardResponse finds session.phase ===
+      // 'CONFIRMING' on the plain findUnique, then dispatches to
+      // handleConfirmResponse.  Inside that handler we $transaction a
+      // second update (with relations) to grab card + sadRecord for the
+      // callback + the `complete` payload.
+      (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSession('CONFIRMING'),
+      );
+      (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue({
         ...makeSession('COMPLETE'),
         cardId: 'card_01',
         sadRecordId: 'sad_01',
-        card: { cardRef: 'ref_01', chipSerial: 'CS001' },
+        card: { cardRef: 'ref_01', chipSerial: 'CS001', paramRecordId: null },
         sadRecord: { proxyCardId: 'pxy_abc123' },
       });
       (prisma.card.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
       (prisma.sadRecord.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
 
-      // 0x01 = success byte, followed by 32 bytes provenance hash
-      const statusData = Buffer.concat([
-        Buffer.from([0x01]),
-        Buffer.alloc(32, 0xCC), // provenance hash
-      ]);
-      const msg: WSMessage = { type: 'response', hex: statusData.toString('hex'), sw: '9000' };
+      const msg: WSMessage = { type: 'response', hex: '', sw: '9000' };
       const responses = await mgr.handleMessage('session_01', msg);
 
-      expect(responses).toHaveLength(2);
-      expect(responses[0].type).toBe('apdu');
-      expect(responses[0].hex).toBe('80E8000000'); // CONFIRM APDU
-      expect(responses[0].phase).toBe('confirming');
-      expect(responses[1].type).toBe('complete');
-      expect(responses[1].proxyCardId).toBe('pxy_abc123');
+      expect(responses).toHaveLength(1);
+      expect(responses[0].type).toBe('complete');
+      expect(responses[0].proxyCardId).toBe('pxy_abc123');
 
-      // The atomic commit runs asynchronously now — flush the microtask
-      // queue so the $transaction callback (mocked to run inline) has
-      // executed by the time we assert on card.update / sadRecord.update.
-      await new Promise((r) => setImmediate(r));
-
-      // Card status updated to PROVISIONED
       expect(prisma.card.update).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { id: 'card_01' },
           data: expect.objectContaining({ status: 'PROVISIONED' }),
         }),
       );
-
-      // SAD marked CONSUMED
       expect(prisma.sadRecord.update).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { id: 'sad_01' },
+          data: { status: 'CONSUMED' },
+        }),
+      );
+      // paramRecordId is null on this fixture (legacy / non-prototype
+      // card) so the extra ParamRecord update must NOT fire.
+      expect(prisma.paramRecord.update).not.toHaveBeenCalled();
+    });
+
+    it('also flips ParamRecord=CONSUMED when the card rode the prototype path', async () => {
+      (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSession('CONFIRMING'),
+      );
+      (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...makeSession('COMPLETE'),
+        cardId: 'card_01',
+        sadRecordId: 'sad_01',
+        card: { cardRef: 'ref_01', chipSerial: 'CS001', paramRecordId: 'param_01' },
+        sadRecord: { proxyCardId: 'pxy_abc123' },
+      });
+      (prisma.card.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      (prisma.sadRecord.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      (prisma.paramRecord.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
+
+      const msg: WSMessage = { type: 'response', hex: '', sw: '9000' };
+      await mgr.handleMessage('session_01', msg);
+
+      expect(prisma.paramRecord.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'param_01' },
           data: { status: 'CONSUMED' },
         }),
       );

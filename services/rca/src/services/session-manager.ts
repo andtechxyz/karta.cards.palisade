@@ -942,6 +942,12 @@ export class SessionManager {
         return this.handleSadResponse(sessionId);
       case 'AWAITING_FINAL':
         return this.handleFinalStatus(sessionId, normalizedMsg);
+      case 'CONFIRMING':
+        // Chip's CONFIRM 9000 just landed — commit the session + flip
+        // Card.status=PROVISIONED + emit `complete` to the mobile.
+        // SW != 9000 already rejected upstream (line ~910), so
+        // arriving here means the applet latched to STATE_COMMITTED.
+        return this.handleConfirmResponse(sessionId);
       default:
         return [];
     }
@@ -1278,26 +1284,25 @@ export class SessionManager {
       fidoCredData = credId.toString('base64url');
     }
 
-    // Latency optimization — the DB commit ($transaction) is not on the
-    // chip's critical path: CONFIRM (step 4) is what latches the chip
-    // state.  Previously we ran the $transaction BEFORE returning the
-    // CONFIRM APDU, charging 30-50ms of Postgres RTT against the tap
-    // window.  Now we:
-    //   1. Pre-fetch the card/sadRecord fields the response message
-    //      needs (cardRef, proxyCardId, chipSerial).
-    //   2. Return CONFIRM + complete so the phone can finalize the
-    //      chip immediately.
-    //   3. Run the atomic commit asynchronously; on failure, log
-    //      loudly and let the retention sweeper / admin surface the
-    //      inconsistency.
+    // Two-phase finalize — split the previous single-$transaction into
+    // (a) AWAITING_FINAL → CONFIRMING (captures provenance + FIDO data)
+    // (b) CONFIRMING → COMPLETE (flips Card.status=PROVISIONED +
+    //     SadRecord.status=CONSUMED, fires callback, emits `complete`
+    //     to the mobile client)
     //
-    // Crash semantics are unchanged from before this rewrite: if the
-    // server dies between sending CONFIRM and committing, the chip is
-    // physically PROVISIONED but the DB still reads ACTIVATED — the
-    // same failure mode the pre-rewrite code had between committing
-    // and sending CONFIRM (just flipped on which side of the WS
-    // response boundary the crash lands).  In both cases recovery is
-    // an admin-driven reprovision_card.
+    // Phase (b) only runs from handleConfirmResponse AFTER the chip's
+    // CONFIRM 9000 lands — previously we kicked an async $transaction
+    // + emitted `complete` in the same message as the CONFIRM APDU,
+    // which raced the mobile client's UI flip against the CONFIRM
+    // actually reaching the card.  The failure mode: user lifts card
+    // as soon as the UI says "provisioned" → CONFIRM APDU dies with
+    // "Tag not connected" → applet stuck in STATE_AWAITING_CONFIRM →
+    // server row already says PROVISIONED.
+    //
+    // Split-phase cost: ~one extra WS round-trip on the success path
+    // (mobile already does the SEND-CONFIRM / RECV-9000 dance, we just
+    // hold `complete` until the 9000 arrives).  No extra chip or DB
+    // work.  Correct ordering is worth the ~20 ms.
     const preFetched = await prisma.provisioningSession.findUnique({
       where: { id: sessionId },
       include: { card: true, sadRecord: true },
@@ -1310,24 +1315,44 @@ export class SessionManager {
       return [{ type: 'error', code: 'session_missing', message: 'Session vanished between FINAL_STATUS and commit' }];
     }
 
-    // Kick off the atomic commit in the background.  Patent C5 / PCI
-    // 10.5 semantics preserved — the $transaction still groups the
-    // three writes so an individual write failure rolls the others
-    // back; only the *completion* is no longer on the WS wait path.
-    //
-    // The promise intentionally isn't awaited.  A parent catch is
-    // attached so we don't produce an unhandled rejection on DB
-    // outage; the callback fires from inside the same then-chain so
-    // it sees the committed state on success.
-    const commitPromise = prisma.$transaction(async (tx) => {
+    // Phase (a): capture what we got from FINAL_STATUS + advance the
+    // state machine to CONFIRMING.  No Card / SadRecord writes yet —
+    // those are phase (b), conditional on the chip's CONFIRM ack.
+    // Synchronous so a DB outage surfaces as an immediate error to
+    // the mobile (rather than a silent race that leaves the session
+    // in an inconsistent phase).
+    await prisma.provisioningSession.update({
+      where: { id: sessionId },
+      data: {
+        phase: 'CONFIRMING',
+        provenance: provHash,
+        fidoCredData,
+      },
+    });
+
+    return [
+      { type: 'apdu', hex: APDUBuilder.confirm(), phase: 'confirming', progress: 0.95 },
+      // NOTE: no `{type:'complete'}` here.  It fires from
+      // handleConfirmResponse once the chip acks 9000.  Mobile UI
+      // should stay in a "finalizing" state between these two
+      // messages (~20-30 ms typical).
+    ];
+  }
+
+  /**
+   * CONFIRMING phase handler — runs when the chip's 9000 response to
+   * the CONFIRM APDU lands.  SW != 9000 is caught by handleCardResponse
+   * before this runs, so by the time we're here the chip is latched
+   * to STATE_COMMITTED.  Commits the Card.status=PROVISIONED flip +
+   * SadRecord/ParamRecord CONSUMED + session.COMPLETE in a single
+   * atomic transaction, fires the activation callback, then emits
+   * `complete` to the mobile client.
+   */
+  private async handleConfirmResponse(sessionId: string): Promise<WSMessage[]> {
+    const committed = await prisma.$transaction(async (tx) => {
       const s = await tx.provisioningSession.update({
         where: { id: sessionId },
-        data: {
-          phase: 'COMPLETE',
-          completedAt: new Date(),
-          provenance: provHash,
-          fidoCredData,
-        },
+        data: { phase: 'COMPLETE', completedAt: new Date() },
         include: { card: true, sadRecord: true },
       });
       await tx.card.update({
@@ -1338,30 +1363,34 @@ export class SessionManager {
         where: { id: s.sadRecordId },
         data: { status: 'CONSUMED' },
       });
+      // Mirror the SadRecord CONSUMED transition onto ParamRecord
+      // when the card rode the prototype path.  Belt-and-suspenders:
+      // the retention reaper would sweep READY-and-expired ParamRecords
+      // eventually, but an explicit CONSUMED matches the state-
+      // machine semantics callers expect.
+      if (s.card.paramRecordId) {
+        await tx.paramRecord.update({
+          where: { id: s.card.paramRecordId },
+          data: { status: 'CONSUMED' },
+        });
+      }
       return s;
     });
-    commitPromise
-      .then((s) => {
-        console.log(
-          `[rca] provisioning complete: session=${redactSid(sessionId)}, card=${redactSid(s.cardId)}`,
-        );
-        metrics().counter('rca.provisioning.complete', 1, { mode: 'classical' });
-        // Fire callback to activation service — best-effort, callback
-        // retries live on activation's idempotency path.
-        this.fireCallback(s.card.cardRef, s.card.chipSerial ?? '').catch((err) =>
-          console.error('[rca] callback failed:', err),
-        );
-      })
-      .catch((err) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(
-          `[rca] COMMIT FAILED session=${redactSid(sessionId)}: ${msg} — chip is provisioned but DB state is not; operator must reconcile via admin UI`,
-        );
-      });
+
+    console.log(
+      `[rca] provisioning complete: session=${redactSid(sessionId)}, card=${redactSid(committed.cardId)}`,
+    );
+    metrics().counter('rca.provisioning.complete', 1, { mode: 'classical' });
+
+    // Fire callback to activation — best-effort, idempotent on the
+    // activation side so a retry from here (or the retention reaper)
+    // is safe.
+    this.fireCallback(committed.card.cardRef, committed.card.chipSerial ?? '').catch((err) =>
+      console.error('[rca] callback failed:', err),
+    );
 
     return [
-      { type: 'apdu', hex: APDUBuilder.confirm(), phase: 'confirming', progress: 0.95 },
-      { type: 'complete', proxyCardId: preFetched.sadRecord.proxyCardId },
+      { type: 'complete', proxyCardId: committed.sadRecord.proxyCardId },
     ];
   }
 
