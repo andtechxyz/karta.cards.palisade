@@ -464,7 +464,12 @@ export class DataPrepService {
     sadBytes: Buffer,
     kmsKeyArn: string,
   ): Promise<{ encrypted: Buffer; keyVersion: number }> {
-    if (kmsKeyArn) {
+    // Treat literal "none" and whitespace-only the same as empty — operators
+    // often populate Secrets Manager with "none" as the dev sentinel (AWS
+    // Secrets Manager rejects zero-length strings).  Anything that would
+    // reach AWS KMS as the KeyId 'none' fails with "Invalid keyId 'none'".
+    const normalised = kmsKeyArn.trim().toLowerCase();
+    if (kmsKeyArn && normalised !== 'none' && normalised !== 'dev') {
       // Production: KMS encrypt via shared singleton (keeps TLS keep-alive).
       const resp = await kmsClient().send(
         new EncryptCommand({ KeyId: kmsKeyArn, Plaintext: sadBytes }),
@@ -506,13 +511,19 @@ export class DataPrepService {
     // latency (KMS Decrypt round-trip = 150-400 ms cold), so operators
     // need a p95 dashboard to spot drift.  Tag on `mode` so dev AES-ECB
     // and prod KMS paths are visible separately.
+    // Match the "none" / "dev" sentinel handling from encryptSad so a
+    // rca task booting against `KMS_SAD_KEY_ARN=none` doesn't drop into
+    // the KMS branch and send 'none' as the KeyId.
+    const arnNormalised = kmsKeyArn.trim().toLowerCase();
+    const hasKmsArn =
+      !!kmsKeyArn && arnNormalised !== 'none' && arnNormalised !== 'dev';
     const mode =
       sadKeyVersion === SAD_KEY_VERSION_DEV_AES_ECB ? 'dev'
-      : sadKeyVersion === 0 && kmsKeyArn ? 'kms'
+      : sadKeyVersion === 0 && hasKmsArn ? 'kms'
       : 'unknown';
     const startedAt = Date.now();
     try {
-      if (sadKeyVersion === 0 && kmsKeyArn) {
+      if (sadKeyVersion === 0 && hasKmsArn) {
         // Production: KMS decrypt — CiphertextBlob is self-describing.
         // Use the module-level KMSClient singleton; constructing a fresh
         // client on every call adds ~10-20 ms of TLS + DNS warm-up on the
@@ -537,7 +548,7 @@ export class DataPrepService {
       }
 
       throw new Error(
-        `decryptSad: unsupported sadKeyVersion=${sadKeyVersion} (kmsKeyArn=${kmsKeyArn ? 'set' : 'empty'})`,
+        `decryptSad: unsupported sadKeyVersion=${sadKeyVersion} (kmsKeyArn=${hasKmsArn ? 'set' : 'empty'})`,
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message.toLowerCase() : '';
