@@ -1,7 +1,20 @@
-import { defineEnv, baseEnvShape, authKeysJson } from '@palisade/core';
+import {
+  defineEnv,
+  baseEnvShape,
+  authKeysJson,
+  assertProdRequiredEnv,
+} from '@palisade/core';
 import { z } from 'zod';
 
-const { get: getRcaConfig, reset: _resetRcaConfig } = defineEnv({
+// Dev fallback constants kept at module scope so zod's `.default(...)` and
+// the prod-required assertion below always agree on what "the dev value" is.
+// If someone changes either side in isolation the prod check silently stops
+// firing, so the single source of truth lives here.
+const DATA_PREP_DEV_URL = 'http://localhost:3006';
+const ACTIVATION_CALLBACK_DEV_URL = 'http://localhost:3002';
+const CALLBACK_HMAC_DEV_SECRET = '0'.repeat(64);
+
+const { get: _getRcaConfigRaw, reset: _resetRcaConfigRaw } = defineEnv({
   ...baseEnvShape,
 
   PORT: z.coerce.number().default(3007),
@@ -9,14 +22,21 @@ const { get: getRcaConfig, reset: _resetRcaConfig } = defineEnv({
   // HMAC auth — who can call us
   PROVISION_AUTH_KEYS: authKeysJson,
 
-  // Data-prep service URL (internal ALB)
-  DATA_PREP_SERVICE_URL: z.string().url().default('http://localhost:3006'),
+  // Data-prep service URL (internal ALB).  Localhost default is for
+  // `pnpm dev`; production MUST override via task def with the internal
+  // ALB DNS (e.g. http://data-prep.palisade.internal:3006).  Enforced
+  // by assertProdRequiredEnv below.
+  DATA_PREP_SERVICE_URL: z.string().url().default(DATA_PREP_DEV_URL),
 
-  // Callback URL for notifying activation service on completion
-  ACTIVATION_CALLBACK_URL: z.string().url().default('http://localhost:3002'),
+  // Callback URL for notifying activation service on completion.  Same
+  // prod-override rules as DATA_PREP_SERVICE_URL.
+  ACTIVATION_CALLBACK_URL: z.string().url().default(ACTIVATION_CALLBACK_DEV_URL),
 
-  // HMAC secret for signing callbacks
-  CALLBACK_HMAC_SECRET: z.string().min(1).default('0'.repeat(64)),
+  // HMAC secret for signing callbacks.  Default is 64 zero chars — a
+  // key an attacker could generate offline, so callback integrity is
+  // effectively off in dev.  Prod MUST provide a real 32-byte hex
+  // secret from Secrets Manager (palisade/CALLBACK_HMAC_SECRET).
+  CALLBACK_HMAC_SECRET: z.string().min(1).default(CALLBACK_HMAC_DEV_SECRET),
 
   // WebSocket reconnect timeout
   WS_TIMEOUT_SECONDS: z.coerce.number().default(30),
@@ -90,4 +110,86 @@ const { get: getRcaConfig, reset: _resetRcaConfig } = defineEnv({
   WS_TOKEN_SECRET: z.string().regex(/^[0-9a-fA-F]{64}$/, 'WS_TOKEN_SECRET must be 64 hex chars (32 bytes)'),
 });
 
-export { getRcaConfig, _resetRcaConfig };
+// Single-flight guard — assertProdRequiredEnv emits one warning line per
+// fallback-active field in dev.  Firing it every time getRcaConfig() is
+// called would bury those warnings under thousands of lines of spam
+// (getRcaConfig is called per-request in some paths).  We run the check
+// exactly once per process and cache the resolved config.
+let _prodEnvChecked = false;
+
+/**
+ * Resolve the rca config and — on first call — run the production
+ * required-env check.  In prod, missing/unsafe values throw here with a
+ * single message listing every offending field at once.  In dev/test,
+ * a single warning per fallback-active field is printed to stderr.
+ */
+export function getRcaConfig() {
+  const cfg = _getRcaConfigRaw();
+  if (!_prodEnvChecked) {
+    assertProdRequiredEnv(cfg.NODE_ENV, [
+      {
+        name: 'KMS_SAD_KEY_ARN',
+        value: cfg.KMS_SAD_KEY_ARN,
+        devFallback: '',
+        // 'none'/'dev' are sentinel values that mean "no KMS key, use
+        // the AES-128-ECB stub" (Secrets Manager rejects zero-length
+        // strings so the operator has to store SOMETHING — see
+        // commit cde5f8d).  Prod must have a real ARN, not a sentinel.
+        fallbackSentinels: ['none', 'dev'],
+        description:
+          'AWS Payment Cryptography key ARN for SAD blob decryption. ' +
+          'Without it rca can only read AES-128-ECB dev ciphertexts — ' +
+          'prod SadRecords encrypted under KMS will fail to decrypt.',
+      },
+      {
+        name: 'RCA_PUBLIC_WS_BASE',
+        value: cfg.RCA_PUBLIC_WS_BASE,
+        // Declared `.optional()` — no zod default — so undefined IS the fallback.
+        devFallback: undefined,
+        description:
+          'Publicly-reachable WebSocket origin handed back to the mobile ' +
+          'app in /api/provision/start.  Falling back to the inbound ' +
+          'request host breaks behind ALB/CloudFront (phone gets the ' +
+          'internal DNS name).  Must be https://palisade.karta.cards in prod.',
+      },
+      {
+        name: 'CALLBACK_HMAC_SECRET',
+        value: cfg.CALLBACK_HMAC_SECRET,
+        devFallback: CALLBACK_HMAC_DEV_SECRET,
+        description:
+          'HMAC-SHA256 key for signing provisioning-complete callbacks ' +
+          'to the activation service.  Default is 64 zero chars — any ' +
+          'attacker who can reach the activation endpoint can forge ' +
+          'completions.  Pull from Secrets Manager (palisade/CALLBACK_HMAC_SECRET).',
+      },
+      {
+        name: 'DATA_PREP_SERVICE_URL',
+        value: cfg.DATA_PREP_SERVICE_URL,
+        devFallback: DATA_PREP_DEV_URL,
+        description:
+          'Internal ALB DNS for the data-prep service.  Leaving it at ' +
+          'localhost in a Fargate task means rca tries to reach data-prep ' +
+          'on its own loopback — no such service listens there.',
+        rejectLocalhostInProd: true,
+      },
+      {
+        name: 'ACTIVATION_CALLBACK_URL',
+        value: cfg.ACTIVATION_CALLBACK_URL,
+        devFallback: ACTIVATION_CALLBACK_DEV_URL,
+        description:
+          'Internal ALB DNS for the activation service, used when rca ' +
+          'notifies activation that a card just finished provisioning. ' +
+          'Localhost default would silently drop the completion callback.',
+        rejectLocalhostInProd: true,
+      },
+    ]);
+    _prodEnvChecked = true;
+  }
+  return cfg;
+}
+
+/** Reset the cached config — test hook, clears the prod-check single-flight too. */
+export function _resetRcaConfig(): void {
+  _resetRcaConfigRaw();
+  _prodEnvChecked = false;
+}

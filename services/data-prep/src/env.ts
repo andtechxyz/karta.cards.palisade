@@ -1,10 +1,15 @@
-import { defineEnv, baseEnvShape, authKeysJson } from '@palisade/core';
+import {
+  defineEnv,
+  baseEnvShape,
+  authKeysJson,
+  assertProdRequiredEnv,
+} from '@palisade/core';
 import { z } from 'zod';
 
 import type { UdkBackend } from './services/udk-deriver.js';
 export type { UdkBackend };
 
-const { get: getDataPrepConfig, reset: _resetDataPrepConfig } = defineEnv({
+const { get: _getDataPrepConfigRaw, reset: _resetDataPrepConfigRaw } = defineEnv({
   ...baseEnvShape,
 
   PORT: z.coerce.number().default(3006),
@@ -15,7 +20,12 @@ const { get: getDataPrepConfig, reset: _resetDataPrepConfig } = defineEnv({
   // AWS region for Payment Cryptography and KMS
   AWS_REGION: z.string().default('ap-southeast-2'),
 
-  // KMS key for encrypting SAD blobs at rest
+  // KMS key for encrypting SAD blobs at rest.  Empty default keeps
+  // `pnpm dev` working against the AES-128-ECB stub (sadKeyVersion=1).
+  // Enforced prod-required by assertProdRequiredEnv below — missing
+  // this var in a Fargate task means every SadRecord lands encrypted
+  // under the stub key, which the same code path on rca will happily
+  // decrypt with no auth, undermining the entire at-rest PCI 3.5 story.
   KMS_SAD_KEY_ARN: z.string().default(''),
 
   // SAD record TTL in days
@@ -76,4 +86,42 @@ export function resolveUdkBackend(cfg: ReturnType<typeof getDataPrepConfig>): Ud
   return backend;
 }
 
-export { getDataPrepConfig, _resetDataPrepConfig };
+// Single-flight guard — see services/rca/src/env.ts for rationale.
+let _prodEnvChecked = false;
+
+/**
+ * Resolve the data-prep config and — on first call — enforce that
+ * production deployments have explicit values for the prod-required
+ * env vars (currently: KMS_SAD_KEY_ARN).  Dev/test prints one warning
+ * per fallback-active field and keeps going.
+ */
+export function getDataPrepConfig() {
+  const cfg = _getDataPrepConfigRaw();
+  if (!_prodEnvChecked) {
+    assertProdRequiredEnv(cfg.NODE_ENV, [
+      {
+        name: 'KMS_SAD_KEY_ARN',
+        value: cfg.KMS_SAD_KEY_ARN,
+        devFallback: '',
+        // 'none'/'dev' sentinels — see commit cde5f8d.  Secrets
+        // Manager won't store empty strings, so operators paper over
+        // "no KMS" with these magic words.  Fine in dev, critical to
+        // catch in prod.
+        fallbackSentinels: ['none', 'dev'],
+        description:
+          'AWS KMS key ARN used to wrap SAD blobs at rest. Without it ' +
+          'SadRecord.sadEncrypted is written under the AES-128-ECB dev ' +
+          'stub (sadKeyVersion=1) — no audit trail via CloudTrail, ' +
+          'and the wrapping key sits in app config instead of KMS.',
+      },
+    ]);
+    _prodEnvChecked = true;
+  }
+  return cfg;
+}
+
+/** Reset the cached config — test hook, clears the prod-check single-flight too. */
+export function _resetDataPrepConfig(): void {
+  _resetDataPrepConfigRaw();
+  _prodEnvChecked = false;
+}

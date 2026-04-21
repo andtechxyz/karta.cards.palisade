@@ -364,14 +364,37 @@ ensure_secret "palisade/CARD_OPS_AUTH_KEYS"        "CHANGEME"
 # entry keyed 'activation' — rotate together.
 ensure_secret "palisade/SERVICE_AUTH_CARD_OPS_SECRET" "CHANGEME"
 
+# HMAC-SHA256 key for the short-lived WebSocket upgrade token rca hands
+# to mobile clients (PCI 8.3.6 / patent C3).  Must be 32 bytes = 64 hex
+# chars — the zod schema enforces the shape, env.ts rejects anything
+# shorter or non-hex.  Generate with `openssl rand -hex 32` and rotate
+# by updating this secret + restarting palisade-rca.
+ensure_secret "palisade/WS_TOKEN_SECRET"           "CHANGEME"
+
+# HMAC-SHA256 key rca uses to sign provisioning-complete callbacks to
+# activation.  activation verifies with the same key — rotate both
+# atomically.  Format: 64 hex chars.
+ensure_secret "palisade/CALLBACK_HMAC_SECRET"      "CHANGEME"
+
 # -------- Activation service URLs --------
 ensure_secret "palisade/ACTIVATION_SERVICE_URL"    "http://internal-vera-internal-886106335.ap-southeast-2.elb.amazonaws.com:3002"
+# Alias under the rca-facing name.  Same URL, different secret name — kept
+# as a distinct secret so the rca task def can be wired through Secrets
+# Manager today (task def uses an inline env var, but this makes the
+# transition to Secrets-sourced URLs a one-line change later).
+ensure_secret "palisade/ACTIVATION_CALLBACK_URL"   "http://internal-vera-internal-886106335.ap-southeast-2.elb.amazonaws.com:3002"
 ensure_secret "palisade/DATA_PREP_SERVICE_URL"     "http://internal-vera-internal-886106335.ap-southeast-2.elb.amazonaws.com:3006"
 ensure_secret "palisade/RCA_SERVICE_URL"           "http://internal-vera-internal-886106335.ap-southeast-2.elb.amazonaws.com:3007"
 ensure_secret "palisade/CARD_OPS_URL"              "http://internal-vera-internal-886106335.ap-southeast-2.elb.amazonaws.com:3010"
 # Public WS base that the admin SPA connects its APDU-relay WebSocket to.
 # Must resolve to the palisade-card-ops target group via the public ALB.
 ensure_secret "palisade/CARD_OPS_PUBLIC_WS_BASE"   "wss://card-ops.karta.cards"
+# Public WS base the mobile app connects to for provisioning (pa-v3
+# applet APDU relay).  Must resolve to palisade-rca via mobile.karta.cards
+# → CloudFront → public ALB.  Stored as a secret for parity with
+# CARD_OPS_PUBLIC_WS_BASE even though the rca task def currently bakes
+# it inline — makes future rotation a Secrets Manager change only.
+ensure_secret "palisade/RCA_PUBLIC_WS_BASE"        "wss://mobile.karta.cards"
 
 # Vera vault endpoint — activation uses this on card registration.
 ensure_secret "palisade/VERA_VAULT_URL"            "http://internal-vera-internal-886106335.ap-southeast-2.elb.amazonaws.com:3004"
@@ -487,6 +510,9 @@ ARN_DATA_PREP_SERVICE_URL=$(get_secret_arn "palisade/DATA_PREP_SERVICE_URL")
 ARN_RCA_SERVICE_URL=$(get_secret_arn "palisade/RCA_SERVICE_URL")
 ARN_CARD_OPS_URL=$(get_secret_arn "palisade/CARD_OPS_URL")
 ARN_CARD_OPS_PUBLIC_WS_BASE=$(get_secret_arn "palisade/CARD_OPS_PUBLIC_WS_BASE")
+ARN_RCA_PUBLIC_WS_BASE=$(get_secret_arn "palisade/RCA_PUBLIC_WS_BASE")
+ARN_ACTIVATION_CALLBACK_URL=$(get_secret_arn "palisade/ACTIVATION_CALLBACK_URL")
+ARN_WS_TOKEN_SECRET=$(get_secret_arn "palisade/WS_TOKEN_SECRET")
 ARN_SFTP_USERS=$(get_secret_arn "palisade/SFTP_USERS")
 ARN_SFTP_POLL_INTERVAL_MS=$(get_secret_arn "palisade/SFTP_POLL_INTERVAL_MS")
 ARN_SFTP_STABILITY_MS=$(get_secret_arn "palisade/SFTP_STABILITY_MS")
@@ -731,6 +757,24 @@ TASKJSON
 REGISTERED_TASK_DEFS+=("palisade-data-prep")
 
 # --- rca (port 3007, public, WebSocket + HMAC-gated) ---
+#
+# Non-obvious env wiring:
+#
+#   RCA_PUBLIC_WS_BASE — publicly-reachable WS origin handed to the mobile
+#     app in /api/provision/start.  Must match the CloudFront → ALB route
+#     on mobile.karta.cards; otherwise the phone gets the internal ALB DNS
+#     and the WS upgrade fails.  services/rca/src/env.ts's
+#     assertProdRequiredEnv gate blocks startup if this is missing in prod.
+#
+#   RCA_ENABLE_PARAM_BUNDLE — prototype flag.  '1' routes cards whose
+#     Card.paramRecordId != null through the pa-v3 TRANSFER_PARAMS path.
+#     Legacy cards (paramRecordId = null) keep using TRANSFER_SAD either
+#     way.  Flip to '0' to disable the prototype fleet-wide without
+#     redeploying the applet.
+#
+#   WS_TOKEN_SECRET — 32-byte hex HMAC key for the WS upgrade token
+#     (PCI 8.3.6).  Required by env.ts's zod schema; missing it fails
+#     startup with a clear error even without the prod gate.
 echo ""
 echo "--- Registering task definition: palisade-rca ---"
 aws ecs register-task-definition --region "$REGION" --cli-input-json "$(cat <<TASKJSON
@@ -751,13 +795,16 @@ aws ecs register-task-definition --region "$REGION" --cli-input-json "$(cat <<TA
       ],
       "environment": [
         { "name": "DATA_PREP_SERVICE_URL",   "value": "http://${INTERNAL_ALB_DNS}:3006" },
-        { "name": "ACTIVATION_CALLBACK_URL", "value": "http://${INTERNAL_ALB_DNS}:3002" }
+        { "name": "ACTIVATION_CALLBACK_URL", "value": "http://${INTERNAL_ALB_DNS}:3002" },
+        { "name": "RCA_PUBLIC_WS_BASE",      "value": "wss://mobile.karta.cards" },
+        { "name": "RCA_ENABLE_PARAM_BUNDLE", "value": "1" }
       ],
       "secrets": [
         { "name": "DATABASE_URL",         "valueFrom": "${ARN_DATABASE_URL}" },
         { "name": "PROVISION_AUTH_KEYS",  "valueFrom": "${ARN_PROVISION_AUTH_KEYS}" },
         { "name": "CALLBACK_HMAC_SECRET", "valueFrom": "${ARN_CALLBACK_HMAC_SECRET}" },
-        { "name": "KMS_SAD_KEY_ARN",      "valueFrom": "${ARN_KMS_SAD_KEY_ARN}" }
+        { "name": "KMS_SAD_KEY_ARN",      "valueFrom": "${ARN_KMS_SAD_KEY_ARN}" },
+        { "name": "WS_TOKEN_SECRET",      "valueFrom": "${ARN_WS_TOKEN_SECRET}" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
