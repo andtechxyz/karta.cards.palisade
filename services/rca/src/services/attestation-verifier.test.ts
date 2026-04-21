@@ -147,13 +147,48 @@ describe('AttestationVerifier.extract', () => {
     expect(out.cardCert.length).toBe(0);
   });
 
-  it('gives back a cardCert of raw bytes when attestSig DER is malformed', () => {
-    // pubkey + non-DER trailer — attestSig parse fails, trailer lands as cardCert
+  it('post-C4 shape: pubkey + 16B chipNonce + no attestSig produces empty attestSig', () => {
+    // Under the new wire format the parser skips 16 bytes of chipNonce
+    // (byte 65..81) before looking for DER.  A 81-byte response is the
+    // minimal no-attestation shape — iccPubkey carved out, no trailer.
     const pub = Buffer.alloc(SEC1_UNCOMPRESSED_LEN, 0x04);
-    const trailer = Buffer.from('DEADBEEF', 'hex');
-    const out = AttestationVerifier.extract(Buffer.concat([pub, trailer]));
+    const nonce = Buffer.alloc(16, 0xFA);
+    const out = AttestationVerifier.extract(Buffer.concat([pub, nonce]));
+    expect(out.iccPubkey.length).toBe(SEC1_UNCOMPRESSED_LEN);
     expect(out.attestSig.length).toBe(0);
+    expect(out.cardCert.length).toBe(0);
+  });
+
+  it('post-C4 shape: pubkey + 16B chipNonce + malformed trailer gives empty attestSig', () => {
+    // 81 B minimum + non-DER trailer — parser finds no 0x30 at offset 81
+    // so attestSig stays empty; cardCert also stays empty under the new
+    // wire format (cardCert comes from GET_ATTESTATION_CHAIN, not here).
+    const pub = Buffer.alloc(SEC1_UNCOMPRESSED_LEN, 0x04);
+    const nonce = Buffer.alloc(16, 0xFA);
+    const trailer = Buffer.from('DEADBEEF', 'hex');
+    const out = AttestationVerifier.extract(Buffer.concat([pub, nonce, trailer]));
+    expect(out.attestSig.length).toBe(0);
+    // The 4 trailing bytes are captured as cardCert for debug only —
+    // strict verify() will reject on the empty attestSig before it
+    // looks at cardCert, and under the GET_ATTESTATION_CHAIN flow the
+    // caller passes cardCertOverride explicitly anyway.
     expect(out.cardCert.equals(trailer)).toBe(true);
+  });
+
+  it('legacy pre-C4 shape: DER SEQUENCE at offset 65 is parsed as attestSig', () => {
+    // Pre-C4 applets put attestSig immediately after iccPubkey with
+    // no nonce.  The parser detects this by peeking byte 65 for 0x30
+    // and picks the legacy layout.
+    const pub = Buffer.alloc(SEC1_UNCOMPRESSED_LEN, 0x04);
+    // Valid DER ECDSA-P256 sig: SEQ(0x45) { INT(0x21, 0x00||32×0x11), INT(0x20, 0x00||31×0x22) }
+    const sig = Buffer.from(
+      '3045022100' + '11'.repeat(32) + '022000' + '22'.repeat(31),
+      'hex',
+    );
+    const out = AttestationVerifier.extract(Buffer.concat([pub, sig]));
+    expect(out.iccPubkey.length).toBe(SEC1_UNCOMPRESSED_LEN);
+    expect(out.attestSig.length).toBe(sig.length);
+    expect(out.attestSig.equals(sig)).toBe(true);
   });
 });
 

@@ -200,16 +200,32 @@ export const assertAttestationPinsForMode = assertAttestationConfigForMode;
 // Extract
 // -----------------------------------------------------------------------------
 
+/** Chip nonce width emitted by pa-v3 for patent C4 (see applet
+ *  Constants.CHIP_NONCE_LEN).  Kept in sync via shared env-ecdh
+ *  export; re-declared here for the wire-format parser to avoid an
+ *  import cycle. */
+export const CHIP_NONCE_LEN = 16 as const;
+
 export class AttestationVerifier {
   /**
-   * Split a raw GENERATE_KEYS response into its three components.
+   * Split a raw GENERATE_KEYS response into its components.
    *
-   * Layout: iccPubkey(65) || attestSig(DER) || cardCert(var)
+   * Current (post-C4 + post-C16/C23) wire layout:
+   *   iccPubkey(65)   always
+   *   chipNonce(16)   post-C4 applets; empty for legacy (pre-C4) applets
+   *   attestSig(DER)  post-C16/C23 when attestation material is loaded
+   *                   on the chip; empty otherwise
    *
-   * Parsing strategy: iccPubkey is fixed-width; attestSig starts with DER
-   * SEQUENCE (0x30 LL) so its length is self-describing; cardCert is the
-   * remainder.  Tolerates short buffers (returns empty fields) so a
-   * mid-tap NFC dropout still yields something we can log / debug with.
+   * Parsing strategy: iccPubkey is fixed-width at offset 0; peek byte
+   * 81 for the DER SEQUENCE tag (0x30) to detect whether an attestation
+   * trailer is present.  The cardCert is fetched via a SEPARATE
+   * GET_ATTESTATION_CHAIN APDU (INS=0xEE) and passed to verify() by
+   * the session-manager — it is NOT in the keygen response.  The
+   * AttestationExtractResult.cardCert field is retained for
+   * back-compat but stays empty under the new wire format.
+   *
+   * Tolerates short buffers (returns empty fields) so a mid-tap NFC
+   * dropout still yields something we can log / debug with.
    */
   static extract(keygenResponse: Buffer): AttestationExtractResult {
     const empty = Buffer.alloc(0);
@@ -232,6 +248,22 @@ export class AttestationVerifier {
 
     if (keygenResponse.length <= SEC1_UNCOMPRESSED_LEN) return result;
 
+    // Where the attestSig might start.  Post-C4 applets inject a
+    // 16-byte chipNonce between iccPubkey and the optional attestSig.
+    // Detect which wire shape we're looking at by peeking offset 65:
+    // DER SEQUENCE starts with 0x30, a random chip nonce byte almost
+    // certainly doesn't (1/256 collision rate we accept as negligible
+    // given the downstream HMAC-tag verify would then catch the
+    // mismatch).  If offset 65 is 0x30, we have a legacy pre-C4 layout
+    // (attestSig right after pubkey, no nonce).  Otherwise the nonce
+    // is there and attestSig is at 81 (if present at all).
+    const attestSigOff =
+      keygenResponse[SEC1_UNCOMPRESSED_LEN] === 0x30
+        ? SEC1_UNCOMPRESSED_LEN
+        : SEC1_UNCOMPRESSED_LEN + CHIP_NONCE_LEN;
+
+    if (keygenResponse.length <= attestSigOff) return result;
+
     // Read DER SEQUENCE length for attestSig.  Short-form (< 128) length
     // is one byte; long-form (0x81 LL) is two; longer forms (0x82+) don't
     // happen for ECDSA-P256 sigs so we reject anything else as a malformed
@@ -239,17 +271,17 @@ export class AttestationVerifier {
     // offline analysis.
     let attestSigLen = 0;
     let attestSigBodyOff = 0;
-    const tag = keygenResponse[SEC1_UNCOMPRESSED_LEN];
-    const lenByte = keygenResponse[SEC1_UNCOMPRESSED_LEN + 1];
+    const tag = keygenResponse[attestSigOff];
+    const lenByte = keygenResponse[attestSigOff + 1];
     if (tag === 0x30 && lenByte !== undefined) {
       if ((lenByte & 0x80) === 0) {
         attestSigLen = 2 + lenByte; // hdr(2) + body
-        attestSigBodyOff = SEC1_UNCOMPRESSED_LEN;
+        attestSigBodyOff = attestSigOff;
       } else if (lenByte === 0x81) {
-        const real = keygenResponse[SEC1_UNCOMPRESSED_LEN + 2];
+        const real = keygenResponse[attestSigOff + 2];
         if (real !== undefined) {
           attestSigLen = 3 + real;
-          attestSigBodyOff = SEC1_UNCOMPRESSED_LEN;
+          attestSigBodyOff = attestSigOff;
         }
       }
     }
@@ -259,10 +291,11 @@ export class AttestationVerifier {
       attestSigLen > MAX_DER_SIG_LEN ||
       attestSigBodyOff + attestSigLen > keygenResponse.length
     ) {
-      // Can't carve a plausible attestSig — give the post-pubkey bytes
-      // back as cardCert for debug.  Strict-mode verify will then
-      // reject on the empty attestSig.
-      result.cardCert = keygenResponse.subarray(SEC1_UNCOMPRESSED_LEN);
+      // Can't carve a plausible attestSig — give the post-nonce
+      // bytes back as cardCert for debug.  Strict-mode verify will
+      // then reject on the empty attestSig before it looks at the
+      // debug cardCert buffer.
+      result.cardCert = keygenResponse.subarray(attestSigOff);
       result.certChain = result.cardCert;
       return result;
     }
@@ -273,16 +306,22 @@ export class AttestationVerifier {
     );
     result.attestation = result.attestSig;
 
+    // Anything beyond attestSig is unexpected under the new wire
+    // shape (cardCert comes via GET_ATTESTATION_CHAIN, not here).
+    // Retained as `cardCert` for legacy callers only.  CPLC is
+    // harder to derive without the cardCert — strict verify() now
+    // requires the caller to pass it alongside the cardCert via
+    // AttestationVerifierConfig.cardCert (see verify()).
     const cardCertOff = attestSigBodyOff + attestSigLen;
-    result.cardCert = keygenResponse.subarray(cardCertOff);
-    result.certChain = result.cardCert;
-
-    // Pull CPLC out of the card cert body if long enough.
-    if (result.cardCert.length >= SEC1_UNCOMPRESSED_LEN + CPLC_LEN) {
-      result.cplc = result.cardCert.subarray(
-        SEC1_UNCOMPRESSED_LEN,
-        SEC1_UNCOMPRESSED_LEN + CPLC_LEN,
-      );
+    if (cardCertOff < keygenResponse.length) {
+      result.cardCert = keygenResponse.subarray(cardCertOff);
+      result.certChain = result.cardCert;
+      if (result.cardCert.length >= SEC1_UNCOMPRESSED_LEN + CPLC_LEN) {
+        result.cplc = result.cardCert.subarray(
+          SEC1_UNCOMPRESSED_LEN,
+          SEC1_UNCOMPRESSED_LEN + CPLC_LEN,
+        );
+      }
     }
 
     return result;
@@ -295,11 +334,19 @@ export class AttestationVerifier {
    *
    * `config` is only consulted in strict mode.  Callers in permissive
    * mode may pass `undefined`.
+   *
+   * `cardCertOverride` is the bytes of the separately-fetched
+   * GET_ATTESTATION_CHAIN response.  Under the new wire format the
+   * chip does not emit cardCert inline in GEN_KEYS (to keep every
+   * APDU in short-form range); rca fetches it with a follow-up APDU
+   * and passes the response body here.  When omitted, falls back to
+   * `extract.cardCert` (legacy pre-split wire format).
    */
   static verify(
     extract: AttestationExtractResult,
     mode: AttestationMode = 'permissive',
     config?: AttestationVerifierConfig,
+    cardCertOverride?: Buffer,
   ): AttestationVerifyResult {
     if (mode === 'permissive') {
       const sample = extract.attestSig.subarray(
@@ -352,7 +399,13 @@ export class AttestationVerifier {
     }
 
     // 2. Verify the card cert was signed by the Issuer CA.
-    const cardParsed = parseCardCert(extract.cardCert);
+    //    Prefer the explicit override (GET_ATTESTATION_CHAIN response)
+    //    over extract.cardCert (legacy pre-split wire format).
+    const cardCertBytes =
+      cardCertOverride && cardCertOverride.length > 0
+        ? cardCertOverride
+        : extract.cardCert;
+    const cardParsed = parseCardCert(cardCertBytes);
     if (!cardParsed.ok) {
       return {
         ok: false,
@@ -368,11 +421,15 @@ export class AttestationVerifier {
       };
     }
 
-    // 3. Card cert must bind this session's CPLC.  The cpls we carved out
-    //    of cardCert in extract() must equal cardParsed.cplc — they come
-    //    from the same bytes, so this is a tautology check that guards
-    //    against future refactors silently desyncing the two readers.
-    if (!extract.cplc.equals(cardParsed.cplc)) {
+    // 3. Card cert must bind this session's CPLC.  Under the new
+    //    (post-C16/C23) wire format there's only ONE cplc source —
+    //    cardParsed.cplc, read out of the GET_ATTESTATION_CHAIN
+    //    response buffer.  Under the legacy pre-split shape
+    //    extract.cplc was a parallel carve from the same bytes and
+    //    had to match as a parser-desync guard.  Skip the check
+    //    when extract.cplc is empty (new shape) and only enforce it
+    //    when both sources are populated (legacy shape).
+    if (extract.cplc.length > 0 && !extract.cplc.equals(cardParsed.cplc)) {
       return {
         ok: false,
         warning: 'extract.cplc does not match cardCert.cplc (internal parser desync)',
@@ -394,7 +451,10 @@ export class AttestationVerifier {
     if (!cardKey) {
       return { ok: false, warning: 'could not import card pubkey from cert', issuerId };
     }
-    const signed = Buffer.concat([extract.iccPubkey, extract.cplc]);
+    // Use cardParsed.cplc (the authoritative source from the cardCert)
+    // rather than extract.cplc (legacy parallel carve, empty under
+    // the new wire format).
+    const signed = Buffer.concat([extract.iccPubkey, cardParsed.cplc]);
     if (!verifySigOverBody(signed, extract.attestSig, cardKey)) {
       return {
         ok: false,
