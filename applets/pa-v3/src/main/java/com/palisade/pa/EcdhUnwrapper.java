@@ -56,7 +56,10 @@ import javacardx.crypto.Cipher;
  *   prkBuf:         32-byte scratch for HKDF PRK
  *   okmBuf:         64-byte scratch for HKDF OKM (aes || iv || hmac)
  *   expTagBuf:      32-byte scratch for computed HMAC-SHA256 tag
- *   hmacKey, hmacScratch: 64-byte each, inline HMAC-SHA256 pads
+ *   hmacKey:      64-byte HMAC block-sized key buffer
+ *   hmacScratch: 160-byte — must fit T(2)'s `T(1)[32] || sessionId[<=96] || counter[1]`
+ *                input under the C4 nonce extension (sessionIdLen grew
+ *                to accommodate a trailing 16-byte chip nonce)
  *
  * Total static RAM: ~280 B plus KeyAgreement/Cipher/MessageDigest
  * instances.  Well within JCOP 5 budgets.
@@ -124,7 +127,20 @@ public final class EcdhUnwrapper {
         okmBuf      = JCSystem.makeTransientByteArray((short) 64, JCSystem.CLEAR_ON_DESELECT);
         expTagBuf   = JCSystem.makeTransientByteArray((short) 32, JCSystem.CLEAR_ON_DESELECT);
         hmacKey     = JCSystem.makeTransientByteArray((short) 64, JCSystem.CLEAR_ON_DESELECT);
-        hmacScratch = JCSystem.makeTransientByteArray((short) 64, JCSystem.CLEAR_ON_DESELECT);
+        // hmacScratch MUST fit the largest HKDF-Expand input staged here:
+        //     T(2) = T(1)[32] || sessionId[<=79] || counter[1] = 112 B max
+        // where sessionIdLen caps at 63 (incoming GEN_KEYS body limit)
+        // plus 16 B for the C4 chip nonce appended at keygen time.
+        // hmacScratch was 64 B historically — sized for pa-v1's ~40-B
+        // max info input — which overflowed by up to ~50 bytes on a
+        // full-length C4 sessionId and threw an uncaught
+        // ArrayIndexOutOfBoundsException mid-HKDF-expand, emerging as
+        // SW=6F00 on the final TRANSFER_PARAMS chunk.  128 B is the
+        // smallest power of 2 above the 112-B worst case — leaves a
+        // 16-B cushion without wasting transient RAM on JCOP 5 (a
+        // 160-B allocation failed INSTALL 0x6F00 at applet constructor
+        // time on this silicon).
+        hmacScratch = JCSystem.makeTransientByteArray((short) 128, JCSystem.CLEAR_ON_DESELECT);
     }
 
     /**
@@ -314,7 +330,7 @@ public final class EcdhUnwrapper {
         Util.arrayFillNonAtomic(okmBuf,      (short) 0, (short) 64, (byte) 0);
         Util.arrayFillNonAtomic(expTagBuf,   (short) 0, (short) 32, (byte) 0);
         Util.arrayFillNonAtomic(hmacKey,     (short) 0, (short) 64, (byte) 0);
-        Util.arrayFillNonAtomic(hmacScratch, (short) 0, (short) 64, (byte) 0);
+        Util.arrayFillNonAtomic(hmacScratch, (short) 0, (short) 128, (byte) 0);
     }
 
     // ---------------------------------------------------------------

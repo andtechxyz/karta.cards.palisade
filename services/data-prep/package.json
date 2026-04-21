@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "exports": {
-    "./services/data-prep.service": "./dist/services/data-prep.service.js"
+    "./services/data-prep.service": "./dist/services/data-prep.service.js",
+    "./services/data-prep.service.js": "./dist/services/data-prep.service.js"
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",
