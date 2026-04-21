@@ -48,6 +48,9 @@ export {
   parseParamBundle,
   referenceBundleForJcDev,
   loadGoldenBundle,
+  reduceSensitiveFields,
+  spliceSensitiveFields,
+  SENSITIVE_PARAM_TAGS,
 } from './param-bundle-builder.js';
 export type { ParamBundleInput, ParamTagValue } from './param-bundle-builder.js';
 export {

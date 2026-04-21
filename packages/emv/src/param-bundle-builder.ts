@@ -347,6 +347,151 @@ export function parseParamBundle(data: Buffer): Map<number, Buffer> {
 }
 
 // ---------------------------------------------------------------------------
+// Patent C17/C22 per-field envelope encryption helpers
+// ---------------------------------------------------------------------------
+//
+// These two helpers let data-prep store the crypto-sensitive tags
+// (3 MKs + ICC RSA priv) in their own envelope-encrypted columns on
+// ParamRecord while keeping the rest of the bundle in the legacy
+// bundleEncrypted blob.  At wrap time rca splices the real plaintexts
+// back into the zeroed TLV slots before ECDH-wrapping to the chip.
+// The plaintext window per sensitive field is reduced from "whole
+// bundle in memory for ~50 ms" to "one 16-B key at a time for a few
+// ms each" — matches PROTOTYPE_PLAN.md §3 "Enhancement path".
+
+/**
+ * ParamBundle tags whose values are crypto-sensitive and must be
+ * split into per-column encrypted storage.  Every tag in this list
+ * appears AT MOST ONCE per bundle — duplicates are a schema error
+ * caught by reduceSensitiveFields.
+ */
+export const SENSITIVE_PARAM_TAGS: readonly number[] = Object.freeze([
+  ParamTag.MK_AC,
+  ParamTag.MK_SMI,
+  ParamTag.MK_SMC,
+  ParamTag.ICC_RSA_PRIV,
+]);
+
+/**
+ * Zero the value bytes of sensitive TLVs while preserving the
+ * surrounding tag + length prefixes.  Non-sensitive TLVs pass
+ * through unchanged.  The returned "reduced" bundle is bit-for-bit
+ * identical to the original except at the sensitive value positions
+ * — so {@link spliceSensitiveFields} can write plaintexts back in
+ * place without re-parsing, and so downstream parsers see the exact
+ * same shape.
+ *
+ * Returns a fresh Buffer; does not mutate `bundle`.
+ *
+ * @throws if a sensitive tag appears more than once (schema violation)
+ * @throws on malformed length prefix (unsupported 0x82+ long form)
+ */
+export function reduceSensitiveFields(
+  bundle: Buffer,
+  sensitiveTags: readonly number[] = SENSITIVE_PARAM_TAGS,
+): Buffer {
+  const sens = new Set(sensitiveTags);
+  const seen = new Set<number>();
+  const out = Buffer.from(bundle); // copy, then overwrite the sensitive value slots
+
+  let off = 0;
+  while (off < out.length) {
+    const tag = out[off];
+    off += 1;
+    const lenByte = out[off];
+    let len: number;
+    if (lenByte < 0x80) {
+      len = lenByte;
+      off += 1;
+    } else if (lenByte === 0x81) {
+      len = out[off + 1];
+      off += 2;
+    } else {
+      throw new Error(
+        `reduceSensitiveFields: unsupported length byte 0x${lenByte.toString(16)} at offset ${off - 1}`,
+      );
+    }
+    if (sens.has(tag)) {
+      if (seen.has(tag)) {
+        throw new Error(
+          `reduceSensitiveFields: duplicate sensitive tag 0x${tag.toString(16)}`,
+        );
+      }
+      seen.add(tag);
+      out.fill(0, off, off + len);
+    }
+    off += len;
+  }
+  return out;
+}
+
+/**
+ * Inverse of {@link reduceSensitiveFields}: overwrite the zeroed
+ * value slots with plaintexts.  Returns a fresh Buffer — caller is
+ * responsible for scrubbing both input and output when done.
+ *
+ * Length-mismatch detection catches two integrity failures in one
+ * check: (a) the per-field encrypted column was tampered with (and
+ * now decrypts to the wrong length), (b) the reduced bundle was
+ * tampered with (its TLV length prefix no longer matches what the
+ * original had).  Either way, splicing must refuse so rca never
+ * wraps a structurally-drifted bundle for the chip.
+ *
+ * @throws if any plaintext length disagrees with the in-bundle TLV
+ *         length prefix.
+ * @throws if a plaintext is provided for a tag not present in the
+ *         reduced bundle (caller error — e.g. per-field decrypt
+ *         returned a field the bundle doesn't expect).
+ */
+export function spliceSensitiveFields(
+  reduced: Buffer,
+  plaintexts: Map<number, Buffer>,
+): Buffer {
+  const out = Buffer.from(reduced);
+  const remaining = new Map(plaintexts);
+
+  let off = 0;
+  while (off < out.length) {
+    const tag = out[off];
+    off += 1;
+    const lenByte = out[off];
+    let len: number;
+    if (lenByte < 0x80) {
+      len = lenByte;
+      off += 1;
+    } else if (lenByte === 0x81) {
+      len = out[off + 1];
+      off += 2;
+    } else {
+      throw new Error(
+        `spliceSensitiveFields: unsupported length byte 0x${lenByte.toString(16)} at offset ${off - 1}`,
+      );
+    }
+    const plain = remaining.get(tag);
+    if (plain !== undefined) {
+      if (plain.length !== len) {
+        throw new Error(
+          `spliceSensitiveFields: tag 0x${tag.toString(16)} plaintext is ${plain.length} bytes, TLV declared ${len}`,
+        );
+      }
+      plain.copy(out, off);
+      remaining.delete(tag);
+    }
+    off += len;
+  }
+
+  if (remaining.size > 0) {
+    const missing = Array.from(remaining.keys())
+      .map((t) => `0x${t.toString(16)}`)
+      .join(',');
+    throw new Error(
+      `spliceSensitiveFields: plaintexts for tags [${missing}] not found in reduced bundle`,
+    );
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

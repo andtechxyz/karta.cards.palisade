@@ -13,7 +13,7 @@
  */
 
 import { prisma } from '@palisade/db';
-import { APDUBuilder } from '@palisade/emv';
+import { APDUBuilder, ParamTag, spliceSensitiveFields } from '@palisade/emv';
 import { badRequest, redactSid } from '@palisade/core';
 import { DataPrepService } from '@palisade/data-prep/services/data-prep.service';
 
@@ -1124,13 +1124,73 @@ export class SessionManager {
     }
 
     const config = getRcaConfig();
-    const plaintextBundle = await DataPrepService.decryptSad(
+    const kmsArn = config.KMS_SAD_KEY_ARN ?? '';
+
+    // Decrypt the at-rest bundle first.  Under legacy mode this is
+    // the full ParamBundle; under C17/C22 per-column mode it's the
+    // "reduced" bundle with the four crypto-sensitive TLVs zeroed
+    // out (see data-prep.prepareParamBundle::reduceSensitiveFields).
+    const restedBundle = await DataPrepService.decryptSad(
       Buffer.isBuffer(pr.bundleEncrypted)
         ? pr.bundleEncrypted
         : Buffer.from(pr.bundleEncrypted),
-      config.KMS_SAD_KEY_ARN ?? '',
+      kmsArn,
       pr.bundleKeyVersion,
     );
+
+    // Patent C17/C22 per-column dispatch.  Auto-detect by presence of
+    // the envelope columns — this row was written by a data-prep with
+    // PARAMS_PER_COLUMN=1.  The legacy path (all four columns NULL)
+    // uses `restedBundle` verbatim as plaintextBundle.
+    let plaintextBundle: Buffer;
+    const perColumn = pr.mkAcEncrypted != null;
+    if (perColumn) {
+      // Decrypt the four per-field envelopes in parallel.  Each is a
+      // small KMS round-trip (tens of bytes of ciphertext each); all
+      // four are independent so parallel cuts the critical path.
+      const [mkAc, mkSmi, mkSmc, rsaPriv] = await Promise.all([
+        DataPrepService.decryptSad(
+          Buffer.from(pr.mkAcEncrypted!),
+          kmsArn,
+          pr.mkAcKeyVersion ?? 0,
+        ),
+        DataPrepService.decryptSad(
+          Buffer.from(pr.mkSmiEncrypted!),
+          kmsArn,
+          pr.mkSmiKeyVersion ?? 0,
+        ),
+        DataPrepService.decryptSad(
+          Buffer.from(pr.mkSmcEncrypted!),
+          kmsArn,
+          pr.mkSmcKeyVersion ?? 0,
+        ),
+        DataPrepService.decryptSad(
+          Buffer.from(pr.iccRsaPrivEncrypted!),
+          kmsArn,
+          pr.iccRsaPrivKeyVersion ?? 0,
+        ),
+      ]);
+      try {
+        const tagMap = new Map<number, Buffer>([
+          [ParamTag.MK_AC, mkAc],
+          [ParamTag.MK_SMI, mkSmi],
+          [ParamTag.MK_SMC, mkSmc],
+          [ParamTag.ICC_RSA_PRIV, rsaPriv],
+        ]);
+        plaintextBundle = spliceSensitiveFields(restedBundle, tagMap);
+      } finally {
+        // Scrub each per-field buffer the moment the splice is done.
+        // Total plaintext-in-RAM window per field now bounded by the
+        // ~microsecond splice copy, not the ~50 ms whole-bundle wrap.
+        mkAc.fill(0);
+        mkSmi.fill(0);
+        mkSmc.fill(0);
+        rsaPriv.fill(0);
+        restedBundle.fill(0);
+      }
+    } else {
+      plaintextBundle = restedBundle;
+    }
 
     // Patent C4: feed the chip-side nonce (captured in
     // handleKeygenResponse) into the wrap's HKDF info so the AES/IV/HMAC
@@ -1138,26 +1198,6 @@ export class SessionManager {
     // returns undefined for older applets; wrapParamBundle then falls
     // back to legacy info shape (sessionId alone).
     const chipNonce = getChipNonce(sessionId);
-
-    // TODO(c17/c22-per-column): when pr.mkAcEncrypted IS NOT NULL,
-    // branch to a per-field decrypt path:
-    //   const [mkAc, mkSmi, mkSmc, rsaPriv] = await Promise.all([
-    //     DataPrepService.decryptSad(pr.mkAcEncrypted!, arn, pr.mkAcKeyVersion ?? 0),
-    //     DataPrepService.decryptSad(pr.mkSmiEncrypted!, arn, pr.mkSmiKeyVersion ?? 0),
-    //     DataPrepService.decryptSad(pr.mkSmcEncrypted!, arn, pr.mkSmcKeyVersion ?? 0),
-    //     DataPrepService.decryptSad(pr.iccRsaPrivEncrypted!, arn, pr.iccRsaPrivKeyVersion ?? 0),
-    //   ]);
-    // Surgically TLV-replace the zeroed placeholder fields in
-    // `plaintextBundle` with the per-field plaintexts before wrap,
-    // then scrub each per-field buffer individually.  Matches
-    // PROTOTYPE_PLAN.md §3 "Enhancement path" and closes the
-    // "single-blob decrypt in rca RAM" window noted there.
-    // Companion TODO lives in services/data-prep/src/services/
-    // data-prep.service.ts::prepareParamBundle.
-    // Migration adding the new columns: packages/db/prisma/migrations/
-    // 20260421140000_param_per_field_c17/migration.sql (additive,
-    // not auto-applied by CI — operator runs `prisma migrate deploy`
-    // when ready to flip PARAMS_PER_COLUMN=1).
 
     let chunks: Buffer[];
     try {

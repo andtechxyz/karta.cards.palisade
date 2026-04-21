@@ -13,6 +13,9 @@ import {
   buildParamBundle,
   parseParamBundle,
   referenceBundleForJcDev,
+  reduceSensitiveFields,
+  spliceSensitiveFields,
+  SENSITIVE_PARAM_TAGS,
   type ParamBundleInput,
 } from './param-bundle-builder.js';
 
@@ -236,5 +239,115 @@ describe('referenceBundleForJcDev', () => {
     const a = referenceBundleForJcDev();
     const b = referenceBundleForJcDev();
     expect(a.equals(b)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Patent C17/C22: reduceSensitiveFields + spliceSensitiveFields
+// ---------------------------------------------------------------------------
+
+describe('reduceSensitiveFields / spliceSensitiveFields round-trip', () => {
+  it('reduce → splice(originals) reproduces the original bundle byte-for-byte', () => {
+    const bundle = referenceBundleForJcDev();
+    const parsed = parseParamBundle(bundle);
+
+    const reduced = reduceSensitiveFields(bundle);
+
+    const originals = new Map<number, Buffer>();
+    for (const tag of SENSITIVE_PARAM_TAGS) {
+      const v = parsed.get(tag);
+      if (!v) throw new Error(`test fixture missing sensitive tag 0x${tag.toString(16)}`);
+      originals.set(tag, v);
+    }
+    const spliced = spliceSensitiveFields(reduced, originals);
+
+    expect(spliced.equals(bundle)).toBe(true);
+  });
+
+  it('reduce zeros only the sensitive value bytes, leaves the rest verbatim', () => {
+    const bundle = referenceBundleForJcDev();
+    const parsed = parseParamBundle(bundle);
+    const reduced = reduceSensitiveFields(bundle);
+
+    // Same total length, same byte count — just zeroed-out slots for
+    // sensitive tags.
+    expect(reduced.length).toBe(bundle.length);
+
+    const parsedReduced = parseParamBundle(reduced);
+    for (const tag of SENSITIVE_PARAM_TAGS) {
+      const v = parsedReduced.get(tag);
+      expect(v).toBeDefined();
+      expect(v!.every((b) => b === 0)).toBe(true);
+    }
+
+    // Every non-sensitive field survived intact.
+    const sens = new Set(SENSITIVE_PARAM_TAGS);
+    for (const [tag, original] of parsed) {
+      if (sens.has(tag)) continue;
+      expect(parsedReduced.get(tag)?.equals(original)).toBe(true);
+    }
+  });
+
+  it('reduce preserves TLV length prefixes so splice can scan by offset alone', () => {
+    const bundle = referenceBundleForJcDev();
+    const reduced = reduceSensitiveFields(bundle);
+    // Byte-level: the header/length bytes all match.  Only value slots
+    // at the sensitive tag positions changed.
+    const parsed = parseParamBundle(bundle);
+    const parsedReduced = parseParamBundle(reduced);
+    expect(parsedReduced.size).toBe(parsed.size);
+    for (const [tag, v] of parsed) {
+      expect(parsedReduced.get(tag)?.length).toBe(v.length);
+    }
+  });
+
+  it('splice rejects plaintexts whose length disagrees with TLV prefix', () => {
+    const bundle = referenceBundleForJcDev();
+    const reduced = reduceSensitiveFields(bundle);
+    const parsed = parseParamBundle(bundle);
+    const originals = new Map<number, Buffer>();
+    for (const tag of SENSITIVE_PARAM_TAGS) originals.set(tag, parsed.get(tag)!);
+
+    // Truncate MK_AC to 15 bytes — now mismatches the 16-byte TLV
+    // length prefix.  Should fail loudly.
+    const truncated = new Map(originals);
+    truncated.set(ParamTag.MK_AC, parsed.get(ParamTag.MK_AC)!.subarray(0, 15));
+    expect(() => spliceSensitiveFields(reduced, truncated)).toThrow(
+      /MK_AC|0x9|plaintext is 15 bytes, TLV declared 16/,
+    );
+  });
+
+  it('splice rejects plaintexts for tags not present in reduced bundle', () => {
+    const bundle = referenceBundleForJcDev();
+    const reduced = reduceSensitiveFields(bundle);
+    const parsed = parseParamBundle(bundle);
+    const originals = new Map<number, Buffer>();
+    for (const tag of SENSITIVE_PARAM_TAGS) originals.set(tag, parsed.get(tag)!);
+
+    // Add a nonsense tag that isn't in the bundle — should throw.
+    originals.set(0x7f, Buffer.alloc(4, 0xAB));
+    expect(() => spliceSensitiveFields(reduced, originals)).toThrow(
+      /0x7f.*not found/,
+    );
+  });
+
+  it('reduce rejects duplicate sensitive tags (schema violation)', () => {
+    // Craft a malformed bundle with MK_AC appearing twice.
+    const mkAc1 = Buffer.from([ParamTag.MK_AC, 0x10, ...new Array(16).fill(0x11)]);
+    const mkAc2 = Buffer.from([ParamTag.MK_AC, 0x10, ...new Array(16).fill(0x22)]);
+    const malformed = Buffer.concat([mkAc1, mkAc2]);
+    expect(() => reduceSensitiveFields(malformed)).toThrow(/duplicate sensitive tag/);
+  });
+
+  it('reduce rejects malformed length prefixes (0x82+ unsupported)', () => {
+    const malformed = Buffer.from([ParamTag.MK_AC, 0x82, 0x00, 0x10, ...new Array(16).fill(0)]);
+    expect(() => reduceSensitiveFields(malformed)).toThrow(/unsupported length byte/);
+  });
+
+  it('reduce is a no-op when no sensitive tags match (custom allowlist path)', () => {
+    const bundle = referenceBundleForJcDev();
+    // Ask it to reduce tag 0xFE which doesn't exist in the bundle
+    const reduced = reduceSensitiveFields(bundle, [0xfe]);
+    expect(reduced.equals(bundle)).toBe(true);
   });
 });

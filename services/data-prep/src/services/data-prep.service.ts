@@ -23,6 +23,7 @@ import {
   decryptSadDev,
   SAD_KEY_VERSION_DEV_AES_ECB,
   buildMChipParamBundle,
+  reduceSensitiveFields,
 } from '@palisade/emv';
 import type { CardData, IssuerProfileForSad, McipMapperInput } from '@palisade/emv';
 import { notFound, badRequest } from '@palisade/core';
@@ -268,7 +269,18 @@ export class DataPrepService {
     //    Byte-for-byte parity with simulateMChipChipBuild (which the
     //    pa-v3 applet's DgiBuilderMchip mirrors in Java) is enforced
     //    by packages/emv/src/byte-parity.test.ts.
+    //
+    // Also prep the per-field envelopes under PARAMS_PER_COLUMN=1 —
+    // must happen BEFORE the finally scrub below, while the per-card
+    // MK plaintexts are still in memory.  Legacy mode (flag=0) leaves
+    // the four `*Encrypted` handles undefined so the write below
+    // passes null into those columns.
     let bundle: Buffer;
+    let mkAcEnv: { encrypted: Buffer; keyVersion: number } | null = null;
+    let mkSmiEnv: { encrypted: Buffer; keyVersion: number } | null = null;
+    let mkSmcEnv: { encrypted: Buffer; keyVersion: number } | null = null;
+    let iccRsaEnv: { encrypted: Buffer; keyVersion: number } | null = null;
+    const perColumnMode = config.PARAMS_PER_COLUMN === '1';
     try {
       const mapperInput: McipMapperInput = {
         profile: this.toSadProfile(issuerProfile),
@@ -290,6 +302,20 @@ export class DataPrepService {
         postProvisionUrl: issuerProfile.postProvisionUrl ?? 'tap.karta.cards',
       };
       bundle = buildMChipParamBundle(mapperInput);
+
+      if (perColumnMode) {
+        // Patent C17/C22 — per-field envelope encryption.  Each of the
+        // four crypto-sensitive fields gets its own KMS envelope so
+        // CloudTrail sees a distinct Decrypt call per field at wrap
+        // time (useful for both audit + per-field key rotation).
+        // Parallel awaits cut ~3 KMS round-trips off the critical path.
+        [mkAcEnv, mkSmiEnv, mkSmcEnv, iccRsaEnv] = await Promise.all([
+          this.encryptSad(derived.mkAcKeyBytes, config.KMS_SAD_KEY_ARN),
+          this.encryptSad(derived.mkSmiKeyBytes, config.KMS_SAD_KEY_ARN),
+          this.encryptSad(derived.mkSmcKeyBytes, config.KMS_SAD_KEY_ARN),
+          this.encryptSad(iccRsaPriv, config.KMS_SAD_KEY_ARN),
+        ]);
+      }
     } finally {
       // Scrub per-card EMV master keys even if bundle assembly threw.
       // @palisade/emv's mapper copies the bytes into the bundle buffer
@@ -301,40 +327,33 @@ export class DataPrepService {
       iccRsaPriv.fill(0);
     }
 
-    // 5. Encrypt at rest.  Same envelope-encryption pattern as SadRecord
-    //    (KMS-wrapped AES-256-GCM in prod; AES-128-ECB in dev).  The
-    //    ECDH wrap against the chip's pubkey happens LATER inside rca's
-    //    TRANSFER_PARAMS builder, not here — we don't know the chip
-    //    pubkey until GENERATE_KEYS runs at provisioning time.
+    // 5. Encrypt the rest-at-rest bundle.  Under PARAMS_PER_COLUMN=1
+    //    we first zero the four sensitive value slots in the TLV
+    //    blob — `reduced` is still wire-valid (same length, same tag/
+    //    length prefixes) but the AES-AC/SMI/SMC/ICC RSA priv slots
+    //    are all-zero.  rca splices the per-column plaintexts back
+    //    in at wrap time via spliceSensitiveFields.  Under legacy
+    //    mode (flag=0) this is a no-op copy and the full bundle
+    //    goes into bundleEncrypted as before.
+    const rested = perColumnMode
+      ? reduceSensitiveFields(bundle)
+      : bundle;
     let encrypted: Buffer;
     let keyVersion: number;
     try {
-      ({ encrypted, keyVersion } = await this.encryptSad(bundle, config.KMS_SAD_KEY_ARN));
+      ({ encrypted, keyVersion } = await this.encryptSad(rested, config.KMS_SAD_KEY_ARN));
     } finally {
       bundle.fill(0);
+      if (perColumnMode && rested !== bundle) rested.fill(0);
     }
 
     // 6. Write ParamRecord + link Card.paramRecordId.  Must be atomic
     //    so a crash between the two writes doesn't leave a ParamRecord
     //    orphan that would confuse the retention reaper.
     //
-    // TODO(c17/c22-per-column): when config.PARAMS_PER_COLUMN === '1',
-    // also call this.encryptSad() (or a dedicated per-field helper)
-    // on each of:
-    //   derived.mkAcKeyBytes    → mkAcEncrypted       + mkAcKeyVersion
-    //   derived.mkSmiKeyBytes   → mkSmiEncrypted      + mkSmiKeyVersion
-    //   derived.mkSmcKeyBytes   → mkSmcEncrypted      + mkSmcKeyVersion
-    //   iccRsaPriv              → iccRsaPrivEncrypted + iccRsaPrivKeyVersion
-    // and include those 8 fields in the paramRecord.create() data.
-    // The existing `bundleEncrypted` stays populated either way —
-    // rca autodetects per-column mode via `mkAcEncrypted IS NOT NULL`
-    // and the extra columns only apply their plaintext-window
-    // tightening when rca's wrap path opts in too.
-    // See the companion TODO in services/rca/src/services/session-
-    // manager.ts::handleSadResponse-TRANSFER_PARAMS for the read side.
-    // Note: the derived.*KeyBytes buffers get scrubbed in the finally
-    // block above — per-field encryption must happen BEFORE that scrub,
-    // i.e. inside the same try that calls buildMChipParamBundle.
+    // Per-column columns populated only under PARAMS_PER_COLUMN=1;
+    // rca autodetects via `mkAcEncrypted IS NOT NULL` and branches
+    // to the splice-after-decrypt path at wrap time.
     const proxyCardId = `pxy_${randomBytes(12).toString('hex')}`;
     const paramRecord = await prisma.$transaction(async (tx) => {
       const pr = await tx.paramRecord.create({
@@ -343,6 +362,14 @@ export class DataPrepService {
           proxyCardId,
           bundleEncrypted: encrypted,
           bundleKeyVersion: keyVersion,
+          mkAcEncrypted: mkAcEnv?.encrypted ?? null,
+          mkAcKeyVersion: mkAcEnv?.keyVersion ?? null,
+          mkSmiEncrypted: mkSmiEnv?.encrypted ?? null,
+          mkSmiKeyVersion: mkSmiEnv?.keyVersion ?? null,
+          mkSmcEncrypted: mkSmcEnv?.encrypted ?? null,
+          mkSmcKeyVersion: mkSmcEnv?.keyVersion ?? null,
+          iccRsaPrivEncrypted: iccRsaEnv?.encrypted ?? null,
+          iccRsaPrivKeyVersion: iccRsaEnv?.keyVersion ?? null,
           schemeByte: 0x01, // MChip
           cvnByte: 0x12,    // CVN 18
           chipSerial: input.chipSerial ?? null,
