@@ -317,6 +317,24 @@ export class DataPrepService {
     // 6. Write ParamRecord + link Card.paramRecordId.  Must be atomic
     //    so a crash between the two writes doesn't leave a ParamRecord
     //    orphan that would confuse the retention reaper.
+    //
+    // TODO(c17/c22-per-column): when config.PARAMS_PER_COLUMN === '1',
+    // also call this.encryptSad() (or a dedicated per-field helper)
+    // on each of:
+    //   derived.mkAcKeyBytes    → mkAcEncrypted       + mkAcKeyVersion
+    //   derived.mkSmiKeyBytes   → mkSmiEncrypted      + mkSmiKeyVersion
+    //   derived.mkSmcKeyBytes   → mkSmcEncrypted      + mkSmcKeyVersion
+    //   iccRsaPriv              → iccRsaPrivEncrypted + iccRsaPrivKeyVersion
+    // and include those 8 fields in the paramRecord.create() data.
+    // The existing `bundleEncrypted` stays populated either way —
+    // rca autodetects per-column mode via `mkAcEncrypted IS NOT NULL`
+    // and the extra columns only apply their plaintext-window
+    // tightening when rca's wrap path opts in too.
+    // See the companion TODO in services/rca/src/services/session-
+    // manager.ts::handleSadResponse-TRANSFER_PARAMS for the read side.
+    // Note: the derived.*KeyBytes buffers get scrubbed in the finally
+    // block above — per-field encryption must happen BEFORE that scrub,
+    // i.e. inside the same try that calls buildMChipParamBundle.
     const proxyCardId = `pxy_${randomBytes(12).toString('hex')}`;
     const paramRecord = await prisma.$transaction(async (tx) => {
       const pr = await tx.paramRecord.create({

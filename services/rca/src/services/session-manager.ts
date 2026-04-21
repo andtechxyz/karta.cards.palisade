@@ -1082,6 +1082,26 @@ export class SessionManager {
     // back to legacy info shape (sessionId alone).
     const chipNonce = getChipNonce(sessionId);
 
+    // TODO(c17/c22-per-column): when pr.mkAcEncrypted IS NOT NULL,
+    // branch to a per-field decrypt path:
+    //   const [mkAc, mkSmi, mkSmc, rsaPriv] = await Promise.all([
+    //     DataPrepService.decryptSad(pr.mkAcEncrypted!, arn, pr.mkAcKeyVersion ?? 0),
+    //     DataPrepService.decryptSad(pr.mkSmiEncrypted!, arn, pr.mkSmiKeyVersion ?? 0),
+    //     DataPrepService.decryptSad(pr.mkSmcEncrypted!, arn, pr.mkSmcKeyVersion ?? 0),
+    //     DataPrepService.decryptSad(pr.iccRsaPrivEncrypted!, arn, pr.iccRsaPrivKeyVersion ?? 0),
+    //   ]);
+    // Surgically TLV-replace the zeroed placeholder fields in
+    // `plaintextBundle` with the per-field plaintexts before wrap,
+    // then scrub each per-field buffer individually.  Matches
+    // PROTOTYPE_PLAN.md §3 "Enhancement path" and closes the
+    // "single-blob decrypt in rca RAM" window noted there.
+    // Companion TODO lives in services/data-prep/src/services/
+    // data-prep.service.ts::prepareParamBundle.
+    // Migration adding the new columns: packages/db/prisma/migrations/
+    // 20260421140000_param_per_field_c17/migration.sql (additive,
+    // not auto-applied by CI — operator runs `prisma migrate deploy`
+    // when ready to flip PARAMS_PER_COLUMN=1).
+
     let chunks: Buffer[];
     try {
       chunks = buildParamBundleApduChunks({

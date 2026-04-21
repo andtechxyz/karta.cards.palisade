@@ -53,6 +53,22 @@ const { get: _getDataPrepConfigRaw, reset: _resetDataPrepConfigRaw } = defineEnv
   // DATA_PREP_UDK_BACKEND resolves to 'local'.  Must decode to exactly 32
   // bytes.  Rotate freely in dev (changes MK + iCVV for every card).
   DEV_UDK_ROOT_SEED: z.string().default(''),
+
+  // --- Patent C17/C22 full build-out: per-field envelope encryption ---
+  // '0' (default): prepareParamBundle writes the entire TLV bundle into
+  //                bundleEncrypted as today.  Legacy behaviour.
+  // '1':           ALSO split MK-AC / MK-SMI / MK-SMC / ICC RSA priv
+  //                into their own envelope-encrypted columns on
+  //                ParamRecord (mkAcEncrypted, mkSmiEncrypted,
+  //                mkSmcEncrypted, iccRsaPrivEncrypted).  Shrinks the
+  //                plaintext window at rca wrap-time from one full-
+  //                bundle decrypt to per-field decrypt-assemble-scrub.
+  //                Matches PROTOTYPE_PLAN.md §3 "Enhancement path".
+  //
+  // Rollout: flip to '1' after the 20260421140000_param_per_field_c17
+  // Prisma migration is deployed.  Previously-provisioned rows stay on
+  // the legacy path — rca autodetects which mode to use per-row.
+  PARAMS_PER_COLUMN: z.enum(['0', '1']).default('0'),
 });
 
 /**

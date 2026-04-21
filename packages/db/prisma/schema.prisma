@@ -710,6 +710,11 @@ model ParamRecord {
   id               String   @id @default(cuid())
   proxyCardId      String   @unique
   cardId           String   @unique
+  /// Legacy-path bulk blob — the entire TLV ParamBundle, KMS-wrapped.
+  /// When PARAMS_PER_COLUMN is off, this is authoritative.  When it's
+  /// on, this still holds the non-sensitive fields (AIP, AFL, AUC,
+  /// PAN, expiry, etc.) but the 4 crypto-sensitive fields below are
+  /// sourced from their own per-column envelope columns.
   bundleEncrypted  Bytes
   bundleKeyVersion Int
   /// Scheme byte mirrored from ParamBundle tag 0x06 (0x01 = MChip,
@@ -725,6 +730,26 @@ model ParamRecord {
   status           String   @default("READY")
   expiresAt        DateTime
   createdAt        DateTime @default(now())
+
+  // --- C17/C22 per-field envelope encryption ------------------------
+  // Each of the 4 crypto-sensitive ParamBundle fields gets its own
+  // envelope-encrypted column when data-prep runs with
+  // PARAMS_PER_COLUMN=1.  Shrinks the plaintext window in rca RAM at
+  // wrap time from ~50 ms (full bundle decrypted in one shot) to
+  // per-field decrypt-assemble-scrub cycles.
+  //
+  // Nullable + optional key-version columns so legacy rows keep
+  // validating without backfill.  data-prep writes either all four
+  // pairs (per-column mode) or none (legacy mode); rca detects the
+  // mode via `mkAcEncrypted IS NOT NULL`.
+  mkAcEncrypted        Bytes?
+  mkAcKeyVersion       Int?
+  mkSmiEncrypted       Bytes?
+  mkSmiKeyVersion      Int?
+  mkSmcEncrypted       Bytes?
+  mkSmcKeyVersion      Int?
+  iccRsaPrivEncrypted  Bytes?
+  iccRsaPrivKeyVersion Int?
 
   card Card?
 
