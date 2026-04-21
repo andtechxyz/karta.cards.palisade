@@ -138,25 +138,25 @@ public class ProvisioningAgentV3 extends Applet {
     // matches the server's wrap side.
     // -----------------------------------------------------------------
 
-    private static final byte[] P256_P = {
+    static final byte[] P256_P = {
         (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF, (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x01,
         (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00, (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,
         (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00, (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
         (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF, (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF
     };
-    private static final byte[] P256_A = {
+    static final byte[] P256_A = {
         (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF, (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x01,
         (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00, (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,
         (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00, (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
         (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF, (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFC
     };
-    private static final byte[] P256_B = {
+    static final byte[] P256_B = {
         (byte)0x5A,(byte)0xC6,(byte)0x35,(byte)0xD8, (byte)0xAA,(byte)0x3A,(byte)0x93,(byte)0xE7,
         (byte)0xB3,(byte)0xEB,(byte)0xBD,(byte)0x55, (byte)0x76,(byte)0x98,(byte)0x86,(byte)0xBC,
         (byte)0x65,(byte)0x1D,(byte)0x06,(byte)0xB0, (byte)0xCC,(byte)0x53,(byte)0xB0,(byte)0xF6,
         (byte)0x3B,(byte)0xCE,(byte)0x3C,(byte)0x3E, (byte)0x27,(byte)0xD2,(byte)0x60,(byte)0x4B
     };
-    private static final byte[] P256_G = {
+    static final byte[] P256_G = {
         (byte)0x04,
         (byte)0x6B,(byte)0x17,(byte)0xD1,(byte)0xF2, (byte)0xE1,(byte)0x2C,(byte)0x42,(byte)0x47,
         (byte)0xF8,(byte)0xBC,(byte)0xE6,(byte)0xE5, (byte)0x63,(byte)0xA4,(byte)0x40,(byte)0xF2,
@@ -167,7 +167,7 @@ public class ProvisioningAgentV3 extends Applet {
         (byte)0x2B,(byte)0xCE,(byte)0x33,(byte)0x57, (byte)0x6B,(byte)0x31,(byte)0x5E,(byte)0xCE,
         (byte)0xCB,(byte)0xB6,(byte)0x40,(byte)0x68, (byte)0x37,(byte)0xBF,(byte)0x51,(byte)0xF5
     };
-    private static final byte[] P256_N = {
+    static final byte[] P256_N = {
         (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF, (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,
         (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF, (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
         (byte)0xBC,(byte)0xE6,(byte)0xFA,(byte)0xAD, (byte)0xA7,(byte)0x17,(byte)0x9E,(byte)0x84,
@@ -183,6 +183,15 @@ public class ProvisioningAgentV3 extends Applet {
      * self-reseeding.
      */
     private final RandomData rng;
+
+    /**
+     * Per-card attestation material (patent claims C16/C23).  Loaded
+     * at personalisation via STORE_ATTESTATION; queried at
+     * GENERATE_KEYS time (Phase B) to sign the ephemeral iccPubkey
+     * with the per-card attestation key, and at GET_ATTESTATION_CHAIN
+     * time to emit the issuer-signed card cert blob.
+     */
+    private final IssuerAttestation attestation;
 
     // -----------------------------------------------------------------
     // Constructor + install
@@ -259,6 +268,8 @@ public class ProvisioningAgentV3 extends Applet {
 
         rng = RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
 
+        attestation = new IssuerAttestation();
+
         state = Constants.STATE_IDLE;
         register();
 
@@ -274,6 +285,7 @@ public class ProvisioningAgentV3 extends Applet {
         // NOT reintroduce lazy initialisation of transient arrays.
         EcdhUnwrapper.initOnce();
         DgiBuilderMchip.initOnce();
+        attestation.initOnce();
     }
 
     // -----------------------------------------------------------------
@@ -282,7 +294,7 @@ public class ProvisioningAgentV3 extends Applet {
     // point, order, and cofactor before genKeyPair() works.
     // -----------------------------------------------------------------
 
-    private static void initP256Params(ECPublicKey key) {
+    static void initP256Params(ECPublicKey key) {
         key.setFieldFP(P256_P, (short) 0, (short) P256_P.length);
         key.setA(P256_A, (short) 0, (short) P256_A.length);
         key.setB(P256_B, (short) 0, (short) P256_B.length);
@@ -291,7 +303,7 @@ public class ProvisioningAgentV3 extends Applet {
         key.setK((short) 1);
     }
 
-    private static void initP256Params(ECPrivateKey key) {
+    static void initP256Params(ECPrivateKey key) {
         key.setFieldFP(P256_P, (short) 0, (short) P256_P.length);
         key.setA(P256_A, (short) 0, (short) P256_A.length);
         key.setB(P256_B, (short) 0, (short) P256_B.length);
@@ -341,6 +353,12 @@ public class ProvisioningAgentV3 extends Applet {
                 break;
             case Constants.INS_WIPE:
                 processWipe(apdu);
+                break;
+            case Constants.INS_STORE_ATTESTATION:
+                processStoreAttestation(apdu);
+                break;
+            case Constants.INS_GET_ATTESTATION_CHAIN:
+                processGetAttestationChain(apdu);
                 break;
             default:
                 ISOException.throwIt(Constants.SW_INS_NOT_SUPPORTED);
@@ -437,10 +455,32 @@ public class ProvisioningAgentV3 extends Applet {
         );
         sessionIdLen = (short) (sessionIdLen + Constants.CHIP_NONCE_LEN);
 
+        // --- Patent C16/C23: attestation signature trailer -----------
+        //
+        // If the issuer loaded attestation material at perso (three
+        // STORE_ATTESTATION APDUs), sign (iccPubkey || cplc) with the
+        // per-card attestation key and append the DER ECDSA signature
+        // to the response.
+        //
+        // Response layout with attestation loaded:
+        //   iccPubkey(65) || chipNonce(16) || attestSig(DER, ~71 B)
+        //                                            total ~152 B
+        //
+        // Without attestation (prototype cards before C16/C23 rollout),
+        // the trailer is just iccPubkey || chipNonce = 81 B as before.
+        // rca's AttestationVerifier.extract tolerates both shapes in
+        // permissive mode.  Strict mode requires the trailer.
+        short respLen = (short) (wLen + Constants.CHIP_NONCE_LEN);
+        if (attestation.isFullyLoaded()) {
+            short sigLen = attestation.signAttestation(
+                buf, (short) 0, wLen,  // sign (iccPubkey || cplc), internal concat
+                buf, respLen
+            );
+            respLen = (short) (respLen + sigLen);
+        }
+
         state = Constants.STATE_KEYGEN_COMPLETE;
-        apdu.setOutgoingAndSend(
-            (short) 0, (short) (wLen + Constants.CHIP_NONCE_LEN)
-        );
+        apdu.setOutgoingAndSend((short) 0, respLen);
     }
 
     // -----------------------------------------------------------------
@@ -781,6 +821,71 @@ public class ProvisioningAgentV3 extends Applet {
         JCSystem.beginTransaction();
         state = Constants.STATE_COMMITTED;
         JCSystem.commitTransaction();
+    }
+
+    // -----------------------------------------------------------------
+    // STORE_ATTESTATION (INS=0xEC) — patent C16/C23 perso-time load
+    // -----------------------------------------------------------------
+    //
+    // P1 selects the DGI sub-type; P2 reserved (must be 0x00).  Body
+    // is the raw bytes for that DGI:
+    //
+    //   P1 0x01 (PRIV_KEY)  body = 32 B raw P-256 scalar
+    //   P1 0x02 (CARD_CERT) body = card_pubkey(65) || cplc(42) || sig(DER)
+    //                              (typically ~178 B, capped at 256)
+    //   P1 0x03 (CPLC)      body = 42 B NXP CPLC
+    //
+    // Gated on STATE_IDLE only — a mid-session material swap would let
+    // an attacker who got a STORE_ATTESTATION APDU through (SCP session
+    // compromise during perso) overwrite the legit attestation with
+    // their own, so post-keygen loads are rejected with SW_WRONG_STATE.
+    // The issuer's perso equipment is expected to send all three
+    // STORE_ATTESTATION APDUs before the first GENERATE_KEYS.
+
+    private void processStoreAttestation(APDU apdu) {
+        if (state != Constants.STATE_IDLE) {
+            ISOException.throwIt(Constants.SW_WRONG_STATE);
+        }
+
+        byte[] buf = apdu.getBuffer();
+        short bodyLen = apdu.setIncomingAndReceive();
+        byte p1 = buf[ISO7816.OFFSET_P1];
+        short bodyOff = ISO7816.OFFSET_CDATA;
+
+        switch (p1) {
+            case Constants.ATTEST_P1_PRIV_KEY:
+                attestation.loadPrivKey(buf, bodyOff, bodyLen);
+                break;
+            case Constants.ATTEST_P1_CARD_CERT:
+                attestation.loadCardCert(buf, bodyOff, bodyLen);
+                break;
+            case Constants.ATTEST_P1_CPLC:
+                attestation.loadCplc(buf, bodyOff, bodyLen);
+                break;
+            default:
+                ISOException.throwIt(Constants.SW_DBG_ATTEST_BAD_P1);
+        }
+        // No response body.  SW=9000 signals successful load.
+    }
+
+    // -----------------------------------------------------------------
+    // GET_ATTESTATION_CHAIN (INS=0xEE) — return the loaded card cert
+    // -----------------------------------------------------------------
+    //
+    // No P1/P2/body.  Response = card cert blob (~178 B) + SW=9000.
+    // Short-APDU safe.  rca calls this AFTER GENERATE_KEYS so it can
+    // walk the Root → Issuer → Card → iccPubkey chain before
+    // committing to wrap the ParamBundle for this chip.
+    //
+    // No state gate — rca may call this any time after at least one
+    // STORE_ATTESTATION(P1=CARD_CERT) has succeeded.  Pre-load state
+    // returns SW_DBG_ATTEST_NOT_LOADED (6AF9) from
+    // IssuerAttestation.getCardCert.
+
+    private void processGetAttestationChain(APDU apdu) {
+        byte[] buf = apdu.getBuffer();
+        short certLen = attestation.getCardCert(buf, (short) 0);
+        apdu.setOutgoingAndSend((short) 0, certLen);
     }
 
     // -----------------------------------------------------------------

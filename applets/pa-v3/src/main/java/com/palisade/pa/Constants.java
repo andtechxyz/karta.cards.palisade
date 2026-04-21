@@ -52,6 +52,45 @@ public final class Constants {
     /** INS_WIPE — unchanged from v2. */
     public static final byte INS_WIPE = (byte) 0xEA;
 
+    /**
+     * INS_STORE_ATTESTATION (patent C16/C23).  Loads per-card
+     * attestation material during personalisation.  P1 selects the
+     * DGI sub-type:
+     *   ATTEST_P1_PRIV_KEY  (0x01)  raw 32-byte P-256 private scalar
+     *   ATTEST_P1_CARD_CERT (0x02)  card cert blob (issuer-signed)
+     *   ATTEST_P1_CPLC      (0x03)  42-byte NXP CPLC
+     * Only accepted in STATE_IDLE; post-keygen loads are rejected
+     * with SW_WRONG_STATE so a mid-session material swap can't
+     * masquerade as a legitimate attestation.
+     */
+    public static final byte INS_STORE_ATTESTATION = (byte) 0xEC;
+
+    /**
+     * INS_GET_ATTESTATION_CHAIN (patent C16/C23).  Returns the loaded
+     * card cert blob verbatim so rca can walk the Root→Issuer→Card
+     * chain before encrypting any SAD/ParamBundle for this chip.
+     * Keeping this as a separate query (rather than stuffing the
+     * cert into the GENERATE_KEYS response) keeps every APDU in
+     * short-form range — iOS CoreNFC has been flaky about extended-
+     * length responses on JCOP 5.
+     */
+    public static final byte INS_GET_ATTESTATION_CHAIN = (byte) 0xEE;
+
+    // --- STORE_ATTESTATION P1 dispatch values ---
+    public static final byte ATTEST_P1_PRIV_KEY  = (byte) 0x01;
+    public static final byte ATTEST_P1_CARD_CERT = (byte) 0x02;
+    public static final byte ATTEST_P1_CPLC      = (byte) 0x03;
+
+    /** Raw P-256 private scalar width (attestation key). */
+    public static final short ATTEST_PRIV_KEY_LEN = (short) 32;
+    /** NXP CPLC fixed width (per CPLC spec). */
+    public static final short ATTEST_CPLC_LEN = (short) 42;
+    /** Upper bound for the card cert blob allocation.  Worst case:
+     *  card_pubkey(65) + cplc(42) + DER sig(~72) = ~179 B.  256 B
+     *  leaves room for longer-form DER variants or future cert
+     *  format changes without re-provisioning EEPROM. */
+    public static final short ATTEST_CARD_CERT_MAX = (short) 256;
+
     // -----------------------------------------------------------------
     // ParamBundle tag numbers.  Mirror of `ParamTag` in
     // packages/emv/src/param-bundle-builder.ts.
@@ -247,4 +286,14 @@ public final class Constants {
     public static final short SW_DBG_METADATA_FAIL    = (short) 0x6AF5;
     /** Debug — commitTransaction itself threw (transaction buffer full?). */
     public static final short SW_DBG_COMMIT_FAIL      = (short) 0x6AF6;
+
+    // --- STORE_ATTESTATION / GET_ATTESTATION_CHAIN debug SWs ---
+    /** Debug — STORE_ATTESTATION P1 not one of the defined values. */
+    public static final short SW_DBG_ATTEST_BAD_P1    = (short) 0x6AF7;
+    /** Debug — STORE_ATTESTATION body length doesn't match the
+     *  expected width for the selected P1 (priv=32, cplc=42, cert=<=256). */
+    public static final short SW_DBG_ATTEST_BAD_LEN   = (short) 0x6AF8;
+    /** Debug — signAttestation / getCardCert / getCplc called before
+     *  the corresponding STORE_ATTESTATION load. */
+    public static final short SW_DBG_ATTEST_NOT_LOADED = (short) 0x6AF9;
 }
