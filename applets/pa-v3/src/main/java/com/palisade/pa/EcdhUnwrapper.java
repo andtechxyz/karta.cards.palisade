@@ -63,9 +63,16 @@ import javacardx.crypto.Cipher;
  */
 public final class EcdhUnwrapper {
 
-    private static ECPrivateKey chipPrivKey;
     private static KeyAgreement keyAgreement;
-    private static MessageDigest sha256;
+    /**
+     * SHA-256 engine.  Package-private so ProvisioningAgentV3 can
+     * reuse the same instance for FINAL_STATUS provenance hashing —
+     * JCOP 5 appears to limit the number of MessageDigest objects an
+     * applet can allocate (installing a second one in the applet
+     * constructor fails INSTALL with 0x6F00).  Always reset() before
+     * use since any code path may leave the engine mid-update.
+     */
+    static MessageDigest sha256;
     private static Cipher aesCipher;
     private static AESKey aesKey;
 
@@ -106,16 +113,10 @@ public final class EcdhUnwrapper {
             false
         );
 
-        // ECPrivateKey in EEPROM — persists across power cycles.  Populated
-        // when GENERATE_KEYS runs; reused here for ECDH.
-        chipPrivKey = (ECPrivateKey) KeyBuilder.buildKey(
-            KeyBuilder.TYPE_EC_FP_PRIVATE,
-            KeyBuilder.LENGTH_EC_FP_256,
-            false
-        );
-        // P-256 curve parameters are set in GENERATE_KEYS handler (where
-        // the KeyPair is constructed).  TODO(jc-dev): port palisade-pa's
-        // AttestationProvider curve setup when wiring GENERATE_KEYS.
+        // No chipPrivKey field any more — callers pass their own
+        // ECPrivateKey (typically the live iccKeyPair.getPrivate()) to
+        // unwrap() so we skip the getS/setS round-trip that JCOP 5 can
+        // truncate for scalars with a 0x00 leading byte.
 
         // Scratch buffers — transient RAM, auto-cleared on deselect.
         sharedBuf   = JCSystem.makeTransientByteArray((short) 32, JCSystem.CLEAR_ON_DESELECT);
@@ -125,72 +126,6 @@ public final class EcdhUnwrapper {
         hmacKey     = JCSystem.makeTransientByteArray((short) 64, JCSystem.CLEAR_ON_DESELECT);
         hmacScratch = JCSystem.makeTransientByteArray((short) 64, JCSystem.CLEAR_ON_DESELECT);
     }
-
-    /** Get the chip's ECC private key, populated at GENERATE_KEYS time. */
-    public static ECPrivateKey getChipPrivKey() {
-        return chipPrivKey;
-    }
-
-    /**
-     * Install the P-256 curve parameters + private scalar generated in
-     * GENERATE_KEYS so the subsequent TRANSFER_PARAMS unwrap can drive
-     * ECDH against the matching keypair.  Called by
-     * ProvisioningAgentV3.processGenerateKeys() right after
-     * iccKeyPair.genKeyPair() finishes.
-     *
-     * Curve parameters are applied on every call — cheap (6 short array
-     * copies) and keeps the EcdhUnwrapper independent of the applet's
-     * curve-constants table.
-     */
-    public static void setChipPriv(byte[] scalarBuf, short scalarOff, short scalarLen) {
-        initOnce();
-        chipPrivKey.setFieldFP(P256_P, (short) 0, (short) P256_P.length);
-        chipPrivKey.setA(P256_A, (short) 0, (short) P256_A.length);
-        chipPrivKey.setB(P256_B, (short) 0, (short) P256_B.length);
-        chipPrivKey.setG(P256_G, (short) 0, (short) P256_G.length);
-        chipPrivKey.setR(P256_N, (short) 0, (short) P256_N.length);
-        chipPrivKey.setK((short) 1);
-        chipPrivKey.setS(scalarBuf, scalarOff, scalarLen);
-    }
-
-    // P-256 curve parameters — duplicated from ProvisioningAgentV3 so
-    // EcdhUnwrapper stays self-contained.  Values are fixed by RFC 6090
-    // / SEC 2 appendix A.1.
-    private static final byte[] P256_P = {
-        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF, (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x01,
-        (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00, (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,
-        (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00, (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
-        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF, (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF
-    };
-    private static final byte[] P256_A = {
-        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF, (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x01,
-        (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00, (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,
-        (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00, (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
-        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF, (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFC
-    };
-    private static final byte[] P256_B = {
-        (byte)0x5A,(byte)0xC6,(byte)0x35,(byte)0xD8, (byte)0xAA,(byte)0x3A,(byte)0x93,(byte)0xE7,
-        (byte)0xB3,(byte)0xEB,(byte)0xBD,(byte)0x55, (byte)0x76,(byte)0x98,(byte)0x86,(byte)0xBC,
-        (byte)0x65,(byte)0x1D,(byte)0x06,(byte)0xB0, (byte)0xCC,(byte)0x53,(byte)0xB0,(byte)0xF6,
-        (byte)0x3B,(byte)0xCE,(byte)0x3C,(byte)0x3E, (byte)0x27,(byte)0xD2,(byte)0x60,(byte)0x4B
-    };
-    private static final byte[] P256_G = {
-        (byte)0x04,
-        (byte)0x6B,(byte)0x17,(byte)0xD1,(byte)0xF2, (byte)0xE1,(byte)0x2C,(byte)0x42,(byte)0x47,
-        (byte)0xF8,(byte)0xBC,(byte)0xE6,(byte)0xE5, (byte)0x63,(byte)0xA4,(byte)0x40,(byte)0xF2,
-        (byte)0x77,(byte)0x03,(byte)0x7D,(byte)0x81, (byte)0x2D,(byte)0xEB,(byte)0x33,(byte)0xA0,
-        (byte)0xF4,(byte)0xA1,(byte)0x39,(byte)0x45, (byte)0xD8,(byte)0x98,(byte)0xC2,(byte)0x96,
-        (byte)0x4F,(byte)0xE3,(byte)0x42,(byte)0xE2, (byte)0xFE,(byte)0x1A,(byte)0x7F,(byte)0x9B,
-        (byte)0x8E,(byte)0xE7,(byte)0xEB,(byte)0x4A, (byte)0x7C,(byte)0x0F,(byte)0x9E,(byte)0x16,
-        (byte)0x2B,(byte)0xCE,(byte)0x33,(byte)0x57, (byte)0x6B,(byte)0x31,(byte)0x5E,(byte)0xCE,
-        (byte)0xCB,(byte)0xB6,(byte)0x40,(byte)0x68, (byte)0x37,(byte)0xBF,(byte)0x51,(byte)0xF5
-    };
-    private static final byte[] P256_N = {
-        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF, (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,
-        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF, (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
-        (byte)0xBC,(byte)0xE6,(byte)0xFA,(byte)0xAD, (byte)0xA7,(byte)0x17,(byte)0x9E,(byte)0x84,
-        (byte)0xF3,(byte)0xB9,(byte)0xCA,(byte)0xC2, (byte)0xFC,(byte)0x63,(byte)0x25,(byte)0x51
-    };
 
     /**
      * Unwrap an ECDH-wrapped ParamBundle.  Writes the plaintext to
@@ -209,20 +144,34 @@ public final class EcdhUnwrapper {
      *                      verify failure (tampering, wrong key, wrong
      *                      session) or CBC unpad failure.
      */
+    /**
+     * Out-param struct for the debug-mismatch path.  When the IV check
+     * fails, unwrap() writes 32 B of diagnostic into `diagBuf`:
+     *   [0..16) chip HKDF-derived IV   (okmBuf[16..32))
+     *   [16..17) sessionIdLen stored at GENERATE_KEYS
+     *   [17..32) first 15 bytes of stored sessionId
+     * Server-side log line `[emv-ecdh][debug] wrap ...` dumps its own
+     * hkdfIV + sessionId; side-by-side diff localises the HKDF
+     * divergence to either info-string bytes or the expand loop.
+     */
+    public static final short DBG_IV_DIAG_LEN = (short) 32;
+
     public static short unwrap(
+        ECPrivateKey chipPriv,
         byte[] wireBuf, short wireOff, short wireLen,
         byte[] sessionId, short sessionIdOff, short sessionIdLen,
-        byte[] outBuf, short outOff
+        byte[] outBuf, short outOff,
+        byte[] diagBuf, short diagOff
     ) {
         initOnce();
 
         final short headerLen = (short) (Constants.SEC1_UNCOMPRESSED_LEN + Constants.AES_IV_LEN);
         if (wireLen < (short) (headerLen + Constants.HMAC_TAG_LEN)) {
-            ISOException.throwIt(Constants.SW_PARAM_BUNDLE_GCM_FAILED);
+            ISOException.throwIt(Constants.SW_DBG_WIRE_TOO_SHORT);
         }
         short ctLen = (short) (wireLen - headerLen - Constants.HMAC_TAG_LEN);
         if (ctLen <= 0 || (short) (ctLen % Constants.AES_IV_LEN) != 0) {
-            ISOException.throwIt(Constants.SW_PARAM_BUNDLE_GCM_FAILED);
+            ISOException.throwIt(Constants.SW_DBG_CT_BAD_LEN);
         }
 
         // Offsets within wireBuf.
@@ -232,13 +181,24 @@ public final class EcdhUnwrapper {
         final short tagOff  = (short) (ctOff + ctLen);
 
         // --- 1. ECDH → shared secret X coordinate (32 B) ----------------
-        keyAgreement.init(chipPrivKey);
+        //
+        // `chipPriv` is the caller's live ECPrivateKey (typically
+        // `iccKeyPair.getPrivate()` from GENERATE_KEYS) — we consume it
+        // directly rather than copying the scalar, because an earlier
+        // getS/setS round-trip produced scalars of different bit-length
+        // on JCOP 5 when the top byte of d was 0x00 (happens ~1/256 of
+        // keygens).  Short-length setS was interpreting the scalar as
+        // literal rather than left-padding, so the re-created key was a
+        // completely different point on the curve → wrong ECDH output →
+        // 6AE4 (IV mismatch) on unwrap.  Using the key object directly
+        // sidesteps the whole scalar-marshalling mess.
+        keyAgreement.init(chipPriv);
         short sharedLen = keyAgreement.generateSecret(
             wireBuf, pubOff, Constants.SEC1_UNCOMPRESSED_LEN,
             sharedBuf, (short) 0
         );
         if (sharedLen != (short) 32) {
-            ISOException.throwIt(Constants.SW_PARAM_BUNDLE_GCM_FAILED);
+            ISOException.throwIt(Constants.SW_DBG_SHARED_LEN_BAD);
         }
 
         // --- 2. HKDF-SHA256 extract: prk = HMAC(salt, shared) -----------
@@ -279,8 +239,28 @@ public final class EcdhUnwrapper {
             Constants.AES_IV_LEN
         );
         if (ivCmp != (byte) 0) {
+            // ECDH sharedX already confirmed matching server-side (see
+            // prior diag run); now dump chip's HKDF-derived IV plus
+            // stored sessionId so server can verify HKDF info input.
+            if (diagBuf != null) {
+                // [0..16)  chip HKDF IV
+                Util.arrayCopyNonAtomic(okmBuf, (short) 16,
+                    diagBuf, diagOff, Constants.AES_IV_LEN);
+                // [16]     sessionIdLen
+                diagBuf[(short) (diagOff + 16)] = (byte) sessionIdLen;
+                // [17..32) first min(15, sessionIdLen) bytes of sessionId
+                short sidCopy = sessionIdLen > 15 ? (short) 15 : sessionIdLen;
+                Util.arrayCopyNonAtomic(sessionId, sessionIdOff,
+                    diagBuf, (short) (diagOff + 17), sidCopy);
+                // Zero any remainder
+                if (sidCopy < 15) {
+                    Util.arrayFillNonAtomic(diagBuf,
+                        (short) (diagOff + 17 + sidCopy),
+                        (short) (15 - sidCopy), (byte) 0);
+                }
+            }
             scrubCryptoState();
-            ISOException.throwIt(Constants.SW_PARAM_BUNDLE_GCM_FAILED);
+            ISOException.throwIt(Constants.SW_DBG_IV_MISMATCH);
         }
 
         // --- 5. HMAC-SHA256(hmacKey, iv || ct) → first 16 B tag ---------
@@ -301,7 +281,7 @@ public final class EcdhUnwrapper {
         );
         if (tagCmp != (byte) 0) {
             scrubCryptoState();
-            ISOException.throwIt(Constants.SW_PARAM_BUNDLE_GCM_FAILED);
+            ISOException.throwIt(Constants.SW_DBG_HMAC_MISMATCH);
         }
 
         // --- 6. AES-CBC decrypt with PKCS#7 unpad -----------------------
@@ -319,7 +299,7 @@ public final class EcdhUnwrapper {
             );
         } catch (Exception e) {
             scrubCryptoState();
-            ISOException.throwIt(Constants.SW_PARAM_BUNDLE_GCM_FAILED);
+            ISOException.throwIt(Constants.SW_DBG_CBC_UNPAD_FAIL);
             return 0;  // unreachable
         }
 
@@ -341,13 +321,26 @@ public final class EcdhUnwrapper {
     // HMAC-SHA256 helpers (inline — no Signature.ALG_HMAC_SHA_256 in 3.0.4)
     // ---------------------------------------------------------------
 
-    /** Single-segment HMAC-SHA256. */
+    /**
+     * Single-segment HMAC-SHA256.
+     *
+     * IMPORTANT — buffer-aliasing contract: this helper mutates
+     * `hmacKey` in place (ipad XOR, then re-XOR to opad) but does NOT
+     * touch `hmacScratch`.  That means the caller is free to pass
+     * `hmacScratch` as the message buffer (HKDF-Expand relies on this
+     * — it stages `info || 0x01` and `T(1) || info || 0x02` in
+     * hmacScratch before calling us).  An earlier version of this
+     * helper used hmacScratch for the pad-XOR scratch, which silently
+     * clobbered the message before SHA-256 could read it — the
+     * resulting HKDF output diverged from the server's and tripped
+     * SW_DBG_IV_MISMATCH (0x6AE4) on every real tap.
+     */
     private static void hmacSha256(
         byte[] keyBuf, short keyOff, short keyLen,
         byte[] msgBuf, short msgOff, short msgLen,
         byte[] out, short outOff
     ) {
-        // Key prep: pad to 64 or pre-hash if longer.
+        // Key prep: right-pad to 64 B with zeros, or pre-hash if longer.
         Util.arrayFillNonAtomic(hmacKey, (short) 0, (short) 64, (byte) 0);
         if (keyLen > (short) 64) {
             sha256.reset();
@@ -356,21 +349,27 @@ public final class EcdhUnwrapper {
             Util.arrayCopyNonAtomic(keyBuf, keyOff, hmacKey, (short) 0, keyLen);
         }
 
-        // inner = SHA-256(ipad || msg)
+        // inner = SHA-256((K ⊕ ipad) || msg)
+        // XOR the ipad in place into hmacKey so we don't need a
+        // separate scratch buffer (which would risk aliasing with
+        // msgBuf — see class-level contract).
         for (short i = (short) 0; i < (short) 64; i++) {
-            hmacScratch[i] = (byte) (hmacKey[i] ^ 0x36);
+            hmacKey[i] = (byte) (hmacKey[i] ^ 0x36);
         }
         sha256.reset();
-        sha256.update(hmacScratch, (short) 0, (short) 64);
+        sha256.update(hmacKey, (short) 0, (short) 64);
         sha256.doFinal(msgBuf, msgOff, msgLen, out, outOff);
         // out[outOff..outOff+32) = inner hash
 
-        // outer = SHA-256(opad || inner)
+        // Transform hmacKey from (K ⊕ ipad) to (K ⊕ opad) by XOR-ing
+        // with (ipad ⊕ opad) = 0x36 ^ 0x5C = 0x6A — saves a second
+        // copy of the raw key.
         for (short i = (short) 0; i < (short) 64; i++) {
-            hmacScratch[i] = (byte) (hmacKey[i] ^ 0x5C);
+            hmacKey[i] = (byte) (hmacKey[i] ^ 0x6A);
         }
+        // outer = SHA-256((K ⊕ opad) || inner)
         sha256.reset();
-        sha256.update(hmacScratch, (short) 0, (short) 64);
+        sha256.update(hmacKey, (short) 0, (short) 64);
         sha256.doFinal(out, outOff, (short) 32, out, outOff);
     }
 
@@ -378,6 +377,10 @@ public final class EcdhUnwrapper {
      * Two-segment HMAC-SHA256 — key, then message = seg1 || seg2.
      * Used for encrypt-then-MAC where the tag covers iv || ct without
      * needing to allocate a scratch buffer that holds both.
+     *
+     * Same buffer-aliasing contract as hmacSha256(): mutates hmacKey
+     * in place, does not touch hmacScratch, so either seg buffer may
+     * safely alias hmacScratch.
      */
     private static void hmacSha256TwoSeg(
         byte[] keyBuf, short keyOff, short keyLen,
@@ -393,21 +396,22 @@ public final class EcdhUnwrapper {
             Util.arrayCopyNonAtomic(keyBuf, keyOff, hmacKey, (short) 0, keyLen);
         }
 
-        // inner = SHA-256(ipad || seg1 || seg2)
+        // inner = SHA-256((K ⊕ ipad) || seg1 || seg2) — in-place on hmacKey
         for (short i = (short) 0; i < (short) 64; i++) {
-            hmacScratch[i] = (byte) (hmacKey[i] ^ 0x36);
+            hmacKey[i] = (byte) (hmacKey[i] ^ 0x36);
         }
         sha256.reset();
-        sha256.update(hmacScratch, (short) 0, (short) 64);
+        sha256.update(hmacKey, (short) 0, (short) 64);
         sha256.update(seg1Buf, seg1Off, seg1Len);
         sha256.doFinal(seg2Buf, seg2Off, seg2Len, out, outOff);
 
-        // outer = SHA-256(opad || inner)
+        // Transform hmacKey from (K ⊕ ipad) to (K ⊕ opad) via XOR 0x6A.
         for (short i = (short) 0; i < (short) 64; i++) {
-            hmacScratch[i] = (byte) (hmacKey[i] ^ 0x5C);
+            hmacKey[i] = (byte) (hmacKey[i] ^ 0x6A);
         }
+        // outer = SHA-256((K ⊕ opad) || inner)
         sha256.reset();
-        sha256.update(hmacScratch, (short) 0, (short) 64);
+        sha256.update(hmacKey, (short) 0, (short) 64);
         sha256.doFinal(out, outOff, (short) 32, out, outOff);
     }
 }

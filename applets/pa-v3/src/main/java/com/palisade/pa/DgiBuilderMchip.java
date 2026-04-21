@@ -57,8 +57,47 @@ public final class DgiBuilderMchip {
     // params.  Format: PAN(F-padded) || 0xD || Expiry(YYMM) || Service(3)
     // || "000000000000" (discretionary, 12 zeros) || padding 0xF to
     // even length.
+    //
+    // Two scratch buffers, both lazy-init on the first buildDgi0101
+    // call (we can't allocate from the <clinit> of a static-only class
+    // since JCSystem.makeTransientByteArray needs a JC runtime context):
+    //   track2Scratch (24 B) — packed Track 2 bytes, destination of
+    //                          buildTrack2.  Consumed by buildDgi0101's
+    //                          emitTlv2(TAG_TRACK2, ...) call.
+    //   nibbleScratch (40 B) — intermediate nibble accumulator used by
+    //                          buildTrack2.  Was previously allocated
+    //                          per-call with `new byte[]`, which on JC
+    //                          3.0.4 leaks transient RAM every tap
+    //                          (no GC by default on JCOP 5) — after
+    //                          enough provisioning attempts the
+    //                          makeTransientByteArray call would throw
+    //                          SystemException(NO_TRANSIENT_SPACE).
+    //                          Hoisted to a static now: allocated once,
+    //                          auto-cleared on deselect.
     // -----------------------------------------------------------------
     private static byte[] track2Scratch;
+    private static byte[] nibbleScratch;
+
+    /**
+     * Allocate all transient scratch used by the four DGI builders.
+     * MUST be called from the applet's constructor (or otherwise
+     * outside any JCSystem.beginTransaction block) — JCSystem.
+     * makeTransientByteArray throws TransactionException.IN_PROGRESS
+     * when invoked inside a transaction, and on JCOP 5 that's one of
+     * the errors that can mute the contactless interface rather than
+     * raise a catchable exception.  Lazy-init inside buildTrack2 was
+     * the root cause of silent-on-final-APDU crashes before this
+     * eager init was added.
+     */
+    public static void initOnce() {
+        if (track2Scratch != null) return;
+        track2Scratch = JCSystem.makeTransientByteArray(
+            (short) 24, JCSystem.CLEAR_ON_DESELECT
+        );
+        nibbleScratch = JCSystem.makeTransientByteArray(
+            (short) 40, JCSystem.CLEAR_ON_DESELECT
+        );
+    }
 
     /**
      * Build DGI 0x0101 (Application Data) into outBuf starting at
@@ -122,12 +161,9 @@ public final class DgiBuilderMchip {
         //         discretionary(12 zero digits) || pad 0xF to even
         //
         // Buffer size: PAN max 10 B + 0xD + expiry 2 B + service 2 B +
-        // discretionary 6 B ≈ 22 B worst case.  Allocate 24 B transient.
-        if (track2Scratch == null) {
-            track2Scratch = JCSystem.makeTransientByteArray(
-                (short) 24, JCSystem.CLEAR_ON_DESELECT
-            );
-        }
+        // discretionary 6 B ≈ 22 B worst case.  Buffer is pre-allocated
+        // by initOnce() so we never hit JCSystem.makeTransientByteArray
+        // inside the beginTransaction of processTransferParams.
         short t2Len = buildTrack2(
             bundleBuf, bundleOff, bundleLen, scratch,
             track2Scratch, (short) 0
@@ -355,12 +391,15 @@ public final class DgiBuilderMchip {
         // Scratch builder working in nibbles — accumulate digits as
         // ASCII '0'..'9', 'D', 'F' then pack.  For simplicity use
         // temp byte array of nibble count, then pack-to-bytes at end.
-
+        //
         // Conservative max: 10 B PAN × 2 + 1 separator + 4 expiry + 3 sc
         //                   + 12 disc = 40 nibbles → 20 bytes packed.
-        byte[] nibbles = JCSystem.makeTransientByteArray(
-            (short) 40, JCSystem.CLEAR_ON_DESELECT
-        );
+        //
+        // Pre-allocated by initOnce() called from the applet
+        // constructor.  See class-level notes on why this can't be a
+        // `new byte[]` local and why it can't be lazy-initialised
+        // inside the processTransferParams transaction.
+        byte[] nibbles = nibbleScratch;
         short nibCount = (short) 0;
 
         // PAN: 8 bytes stored as 16 nibbles (F-padded for 17-digit

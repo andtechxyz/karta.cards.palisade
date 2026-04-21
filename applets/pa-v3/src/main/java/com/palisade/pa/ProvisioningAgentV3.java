@@ -175,20 +175,42 @@ public class ProvisioningAgentV3 extends Applet {
 
     private final KeyPair iccKeyPair;
 
-    /** Scratch for exporting the private scalar during GENERATE_KEYS. */
-    private byte[] privScratch;
-
     // -----------------------------------------------------------------
     // Constructor + install
     // -----------------------------------------------------------------
 
     protected ProvisioningAgentV3(byte[] bArray, short bOffset, byte bLength) {
         // EEPROM allocations.  Sized for MChip CVN 18 worst-case DGIs.
+        //
+        // DGI 8201 sizing breakdown (see DgiBuilderMchip.buildDgi8201):
+        //   9F52 MK-AC   : 2 + 1 +  16 =  19 B
+        //   9F53 MK-SMI  : 2 + 1 +  16 =  19 B
+        //   9F54 MK-SMC  : 2 + 1 +  16 =  19 B
+        //   9F46 PK cert : 2 + 1 + 112 = 115 B (short-form, 112<128)
+        //   DF73 RSA prv : 2 + 2 + 128 = 132 B (long-form,  128>=128)
+        //                                ---
+        //                                304 B  ← with today's 128B/112B
+        //   Worst case (both keys at the MAX_FIELD_LEN=255 cap):
+        //                       2+2+255 + 2+2+255 + 3*19 = 576 B
+        //
+        // An earlier dgi8201Nvm=256 was too small for even the current
+        // data-prep defaults (304 B); buffer overflow during
+        // Util.arrayCopy inside beginTransaction caused the JCVM to
+        // mute the contactless interface mid-commit on tap.
+        // Bumped to 512 B to cover typical 1408-bit RSA paths and
+        // 2048-bit cert paths with some slack, still well inside the
+        // JCOP 5 EEPROM budget.
         sessionId  = new byte[64];  // cuid2 is 24 chars; 64 = generous
-        dgi0101Nvm = new byte[128];
-        dgi0102Nvm = new byte[16];
-        dgi8201Nvm = new byte[256];
-        dgi9201Nvm = new byte[64];
+        dgi0101Nvm = new byte[256]; // bumped from 128 for Track 2 + long PANs
+        // DGI 0102 = 1B tag(0x94) + 1B len + AFL bytes.  The karta-platinum
+        // seed sets AFL = 16 B (32 hex chars), so DGI 0102 = 18 B — the
+        // original 16 B buffer overflowed in Util.arrayCopy during the
+        // post-build NVM write and returned SW 6AF2.  Bumped to 64 B to
+        // cover realistic AFL lengths (4 records × 4 B each = 16 B is
+        // the common case, up to maybe 24-32 B for uncommon card designs).
+        dgi0102Nvm = new byte[64];
+        dgi8201Nvm = new byte[512]; // bumped from 256 — see note above
+        dgi9201Nvm = new byte[128]; // bumped from 64 for CVM-list headroom
 
         // Transient RAM — auto-cleared on deselect.  We need the full
         // APDU body in RAM for ECDH unwrap since the HMAC tag verify
@@ -198,19 +220,23 @@ public class ProvisioningAgentV3 extends Applet {
         // leaves headroom for larger ParamBundles (iCVV rotation,
         // post-provisioning URLs longer than 64 B, etc.).
         //
-        // JCOP 5 transient RAM budget is 4-8 KB so 1024 B here plus
-        // the 1024 B bundleBuf stays well inside budget.
+        // dgiWorkBuf is the scratch used by DgiBuilderMchip to assemble
+        // one DGI at a time before the caller copies it to the matching
+        // NVM slot.  Must be >= the largest DGI output (8201 @ 304 B
+        // today, up to 576 B in worst case), so we use 1024 B to match
+        // wireBuf / bundleBuf and leave plenty of slack.
+        //
+        // JCOP 5 transient RAM budget is 4-8 KB so 1024+1024+1024 stays
+        // within budget even with EcdhUnwrapper's ~280 B of statics.
         wireBuf    = JCSystem.makeTransientByteArray((short) 1024, JCSystem.CLEAR_ON_DESELECT);
         bundleBuf  = JCSystem.makeTransientByteArray((short) 1024, JCSystem.CLEAR_ON_DESELECT);
-        dgiWorkBuf = JCSystem.makeTransientByteArray((short) 256, JCSystem.CLEAR_ON_DESELECT);
+        dgiWorkBuf = JCSystem.makeTransientByteArray((short) 1024, JCSystem.CLEAR_ON_DESELECT);
         scratch    = JCSystem.makeTransientShortArray((short) 2, JCSystem.CLEAR_ON_DESELECT);
 
-        // 32-byte scratch for exporting the EC private scalar inside
-        // GENERATE_KEYS — transient so the secret never survives deselect.
-        privScratch = JCSystem.makeTransientByteArray((short) 32, JCSystem.CLEAR_ON_DESELECT);
-
         // P-256 keypair — curve params installed once here; keypair regen
-        // happens every GENERATE_KEYS call.
+        // happens every GENERATE_KEYS call.  EcdhUnwrapper reads the
+        // private half directly out of iccKeyPair (no scalar copy) so
+        // there's no persistent scratch buffer for the private scalar.
         iccKeyPair = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);
         initP256Params((ECPublicKey) iccKeyPair.getPublic());
         initP256Params((ECPrivateKey) iccKeyPair.getPrivate());
@@ -218,7 +244,18 @@ public class ProvisioningAgentV3 extends Applet {
         state = Constants.STATE_IDLE;
         register();
 
+        // CRITICAL — all transient-array allocations happen HERE, before
+        // any TRANSFER_PARAMS call can start a transaction.  JCSystem.
+        // makeTransientByteArray throws TransactionException.IN_PROGRESS
+        // if called inside beginTransaction, and on JCOP 5 an uncaught
+        // TransactionException during transient allocation mutes the
+        // contactless interface — the card just stops responding
+        // instead of returning a SW.  A previous build had lazy inits
+        // inside DgiBuilderMchip.buildTrack2 and the result was a
+        // silent-on-final-APDU crash that took hours to trace.  Do
+        // NOT reintroduce lazy initialisation of transient arrays.
         EcdhUnwrapper.initOnce();
+        DgiBuilderMchip.initOnce();
     }
 
     // -----------------------------------------------------------------
@@ -260,7 +297,14 @@ public class ProvisioningAgentV3 extends Applet {
 
         byte[] buf = apdu.getBuffer();
 
-        if (buf[ISO7816.OFFSET_CLA] != Constants.CLA_PA) {
+        // Accept CLA = 0x80 (Palisade proprietary, single APDU) OR
+        // 0x90 (same, with ISO 7816-4 §5.1.1.1 command-chaining bit
+        // 0x10 set).  Masking bit 4 out before comparison lets the
+        // chained-short-APDU TRANSFER_PARAMS path work.  Anything else
+        // (non-proprietary CLA, unknown bits in the low nibble) is
+        // rejected with SW_CLA_NOT_SUPPORTED as before.
+        byte cla = buf[ISO7816.OFFSET_CLA];
+        if ((byte) (cla & (byte) 0xEF) != Constants.CLA_PA) {
             ISOException.throwIt(Constants.SW_CLA_NOT_SUPPORTED);
         }
 
@@ -295,6 +339,22 @@ public class ProvisioningAgentV3 extends Applet {
             ISOException.throwIt(Constants.SW_WRONG_STATE);
         }
 
+        // GENERATE_KEYS marks the start of a fresh provisioning session,
+        // so every accumulator from a prior (possibly crashed) attempt
+        // has to be zeroed BEFORE we accept any chunks for this session.
+        //
+        // chainOff is an EEPROM field (not a transient) and so persists
+        // across power cycles.  If a previous tap crashed partway
+        // through TRANSFER_PARAMS (e.g. the silent-JCVM-mute that
+        // happened when transient allocation failed inside a
+        // transaction), the cleanup code at the tail of
+        // processTransferParams never ran, and chainOff still holds
+        // whatever cumulative offset that tap reached.  The next
+        // session's chain #1 then passes the overflow guard but chain
+        // #2 fails when (stale_chainOff + new_Lc) > wireBuf.length →
+        // SW_DATA_INVALID on chain #2 out of nowhere.  Reset here.
+        chainOff = 0;
+
         // Request body format (same as v2): keyType(0x01 = ECC P-256)
         // || sessionId (up to 63 bytes).  Validate + persist sessionId.
         short bodyLen = apdu.setIncomingAndReceive();
@@ -318,22 +378,14 @@ public class ProvisioningAgentV3 extends Applet {
 
         // Generate the ECC P-256 keypair.  genKeyPair() populates both
         // public and private halves of iccKeyPair using the curve params
-        // we installed in the constructor.
+        // we installed in the constructor.  processTransferParams() later
+        // passes iccKeyPair.getPrivate() directly to EcdhUnwrapper —
+        // NO getS/setS round-trip, which JCOP 5 can truncate on scalars
+        // whose top byte is 0x00 (1/256 of keygens) and produce a
+        // different curve point.
         iccKeyPair.genKeyPair();
 
-        ECPrivateKey priv = (ECPrivateKey) iccKeyPair.getPrivate();
-        ECPublicKey  pub  = (ECPublicKey)  iccKeyPair.getPublic();
-
-        // Hand the freshly-generated scalar to EcdhUnwrapper so the
-        // subsequent TRANSFER_PARAMS can drive ECDH against the same
-        // keypair.  Scrub the scratch immediately after so the plaintext
-        // scalar never lives longer than this APDU.
-        short sLen = priv.getS(privScratch, (short) 0);
-        try {
-            EcdhUnwrapper.setChipPriv(privScratch, (short) 0, sLen);
-        } finally {
-            Util.arrayFillNonAtomic(privScratch, (short) 0, (short) privScratch.length, (byte) 0);
-        }
+        ECPublicKey pub = (ECPublicKey) iccKeyPair.getPublic();
 
         // Write the 65-byte uncompressed public key (0x04 || X(32) || Y(32))
         // into the APDU response buffer.  TODO(jc-dev): once the factory
@@ -423,12 +475,38 @@ public class ProvisioningAgentV3 extends Applet {
         //    so a retry with the correct keys/session gets a fresh slate.
         short bundleLen;
         try {
+            // Pass the APDU buffer as the diagnostic scratch — unwrap
+            // writes 32 B (chip_iv || wire_iv) there on IV mismatch.
+            // Those bytes shipped back in the response let the server
+            // diff its HKDF output byte-for-byte without another build.
+            //
+            // Safe to clobber offset 0 of the APDU buffer because
+            // setIncomingAndReceive has already finished consuming the
+            // incoming chunk, and the receiveBytes loop above has
+            // already extracted everything we need out of it.
             bundleLen = EcdhUnwrapper.unwrap(
+                (ECPrivateKey) iccKeyPair.getPrivate(),
                 wireBuf, (short) 0, totalLen,
                 sessionId, (short) 0, sessionIdLen,
-                bundleBuf, (short) 0
+                bundleBuf, (short) 0,
+                apdu.getBuffer(), (short) 0
             );
         } catch (ISOException e) {
+            if (e.getReason() == Constants.SW_DBG_IV_MISMATCH) {
+                // Ship the diagnostic blob.  Throwing after
+                // setOutgoingAndSend preserves the emitted data but
+                // replaces the implicit 9000 SW with our mismatch SW
+                // (per JC 3.0.4 §9.5.4).  If the APDU was case-3 (no
+                // Le), the setOutgoingAndSend itself will throw; we
+                // swallow that and let the original IV_MISMATCH SW
+                // propagate — the server still learns it was an IV
+                // mismatch, just without the 32-B detail.
+                try {
+                    apdu.setOutgoingAndSend((short) 0, EcdhUnwrapper.DBG_IV_DIAG_LEN);
+                } catch (Exception inner) {
+                    // Case-3 last chunk — no outgoing slot.  Discard.
+                }
+            }
             Util.arrayFillNonAtomic(wireBuf, (short) 0, chainOff, (byte) 0);
             chainOff = 0;
             throw e;
@@ -447,26 +525,42 @@ public class ProvisioningAgentV3 extends Applet {
         }
 
         // 4. Build DGIs and write to NVM atomically.
+        //
+        // Each DGI builder's output goes to dgiWorkBuf (1024 B transient)
+        // before we copy to the matching NVM slot.  Per-step SW codes
+        // (0x6AF1..0x6AF6) let the server localise any future crash to
+        // the exact DGI that blew up; once the prototype is stable we
+        // collapse these back to SW_DATA_INVALID.
+        //
+        // Why a transaction wraps ALL four copies: a tear between DGI 1
+        // and DGI 4 would leave the card in a half-provisioned state
+        // that neither v3 nor the server could recover — atomic commit
+        // keeps the state machine truthful about STATE_PARAMS_COMMITTED.
+        short failStep = (short) 0;  // set before each builder call
         JCSystem.beginTransaction();
         try {
+            failStep = Constants.SW_DBG_BUILD_0101_FAIL;
             dgi0101Len = DgiBuilderMchip.buildDgi0101(
                 bundleBuf, (short) 0, bundleLen, scratch,
                 dgiWorkBuf, (short) 0
             );
             Util.arrayCopy(dgiWorkBuf, (short) 0, dgi0101Nvm, (short) 0, dgi0101Len);
 
+            failStep = Constants.SW_DBG_BUILD_0102_FAIL;
             dgi0102Len = DgiBuilderMchip.buildDgi0102(
                 bundleBuf, (short) 0, bundleLen, scratch,
                 dgiWorkBuf, (short) 0
             );
             Util.arrayCopy(dgiWorkBuf, (short) 0, dgi0102Nvm, (short) 0, dgi0102Len);
 
+            failStep = Constants.SW_DBG_BUILD_8201_FAIL;
             dgi8201Len = DgiBuilderMchip.buildDgi8201(
                 bundleBuf, (short) 0, bundleLen, scratch,
                 dgiWorkBuf, (short) 0
             );
             Util.arrayCopy(dgiWorkBuf, (short) 0, dgi8201Nvm, (short) 0, dgi8201Len);
 
+            failStep = Constants.SW_DBG_BUILD_9201_FAIL;
             dgi9201Len = DgiBuilderMchip.buildDgi9201(
                 bundleBuf, (short) 0, bundleLen, scratch,
                 dgiWorkBuf, (short) 0
@@ -477,18 +571,35 @@ public class ProvisioningAgentV3 extends Applet {
             // postProvisionUrl) that existed in the v2 TRANSFER_SAD
             // metadata-trailer format.  Same tags; just pull via
             // ParamBundleParser.findTag.
+            failStep = Constants.SW_DBG_METADATA_FAIL;
             persistMetadata(bundleBuf, (short) 0, bundleLen);
 
             state = Constants.STATE_PARAMS_COMMITTED;
 
+            failStep = Constants.SW_DBG_COMMIT_FAIL;
             JCSystem.commitTransaction();
-        } catch (Exception e) {
-            JCSystem.abortTransaction();
+        } catch (ISOException ioe) {
+            // Known SW path — abort + rethrow with the original SW so
+            // the server sees e.g. SW_PARAM_BUNDLE_INCOMPLETE rather
+            // than a generic "build failed".
+            if (JCSystem.getTransactionDepth() > 0) {
+                JCSystem.abortTransaction();
+            }
             Util.arrayFillNonAtomic(bundleBuf, (short) 0, bundleLen, (byte) 0);
             Util.arrayFillNonAtomic(wireBuf, (short) 0, chainOff, (byte) 0);
             chainOff = 0;
-            throw (e instanceof ISOException) ? (ISOException) e
-                                               : new ISOException(Constants.SW_DATA_INVALID);
+            ISOException.throwIt(ioe.getReason());
+        } catch (Exception e) {
+            // Unknown runtime (ArrayIndexOutOfBoundsException etc.) —
+            // emit the per-step SW we latched in failStep so the
+            // server can see which DGI builder tripped.
+            if (JCSystem.getTransactionDepth() > 0) {
+                JCSystem.abortTransaction();
+            }
+            Util.arrayFillNonAtomic(bundleBuf, (short) 0, bundleLen, (byte) 0);
+            Util.arrayFillNonAtomic(wireBuf, (short) 0, chainOff, (byte) 0);
+            chainOff = 0;
+            ISOException.throwIt(failStep != (short) 0 ? failStep : Constants.SW_DATA_INVALID);
         }
 
         // 5. Scrub the plaintext bundle.  Transient clears on deselect
@@ -531,17 +642,66 @@ public class ProvisioningAgentV3 extends Applet {
     // FINAL_STATUS — unchanged from v2; port verbatim
     // -----------------------------------------------------------------
 
+    /**
+     * FINAL_STATUS — confirms to rca that the four DGIs committed
+     * successfully and emits a provenance hash that binds the card's
+     * response to the bytes actually in NVM.
+     *
+     * Response layout (consumed by rca's handleFinalStatus in
+     * services/rca/src/services/session-manager.ts):
+     *
+     *   [0]     status byte            0x01 = OK, anything else → PA_FAILED
+     *   [1..33] provenance hash (32 B) SHA-256(DGI 0101 || 0102 || 8201 || 9201)
+     *   [33]    fido cred len (1 B)    0x00 = no FIDO data (prototype)
+     *
+     * Total response = 34 B.  rca's parser only derefs index >65 when
+     * length > 66, so the absent FIDO cred block is fine.
+     *
+     * The provenance hash uses the DGI payloads in a protocol-stable
+     * order and byte-exact lengths.  If any post-commit POS tamper
+     * flipped a bit in any DGI, this hash would differ from what
+     * activation will later recompute server-side, catching the
+     * tamper before the card transitions to PROVISIONED.  For the
+     * current prototype activation trusts the hash opaquely
+     * (`provenance: expect.any(String)` in tests), but the
+     * server-side verifier lands as part of Phase 8.
+     */
     private void processFinalStatus(APDU apdu) {
         if (state != Constants.STATE_PARAMS_COMMITTED) {
             ISOException.throwIt(Constants.SW_WRONG_STATE);
         }
-        // Emits [status(1) || provenance_hash(32) || fido_cred_len(1) ||
-        //        fido_cred_id(var)] — compute provenance from the four
-        // DGIs and copy to output.
+
+        byte[] buf = apdu.getBuffer();
+        short pos = (short) 0;
+
+        // Status = success.
+        buf[pos++] = (byte) 0x01;
+
+        // Provenance = SHA-256 over the four committed DGI payloads in
+        // fixed order.  update() absorbs the first three; doFinal()
+        // consumes the fourth and writes the 32-byte digest directly
+        // into the APDU response buffer at the provenance offset.
         //
-        // TODO(jc-dev): port v2's processFinalStatus body here.
+        // We borrow EcdhUnwrapper.sha256 rather than allocating our own
+        // MessageDigest — JCOP 5 caps the number of crypto objects
+        // per applet, and having two SHA-256 instances makes INSTALL
+        // fail 0x6F00 during the applet constructor.
+        EcdhUnwrapper.sha256.reset();
+        EcdhUnwrapper.sha256.update(dgi0101Nvm, (short) 0, dgi0101Len);
+        EcdhUnwrapper.sha256.update(dgi0102Nvm, (short) 0, dgi0102Len);
+        EcdhUnwrapper.sha256.update(dgi8201Nvm, (short) 0, dgi8201Len);
+        EcdhUnwrapper.sha256.doFinal(dgi9201Nvm, (short) 0, dgi9201Len, buf, pos);
+        pos = (short) (pos + 32);
+
+        // FIDO cred block placeholder — 0-length until the FIDO2
+        // attestation key flow is wired (deferred per PROTOTYPE_PLAN.md
+        // §7).  Emitting a defined zero length keeps rca's parser on
+        // the happy path and leaves room to grow without a protocol
+        // break.
+        buf[pos++] = (byte) 0x00;
 
         state = Constants.STATE_AWAITING_CONFIRM;
+        apdu.setOutgoingAndSend((short) 0, pos);
     }
 
     // -----------------------------------------------------------------

@@ -194,10 +194,48 @@ public final class Constants {
     public static final short SW_CLA_NOT_SUPPORTED  = (short) 0x6E00;
     public static final short SW_INS_NOT_SUPPORTED  = (short) 0x6D00;
 
-    /** Custom — ECDH unwrap GCM tag verification failed. */
+    /** Custom — ECDH unwrap HMAC tag verification failed. */
     public static final short SW_PARAM_BUNDLE_GCM_FAILED = (short) 0x6A80;
     /** Custom — ParamBundle missing a required tag. */
     public static final short SW_PARAM_BUNDLE_INCOMPLETE = (short) 0x6A81;
     /** Custom — unsupported scheme or CVN. */
     public static final short SW_PARAM_BUNDLE_UNSUPPORTED = (short) 0x6A82;
+
+    // --- Debug SWs emitted by EcdhUnwrapper — distinct per failure
+    //     point so a server-side log diff between server OKM and chip
+    //     OKM can be narrowed to the exact mismatch.  Prod reverts
+    //     these all to SW_PARAM_BUNDLE_GCM_FAILED once the prototype
+    //     is byte-parity proven on real silicon.
+    /** Debug — wire too short for 65+16+16 framing. */
+    public static final short SW_DBG_WIRE_TOO_SHORT   = (short) 0x6AE1;
+    /** Debug — ciphertext length not a positive multiple of 16. */
+    public static final short SW_DBG_CT_BAD_LEN       = (short) 0x6AE2;
+    /** Debug — ECDH generateSecret returned not-32 bytes. */
+    public static final short SW_DBG_SHARED_LEN_BAD   = (short) 0x6AE3;
+    /** Debug — HKDF-derived IV != wire IV (OKM mismatch up to IV). */
+    public static final short SW_DBG_IV_MISMATCH      = (short) 0x6AE4;
+    /** Debug — HMAC tag mismatch (OKM matches through IV but hmacKey differs
+     *  OR ciphertext tampered). */
+    public static final short SW_DBG_HMAC_MISMATCH    = (short) 0x6AE5;
+    /** Debug — AES-CBC doFinal threw (PKCS#5 unpad fail, usually). */
+    public static final short SW_DBG_CBC_UNPAD_FAIL   = (short) 0x6AE6;
+
+    // --- Per-step debug SWs for the post-unwrap NVM-commit path.  If
+    //     any of these escape to the server, the named builder faulted
+    //     (usually buffer overflow from an under-sized work buffer, or
+    //     a missing ParamBundle tag that validateMChipCvn18 let slip).
+    //     Prod folds all of these into SW_DATA_INVALID once the 4 DGI
+    //     builders are byte-parity proven on-chip vs the TS simulator.
+    /** Debug — DgiBuilderMchip.buildDgi0101 threw an uncaught runtime. */
+    public static final short SW_DBG_BUILD_0101_FAIL  = (short) 0x6AF1;
+    /** Debug — DgiBuilderMchip.buildDgi0102 threw an uncaught runtime. */
+    public static final short SW_DBG_BUILD_0102_FAIL  = (short) 0x6AF2;
+    /** Debug — DgiBuilderMchip.buildDgi8201 threw an uncaught runtime. */
+    public static final short SW_DBG_BUILD_8201_FAIL  = (short) 0x6AF3;
+    /** Debug — DgiBuilderMchip.buildDgi9201 threw an uncaught runtime. */
+    public static final short SW_DBG_BUILD_9201_FAIL  = (short) 0x6AF4;
+    /** Debug — persistMetadata failed (should never happen; stubs only). */
+    public static final short SW_DBG_METADATA_FAIL    = (short) 0x6AF5;
+    /** Debug — commitTransaction itself threw (transaction buffer full?). */
+    public static final short SW_DBG_COMMIT_FAIL      = (short) 0x6AF6;
 }

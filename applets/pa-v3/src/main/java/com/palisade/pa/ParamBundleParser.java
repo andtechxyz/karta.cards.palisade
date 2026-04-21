@@ -30,6 +30,40 @@ public final class ParamBundleParser {
     private ParamBundleParser() { /* static only */ }
 
     /**
+     * Required-tag list for MChip CVN 18 validation.  Hoisted out of
+     * {@link #validateMChipCvn18} because inline `byte[] x = {...}`
+     * literals inside a method body allocate a fresh EEPROM array on
+     * every call in JavaCard 3.0.4 (no GC on JCOP 5 by default), which
+     * slowly exhausts persistent memory.  Single static initialiser
+     * here; the array lives for the applet's lifetime.
+     */
+    private static final byte[] MCHIP_CVN18_REQUIRED_TAGS = {
+        Constants.PB_PAN,
+        Constants.PB_PSN,
+        Constants.PB_EXPIRY,
+        Constants.PB_EFFECTIVE,
+        Constants.PB_SERVICE_CODE,
+        Constants.PB_AID,
+        Constants.PB_MK_AC,
+        Constants.PB_MK_SMI,
+        Constants.PB_MK_SMC,
+        Constants.PB_AIP,
+        Constants.PB_AFL,
+        Constants.PB_AUC,
+        Constants.PB_IAC_DEFAULT,
+        Constants.PB_IAC_DENIAL,
+        Constants.PB_IAC_ONLINE,
+        Constants.PB_CVM_LIST,
+        Constants.PB_ICC_RSA_PRIV,
+        Constants.PB_ICC_PK_CERT,
+        Constants.PB_APP_VERSION,
+        Constants.PB_CURRENCY_CODE,
+        Constants.PB_CURRENCY_EXPONENT,
+        Constants.PB_COUNTRY_CODE,
+        Constants.PB_ICVV,
+    };
+
+    /**
      * Find the value of a tag inside a ParamBundle plaintext.
      *
      * @param buf       backing buffer holding the decrypted bundle bytes
@@ -170,34 +204,8 @@ public final class ParamBundleParser {
         // authoritative "what does the applet need to build DGIs" —
         // keep in sync with scheme-mchip.ts's mapMChipToParamBundle
         // required-fields loop.
-        byte[] requiredTags = {
-            Constants.PB_PAN,
-            Constants.PB_PSN,
-            Constants.PB_EXPIRY,
-            Constants.PB_EFFECTIVE,
-            Constants.PB_SERVICE_CODE,
-            Constants.PB_AID,
-            Constants.PB_MK_AC,
-            Constants.PB_MK_SMI,
-            Constants.PB_MK_SMC,
-            Constants.PB_AIP,
-            Constants.PB_AFL,
-            Constants.PB_AUC,
-            Constants.PB_IAC_DEFAULT,
-            Constants.PB_IAC_DENIAL,
-            Constants.PB_IAC_ONLINE,
-            Constants.PB_CVM_LIST,
-            Constants.PB_ICC_RSA_PRIV,
-            Constants.PB_ICC_PK_CERT,
-            Constants.PB_APP_VERSION,
-            Constants.PB_CURRENCY_CODE,
-            Constants.PB_CURRENCY_EXPONENT,
-            Constants.PB_COUNTRY_CODE,
-            Constants.PB_ICVV,
-        };
-
-        for (short i = (short) 0; i < requiredTags.length; i++) {
-            if (!findTag(buf, bundleOff, bundleLen, requiredTags[i], scratch)) {
+        for (short i = (short) 0; i < (short) MCHIP_CVN18_REQUIRED_TAGS.length; i++) {
+            if (!findTag(buf, bundleOff, bundleLen, MCHIP_CVN18_REQUIRED_TAGS[i], scratch)) {
                 return Constants.SW_PARAM_BUNDLE_INCOMPLETE;
             }
         }
