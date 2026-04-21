@@ -32,6 +32,17 @@ on:
       - '.gitattributes'
       - '**/CODEOWNERS'
       - 'test-fixtures/**'
+  # Manual-trigger path for prototype branches (e.g. chip-computed-DGI
+  # rollout).  Lets operators deploy a named ref without merging to main.
+  # The `services` input narrows the matrix to just the services that need
+  # rebuilding — omit or set to '*' to deploy all services.
+  workflow_dispatch:
+    inputs:
+      services:
+        description: 'Comma-separated services to deploy (or "*" for all).  E.g. "rca,data-prep"'
+        required: false
+        default: '*'
+        type: string
 
 concurrency:
   # One deploy at a time per branch — rapid-fire pushes cancel the
@@ -78,6 +89,14 @@ jobs:
     name: Deploy ${{ matrix.service }}
     needs: test
     runs-on: ubuntu-latest
+    # Narrow the matrix for manual dispatches via `inputs.services`.  The
+    # delimiter trick (surround both sides with commas) avoids partial-
+    # substring matches (e.g. "tap" accidentally matching "batch-processor").
+    # Push builds ignore the input and deploy every matrix entry.
+    if: >-
+      github.event_name == 'push' ||
+      inputs.services == '*' ||
+      contains(format(',{0},', inputs.services), format(',{0},', matrix.service))
     strategy:
       fail-fast: false
       matrix:
