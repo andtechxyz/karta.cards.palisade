@@ -17,13 +17,24 @@ export const APDUBuilder = {
   /**
    * PA GENERATE_KEYS command (CLA=80 INS=E0).
    * Data: keyType(01=ECC_P256) || sessionId(16)
+   *
+   * Appended Le=0x00 makes this a case-4 APDU so the card's
+   * `APDU.setOutgoingAndSend()` can emit the 65-byte pubkey response.
+   * Without the trailing Le, JC 3.0.4 rejects the outgoing direction with
+   * SW=6700 (verified on pa-v3 JCOP 5 — pa-v1 happened to work because
+   * its NFC readers usually patch the Le byte in reader-mode; phones
+   * don't).
    */
   generateKeys(sessionIdHex = ''): string {
     let data = Buffer.from([0x01]); // ECC P-256
     if (sessionIdHex) {
       data = Buffer.concat([data, Buffer.from(sessionIdHex, 'hex')]);
     }
-    const apdu = Buffer.concat([Buffer.from([0x80, 0xe0, 0x00, 0x00, data.length]), data]);
+    const apdu = Buffer.concat([
+      Buffer.from([0x80, 0xe0, 0x00, 0x00, data.length]),
+      data,
+      Buffer.from([0x00]), // Le=00 → "up to 256 bytes of response"
+    ]);
     return apdu.toString('hex').toUpperCase();
   },
 

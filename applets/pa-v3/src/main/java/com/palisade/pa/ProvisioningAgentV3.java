@@ -6,6 +6,10 @@ import javacard.framework.ISO7816;
 import javacard.framework.ISOException;
 import javacard.framework.JCSystem;
 import javacard.framework.Util;
+import javacard.security.ECPrivateKey;
+import javacard.security.ECPublicKey;
+import javacard.security.KeyBuilder;
+import javacard.security.KeyPair;
 
 /**
  * Palisade Provisioning Agent v3 — chip-computed-DGI prototype.
@@ -122,6 +126,54 @@ public class ProvisioningAgentV3 extends Applet {
     private short[] scratch;
 
     // -----------------------------------------------------------------
+    // ECC P-256 keypair (generated in GENERATE_KEYS, used for ECDH
+    // during TRANSFER_PARAMS).  Verbatim curve parameters from
+    // palisade-pa's ProvisioningAgent.java so the key agreement math
+    // matches the server's wrap side.
+    // -----------------------------------------------------------------
+
+    private static final byte[] P256_P = {
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF, (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x01,
+        (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00, (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,
+        (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00, (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF, (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF
+    };
+    private static final byte[] P256_A = {
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF, (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x01,
+        (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00, (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,
+        (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00, (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF, (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFC
+    };
+    private static final byte[] P256_B = {
+        (byte)0x5A,(byte)0xC6,(byte)0x35,(byte)0xD8, (byte)0xAA,(byte)0x3A,(byte)0x93,(byte)0xE7,
+        (byte)0xB3,(byte)0xEB,(byte)0xBD,(byte)0x55, (byte)0x76,(byte)0x98,(byte)0x86,(byte)0xBC,
+        (byte)0x65,(byte)0x1D,(byte)0x06,(byte)0xB0, (byte)0xCC,(byte)0x53,(byte)0xB0,(byte)0xF6,
+        (byte)0x3B,(byte)0xCE,(byte)0x3C,(byte)0x3E, (byte)0x27,(byte)0xD2,(byte)0x60,(byte)0x4B
+    };
+    private static final byte[] P256_G = {
+        (byte)0x04,
+        (byte)0x6B,(byte)0x17,(byte)0xD1,(byte)0xF2, (byte)0xE1,(byte)0x2C,(byte)0x42,(byte)0x47,
+        (byte)0xF8,(byte)0xBC,(byte)0xE6,(byte)0xE5, (byte)0x63,(byte)0xA4,(byte)0x40,(byte)0xF2,
+        (byte)0x77,(byte)0x03,(byte)0x7D,(byte)0x81, (byte)0x2D,(byte)0xEB,(byte)0x33,(byte)0xA0,
+        (byte)0xF4,(byte)0xA1,(byte)0x39,(byte)0x45, (byte)0xD8,(byte)0x98,(byte)0xC2,(byte)0x96,
+        (byte)0x4F,(byte)0xE3,(byte)0x42,(byte)0xE2, (byte)0xFE,(byte)0x1A,(byte)0x7F,(byte)0x9B,
+        (byte)0x8E,(byte)0xE7,(byte)0xEB,(byte)0x4A, (byte)0x7C,(byte)0x0F,(byte)0x9E,(byte)0x16,
+        (byte)0x2B,(byte)0xCE,(byte)0x33,(byte)0x57, (byte)0x6B,(byte)0x31,(byte)0x5E,(byte)0xCE,
+        (byte)0xCB,(byte)0xB6,(byte)0x40,(byte)0x68, (byte)0x37,(byte)0xBF,(byte)0x51,(byte)0xF5
+    };
+    private static final byte[] P256_N = {
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF, (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF, (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xBC,(byte)0xE6,(byte)0xFA,(byte)0xAD, (byte)0xA7,(byte)0x17,(byte)0x9E,(byte)0x84,
+        (byte)0xF3,(byte)0xB9,(byte)0xCA,(byte)0xC2, (byte)0xFC,(byte)0x63,(byte)0x25,(byte)0x51
+    };
+
+    private final KeyPair iccKeyPair;
+
+    /** Scratch for exporting the private scalar during GENERATE_KEYS. */
+    private byte[] privScratch;
+
+    // -----------------------------------------------------------------
     // Constructor + install
     // -----------------------------------------------------------------
 
@@ -142,10 +194,44 @@ public class ProvisioningAgentV3 extends Applet {
         dgiWorkBuf = JCSystem.makeTransientByteArray((short) 256, JCSystem.CLEAR_ON_DESELECT);
         scratch    = JCSystem.makeTransientShortArray((short) 2, JCSystem.CLEAR_ON_DESELECT);
 
+        // 32-byte scratch for exporting the EC private scalar inside
+        // GENERATE_KEYS — transient so the secret never survives deselect.
+        privScratch = JCSystem.makeTransientByteArray((short) 32, JCSystem.CLEAR_ON_DESELECT);
+
+        // P-256 keypair — curve params installed once here; keypair regen
+        // happens every GENERATE_KEYS call.
+        iccKeyPair = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);
+        initP256Params((ECPublicKey) iccKeyPair.getPublic());
+        initP256Params((ECPrivateKey) iccKeyPair.getPrivate());
+
         state = Constants.STATE_IDLE;
         register();
 
         EcdhUnwrapper.initOnce();
+    }
+
+    // -----------------------------------------------------------------
+    // P-256 curve parameter injection helpers.  ALG_EC_FP keys ship
+    // uninitialised; the applet must set the field prime, a, b, base
+    // point, order, and cofactor before genKeyPair() works.
+    // -----------------------------------------------------------------
+
+    private static void initP256Params(ECPublicKey key) {
+        key.setFieldFP(P256_P, (short) 0, (short) P256_P.length);
+        key.setA(P256_A, (short) 0, (short) P256_A.length);
+        key.setB(P256_B, (short) 0, (short) P256_B.length);
+        key.setG(P256_G, (short) 0, (short) P256_G.length);
+        key.setR(P256_N, (short) 0, (short) P256_N.length);
+        key.setK((short) 1);
+    }
+
+    private static void initP256Params(ECPrivateKey key) {
+        key.setFieldFP(P256_P, (short) 0, (short) P256_P.length);
+        key.setA(P256_A, (short) 0, (short) P256_A.length);
+        key.setB(P256_B, (short) 0, (short) P256_B.length);
+        key.setG(P256_G, (short) 0, (short) P256_G.length);
+        key.setR(P256_N, (short) 0, (short) P256_N.length);
+        key.setK((short) 1);
     }
 
     public static void install(byte[] bArray, short bOffset, byte bLength) {
@@ -219,22 +305,35 @@ public class ProvisioningAgentV3 extends Applet {
             sessionId, (short) 0, sessionIdLen
         );
 
-        // Generate the ECC keypair.  EcdhUnwrapper holds the static
-        // chipPrivKey; we call its key-gen path here.  Returns the
-        // 65-byte uncompressed pubkey in the APDU response.
-        //
-        // (Actual keypair generation code elided — use
-        // KeyPair.ALG_EC_FP and KeyPair.genKeyPair() on JCOP 5, same
-        // as palisade-pa's existing implementation.  Ref:
-        // palisade-pa/src/com/palisade/pa/ProvisioningAgent.java
-        // processGenerateKeys().)
-        //
-        // Also append attestation bytes (ECDSA sig over pubkey || CPLC
-        // by the factory attestation key) + CPLC, same as v2.
+        // Generate the ECC P-256 keypair.  genKeyPair() populates both
+        // public and private halves of iccKeyPair using the curve params
+        // we installed in the constructor.
+        iccKeyPair.genKeyPair();
 
-        // TODO(jc-dev): port v2's GENERATE_KEYS body verbatim here.
+        ECPrivateKey priv = (ECPrivateKey) iccKeyPair.getPrivate();
+        ECPublicKey  pub  = (ECPublicKey)  iccKeyPair.getPublic();
+
+        // Hand the freshly-generated scalar to EcdhUnwrapper so the
+        // subsequent TRANSFER_PARAMS can drive ECDH against the same
+        // keypair.  Scrub the scratch immediately after so the plaintext
+        // scalar never lives longer than this APDU.
+        short sLen = priv.getS(privScratch, (short) 0);
+        try {
+            EcdhUnwrapper.setChipPriv(privScratch, (short) 0, sLen);
+        } finally {
+            Util.arrayFillNonAtomic(privScratch, (short) 0, (short) privScratch.length, (byte) 0);
+        }
+
+        // Write the 65-byte uncompressed public key (0x04 || X(32) || Y(32))
+        // into the APDU response buffer.  TODO(jc-dev): once the factory
+        // attestation key is provisioned at install time, append the
+        // signature + CPLC trailer here so rca's AttestationVerifier has
+        // real material to verify in strict mode.  Until then permissive
+        // mode accepts pubkey-only responses, which is what this emits.
+        short wLen = pub.getW(buf, (short) 0);
 
         state = Constants.STATE_KEYGEN_COMPLETE;
+        apdu.setOutgoingAndSend((short) 0, wLen);
     }
 
     // -----------------------------------------------------------------

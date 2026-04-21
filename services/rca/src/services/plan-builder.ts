@@ -18,7 +18,7 @@
  * server-known before the NFC exchange begins:
  *
  *   - SELECT PA: constant (AID A00000006250414C)
- *   - GENERATE_KEYS: constant (80E000000101 — no session-ID payload)
+ *   - GENERATE_KEYS: constant (80E00000010100 — no session-ID payload, case-4)
  *   - TRANSFER_SAD: computed from PlanContext (chipProfile DGI/tag, the
  *     IssuerProfile's bankId/progId/scheme/postProvisionUrl, plus the
  *     plaintext SAD bytes decrypted from SadRecord.sadEncrypted).  Does
@@ -143,9 +143,13 @@ const GET_CHALLENGE_APDU = '80EC000010';
 /**
  * GENERATE_KEYS with a single-byte payload 0x01 ("ECC P-256 keypair").
  * Passing a session-ID payload appends bytes the PA discards (or worse —
- * returns 6D00).  Matches the exact bytes in Palisade's SSD e2e trace.
+ * returns 6D00).  Trailing 00 is Le for the 65-byte pubkey response;
+ * pa-v3 rejects case-3 form (no Le) with SW=6700 when
+ * setOutgoingAndSend tries to emit the pubkey.  pa-v1 typically got
+ * the Le added by its reader, but phones don't, so we send case-4
+ * explicitly.
  */
-const GENERATE_KEYS_APDU = '80E000000101';
+const GENERATE_KEYS_APDU = '80E00000010100';
 
 /** FINAL_STATUS — zero-data case-2-style query. */
 const FINAL_STATUS_APDU = '80E6000000';

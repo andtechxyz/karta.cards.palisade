@@ -216,7 +216,7 @@ describe('handleRelayConnection', () => {
         version: 1,
         steps: [
           { i: 0, apdu: '00A4040008A00000006250414C', phase: 'select_pa', progress: 0.05, expectSw: '9000' },
-          { i: 1, apdu: '80E000000101', phase: 'key_generation', progress: 0.25, expectSw: '9000' },
+          { i: 1, apdu: '80E00000010100', phase: 'key_generation', progress: 0.25, expectSw: '9000' },
         ],
       };
       mockBuildPlanForSession.mockResolvedValue(fakePlan);

@@ -56,10 +56,12 @@ describe('buildProvisioningPlan', () => {
     expect(plan.steps[0].apdu).toBe('00A4040008A00000006250414C');
   });
 
-  it('GENERATE_KEYS step is the exact 6-byte Palisade SSD e2e trace APDU', () => {
+  it('GENERATE_KEYS step is the case-4 APDU (7 bytes: header + Lc=1 + body + Le=0)', () => {
     const plan = buildProvisioningPlan(makeCtx());
-    // 80 E0 00 00 Lc=01 P1=01 — no session-ID payload, the PA discards it.
-    expect(plan.steps[1].apdu).toBe('80E000000101');
+    // 80 E0 00 00 Lc=01 body=01 Le=00 — case-4.  Le is required so pa-v3
+    // can call setOutgoingAndSend for the 65-byte pubkey response;
+    // without it the chip throws SW=6700 (wrong length).
+    expect(plan.steps[1].apdu).toBe('80E00000010100');
   });
 
   it('FINAL_STATUS + CONFIRM steps are zero-data case-2 APDUs', () => {
