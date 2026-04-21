@@ -401,9 +401,15 @@ export function parseWireBundle(wire: Buffer): WrappedParamBundle {
 export function generateTestKeypair(): { pubUncompressed: Buffer; priv: Buffer } {
   const ecdh = createECDH(CURVE);
   ecdh.generateKeys();
+  // `ecdh.getPrivateKey()` returns the scalar as the minimal-length
+  // big-endian buffer — if the leading byte(s) of d happen to be zero
+  // (probability ~ 1 / 256 per leading byte), the buffer will be < 32 B.
+  // Our contract + the P-256 scalar width are fixed at 32 B, so pad.
+  const priv = ecdh.getPrivateKey();
+  const priv32 = priv.length === 32 ? priv : Buffer.concat([Buffer.alloc(32 - priv.length, 0), priv]);
   return {
     pubUncompressed: ecdh.getPublicKey(null, 'uncompressed'),
-    priv: ecdh.getPrivateKey(),
+    priv: priv32,
   };
 }
 
