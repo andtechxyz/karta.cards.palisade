@@ -44,16 +44,25 @@ vi.mock('@aws-sdk/client-kms', () => ({
   DecryptCommand: vi.fn(),
 }));
 
-// Mock the DataPrepService to avoid real AWS calls
-vi.mock('../../services/data-prep/src/services/data-prep.service.js', () => ({
-  DataPrepService: vi.fn().mockImplementation(() => ({
-    prepareCard: vi.fn().mockResolvedValue({
-      proxyCardId: 'pxy_test123',
-      sadRecordId: 'sad-rec-1',
-      status: 'READY',
-    }),
-  })),
-}));
+// Mock the DataPrepService to avoid real AWS calls.  The router
+// stubs both prepareCard (legacy TRANSFER_SAD) and prepare (the
+// dispatcher introduced in commit 948ae0c that routes PARAM_BUNDLE
+// chip profiles to prepareParamBundle).  Both return the same
+// legacy shape here — the integration test only exercises the
+// HTTP-level contract, not the internal routing decision.
+vi.mock('../../services/data-prep/src/services/data-prep.service.js', () => {
+  const stub = {
+    proxyCardId: 'pxy_test123',
+    sadRecordId: 'sad-rec-1',
+    status: 'READY',
+  };
+  return {
+    DataPrepService: vi.fn().mockImplementation(() => ({
+      prepareCard: vi.fn().mockResolvedValue(stub),
+      prepare: vi.fn().mockResolvedValue(stub),
+    })),
+  };
+});
 
 // Mock serve-frontend and rate limiters
 vi.mock('@palisade/core', async (importOriginal) => {
