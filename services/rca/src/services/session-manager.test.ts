@@ -254,22 +254,49 @@ describe('SessionManager', () => {
   // -------------------------------------------------------------------------
 
   describe('handleMessage — pa_fci', () => {
-    it('returns GENERATE_KEYS directly (no SCP11 step) and advances phase to KEYGEN', async () => {
+    it('returns WIPE APDU first (idempotency guard) and advances phase to WIPING', async () => {
+      // Post-commit 0cc7c0a the classical path inserts WIPE between
+      // SELECT_PA and GENERATE_KEYS to close the re-perso-after-commit
+      // loop.  handlePaFci now returns the WIPE APDU and transitions
+      // to phase='WIPING'; GENERATE_KEYS is emitted by the follow-up
+      // handleWipeResponse when the chip ack lands.
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
-        makeSession('KEYGEN'),
+        makeSession('WIPING'),
       );
 
       const responses = await mgr.handleMessage('session_01', { type: 'pa_fci' });
 
       expect(responses).toHaveLength(1);
       expect(responses[0].type).toBe('apdu');
+      expect(responses[0].phase).toBe('wipe_applet');
+      // CLA=80 INS=EA P1=00 P2=00 Le=00 — the same APDU shape as the
+      // plan-builder's WIPE_APDU constant.
+      expect(responses[0].hex).toBe('80EA000000');
+      expect(prisma.provisioningSession.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'session_01' },
+          data: { phase: 'WIPING' },
+        }),
+      );
+    });
+  });
+
+  describe('handleMessage — response in WIPING phase', () => {
+    it('returns GENERATE_KEYS APDU after the chip acks WIPE with 9000', async () => {
+      (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSession('WIPING'),
+      );
+      (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSession('KEYGEN'),
+      );
+
+      const msg: WSMessage = { type: 'response', hex: '', sw: '9000' };
+      const responses = await mgr.handleMessage('session_01', msg);
+
+      expect(responses).toHaveLength(1);
+      expect(responses[0].type).toBe('apdu');
       expect(responses[0].phase).toBe('key_generation');
       // GENERATE_KEYS body: 01 (key-type marker) || session_01 (UTF-8).
-      // Trailing Le=0x41 is a debug variant; chip accepts 0x00/0x41 equally.
-      // The session ID bytes inside the APDU MUST match the HKDF `info`
-      // passed to wrapParamBundle at TRANSFER_PARAMS time; pa-v3
-      // persists these at GENERATE_KEYS and re-uses them in
-      // EcdhUnwrapper.  See handlePaFci for the encoding.
       //   80 E0 00 00 | 0B | 01 73 65 73 73 69 6F 6E 5F 30 31 | 41
       //               Lc       'session_01' utf8           Le
       expect(responses[0].hex).toBe('80E000000B0173657373696F6E5F303141');

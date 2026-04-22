@@ -940,11 +940,55 @@ export class SessionManager {
    * app the cardholder is logged into).
    */
   private async handlePaFci(sessionId: string): Promise<WSMessage[]> {
+    // Insert a WIPE step before GENERATE_KEYS so re-provisioning a
+    // previously-committed chip succeeds.  Without this, a chip left
+    // in STATE_COMMITTED by a prior successful tap returns
+    // SW_WRONG_STATE=0x6985 on GENERATE_KEYS (ProvisioningAgentV3.java:
+    // 373).  WIPE is state-agnostic (no guards), unauthenticated
+    // (CLA=80, no SCP03 required), and preserves attestation material
+    // loaded via STORE_ATTESTATION — only personalisation buffers
+    // (dgi0101/0102/8201/9201, sessionId, state) get zeroed.
+    //
+    // Mirrors the plan-builder WIPE step added in 0cc7c0a.  Classical
+    // and plan mode now have matching idempotency semantics.
+    await prisma.provisioningSession.update({
+      where: { id: sessionId },
+      data: { phase: 'WIPING' },
+    });
+
+    return [{
+      type: 'apdu',
+      hex: '80EA000000',
+      phase: 'wipe_applet',
+      progress: 0.08,
+    }];
+  }
+
+  /**
+   * WIPING-phase handler — chip returned 9000 to our WIPE APDU,
+   * meaning processWipe() ran and the applet is now in STATE_IDLE.
+   * Transition to KEYGEN and emit the GENERATE_KEYS APDU (body
+   * previously emitted directly from handlePaFci).
+   */
+  private async handleWipeResponse(sessionId: string): Promise<WSMessage[]> {
     await prisma.provisioningSession.update({
       where: { id: sessionId },
       data: { phase: 'KEYGEN' },
     });
+    console.log(
+      `[rca] wipe applied (classical): session=${redactSid(sessionId)} — ` +
+        `applet STATE_IDLE, attestation material preserved`,
+    );
+    return this.emitKeygenApdu(sessionId);
+  }
 
+  /**
+   * Build the GENERATE_KEYS APDU for classical mode.  Extracted from
+   * the old inline block in handlePaFci so both handlePaFci and
+   * handleWipeResponse can share the construction (the former kept
+   * it direct, the latter calls it post-WIPE).
+   */
+  private emitKeygenApdu(sessionId: string): WSMessage[] {
     // GENERATE_KEYS for pa-v3.  Body layout:
     //
     //   byte 0          0x01 = "ECC P-256 keypair please"
@@ -1061,6 +1105,11 @@ export class SessionManager {
     if (!session) return [];
 
     switch (session.phase) {
+      case 'WIPING':
+        // Chip returned 9000 to WIPE — transition to KEYGEN and send
+        // GENERATE_KEYS.  See handlePaFci / handleWipeResponse for the
+        // rationale (idempotency guard for re-perso'd chips).
+        return this.handleWipeResponse(sessionId);
       case 'KEYGEN':
         return this.handleKeygenResponse(sessionId, normalizedMsg);
       case 'SAD_TRANSFER':
