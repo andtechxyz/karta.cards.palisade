@@ -2,7 +2,8 @@ import { Router } from 'express';
 import { createHash, randomUUID } from 'node:crypto';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { prisma } from '@palisade/db';
-import { badRequest, notFound } from '@palisade/core';
+import { badRequest, notFound, forbidden } from '@palisade/core';
+import { userCanAccessProgram } from '@palisade/cognito-auth';
 import { getAdminConfig } from '../env.js';
 
 // ---------------------------------------------------------------------------
@@ -20,6 +21,14 @@ const MAX_BATCH_SIZE = 500 * 1024 * 1024; // 500 MB
 
 // GET /api/admin/programs/:programId/embossing-batches
 router.get('/:programId/embossing-batches', async (req, res) => {
+  // Stage I.2 — program-scoped RBAC.  EmbossingBatch.programId is required,
+  // and the programId is in the path, so the gate is direct.
+  if (!userCanAccessProgram(req.cognitoUser!, req.params.programId)) {
+    throw forbidden(
+      'forbidden_program_scope',
+      `You are not scoped to program ${req.params.programId}`,
+    );
+  }
   const batches = await prisma.embossingBatch.findMany({
     where: { programId: req.params.programId },
     orderBy: { uploadedAt: 'desc' },
@@ -33,6 +42,12 @@ router.get('/:programId/embossing-batches', async (req, res) => {
 // Multipart: file, templateId
 router.post('/:programId/embossing-batches', async (req, res) => {
   const { programId } = req.params;
+  if (!userCanAccessProgram(req.cognitoUser!, programId)) {
+    throw forbidden(
+      'forbidden_program_scope',
+      `You are not scoped to program ${programId}`,
+    );
+  }
   const program = await prisma.program.findUnique({ where: { id: programId } });
   if (!program) throw notFound('program_not_found', 'Program not found');
 

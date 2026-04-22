@@ -1,7 +1,8 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { prisma } from '@palisade/db';
-import { validateBody, notFound, conflict } from '@palisade/core';
+import { validateBody, notFound, conflict, forbidden } from '@palisade/core';
+import { programFilterForUser, userCanAccessProgram } from '@palisade/cognito-auth';
 
 // CRUD for IssuerProfile.  An IssuerProfile ties a Program to its chip
 // applet behaviour (ChipProfile), its AWS Payment Cryptography key ARNs
@@ -155,9 +156,17 @@ function stripForList<T extends Record<string, unknown>>(profile: T): T {
 // Routes
 // ---------------------------------------------------------------------------
 
-router.get('/', async (_req, res) => {
+router.get('/', async (req, res) => {
+  // Stage I.2 — admin sees all; scoped operators see only their programs'.
+  const programFilter = programFilterForUser(req.cognitoUser!);
   const profiles = await prisma.issuerProfile.findMany({
     orderBy: { createdAt: 'desc' },
+    where:
+      programFilter === null
+        ? undefined
+        : programFilter.length === 0
+          ? { programId: '__no_programs__' }
+          : { programId: { in: programFilter } },
     include: {
       program: { select: { id: true, name: true } },
       chipProfile: { select: { id: true, name: true, scheme: true } },
@@ -177,10 +186,26 @@ router.get('/:id', async (req, res) => {
   if (!profile) {
     throw notFound('issuer_profile_not_found', `IssuerProfile ${req.params.id} not found`);
   }
+  if (!userCanAccessProgram(req.cognitoUser!, profile.programId)) {
+    throw forbidden(
+      'forbidden_program_scope',
+      `IssuerProfile ${req.params.id} belongs to program ${profile.programId} which you are not scoped to`,
+    );
+  }
   res.json(profile);
 });
 
 router.post('/', validateBody(createSchema), async (req, res) => {
+  // Stage I.2 — creating an IssuerProfile binds it to a programId; the
+  // operator must be scoped to that program.  Admin bypasses.
+  if (typeof req.body.programId === 'string') {
+    if (!userCanAccessProgram(req.cognitoUser!, req.body.programId)) {
+      throw forbidden(
+        'forbidden_program_scope',
+        `You are not scoped to program ${req.body.programId}`,
+      );
+    }
+  }
   try {
     const profile = await prisma.issuerProfile.create({
       data: req.body,
@@ -211,6 +236,22 @@ router.post('/', validateBody(createSchema), async (req, res) => {
 });
 
 router.patch('/:id', validateBody(patchSchema), async (req, res) => {
+  // Stage I.2 — must be scoped to the IssuerProfile's CURRENT programId
+  // before any field-level edit.  programId itself isn't in patchSchema,
+  // so we only need the one access check.
+  const existing = await prisma.issuerProfile.findUnique({
+    where: { id: req.params.id },
+    select: { programId: true },
+  });
+  if (!existing) {
+    throw notFound('issuer_profile_not_found', `IssuerProfile ${req.params.id} not found`);
+  }
+  if (!userCanAccessProgram(req.cognitoUser!, existing.programId)) {
+    throw forbidden(
+      'forbidden_program_scope',
+      `IssuerProfile ${req.params.id} belongs to program ${existing.programId} which you are not scoped to`,
+    );
+  }
   try {
     const profile = await prisma.issuerProfile.update({
       where: { id: req.params.id },

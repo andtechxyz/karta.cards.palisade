@@ -27,6 +27,12 @@ vi.mock('@palisade/cognito-auth', () => ({
       next();
     };
   }),
+  // Stage I.2 helpers — pass-through (admin) defaults so existing
+  // tests don't have to know about RBAC.  Tests that need to assert
+  // scope-deny behaviour set req.cognitoUser via their own middleware.
+  programFilterForUser: () => null,
+  userCanAccessProgram: () => true,
+  isAdminUser: () => true,
 }));
 
 import { prisma } from '@palisade/db';
@@ -318,6 +324,7 @@ describe('POST /api/chip-profiles (multipart upload)', () => {
 
 describe('PATCH /api/chip-profiles/:id', () => {
   it('updates fields in place', async () => {
+    findUnique().mockResolvedValueOnce({ programId: null });  // RBAC pre-check
     update().mockResolvedValue({ id: 'cp_1', name: 'Renamed' });
     const app = buildApp();
     const { status, body } = await inject(app, 'PATCH', '/api/chip-profiles/cp_1', {

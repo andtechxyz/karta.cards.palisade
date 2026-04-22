@@ -2,7 +2,8 @@ import { Router } from 'express';
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { prisma } from '@palisade/db';
-import { validateBody, badRequest, notFound } from '@palisade/core';
+import { validateBody, badRequest, notFound, forbidden } from '@palisade/core';
+import { programFilterForUser, userCanAccessProgram, isAdminUser } from '@palisade/cognito-auth';
 
 // CRUD for ChipProfile.  A ChipProfile describes how one scheme/vendor
 // chip applet (Mastercard M/Chip Advance, Visa VSDC, …) lays out its
@@ -130,11 +131,33 @@ function canonicaliseDgi(entry: Record<string, unknown>): Record<string, unknown
 // ---------------------------------------------------------------------------
 
 router.get('/', async (req, res) => {
-  const programId = typeof req.query.programId === 'string' ? req.query.programId : undefined;
+  // Stage I.2 — admin sees all; scoped operators see (a) their programs'
+  // chip profiles and (b) global ones (programId=null) which act as
+  // shared templates.  An explicit ?programId= query narrows further;
+  // it must itself be in the operator's scope.
+  const queryProgramId = typeof req.query.programId === 'string' ? req.query.programId : undefined;
+  if (queryProgramId !== undefined && !userCanAccessProgram(req.cognitoUser!, queryProgramId)) {
+    throw forbidden(
+      'forbidden_program_scope',
+      `You are not scoped to program ${queryProgramId}`,
+    );
+  }
+  const programFilter = programFilterForUser(req.cognitoUser!);
+  let where: Prisma.ChipProfileWhereInput | undefined;
+  if (queryProgramId) {
+    // Explicit narrow: that program's profiles + globals.
+    where = { OR: [{ programId: queryProgramId }, { programId: null }] };
+  } else if (programFilter !== null) {
+    // Scoped: their programs' profiles + globals.
+    where = {
+      OR: [
+        ...(programFilter.length > 0 ? [{ programId: { in: programFilter } }] : []),
+        { programId: null },
+      ],
+    };
+  } // else admin: undefined where → no filter
   const profiles = await prisma.chipProfile.findMany({
-    where: programId
-      ? { OR: [{ programId }, { programId: null }] }
-      : undefined,
+    where,
     orderBy: { createdAt: 'desc' },
     include: { program: { select: { id: true, name: true } } },
   });
@@ -148,6 +171,14 @@ router.get('/:id', async (req, res) => {
   });
   if (!profile) {
     throw notFound('chip_profile_not_found', `ChipProfile ${req.params.id} not found`);
+  }
+  // Stage I.2 — global profiles (programId=null) are readable by anyone
+  // (they're shared templates).  Program-scoped ones gate on access.
+  if (profile.programId !== null && !userCanAccessProgram(req.cognitoUser!, profile.programId)) {
+    throw forbidden(
+      'forbidden_program_scope',
+      `ChipProfile ${req.params.id} belongs to program ${profile.programId} which you are not scoped to`,
+    );
   }
   res.json(profile);
 });
@@ -170,6 +201,23 @@ router.post('/', async (req, res) => {
     payload = req.body;
   }
   const parsed = createSchema.parse(payload);
+  // Stage I.2 — creating a chip profile under a specific program
+  // requires program scope.  Creating a GLOBAL chip profile
+  // (programId=null/undefined) requires admin — global templates are
+  // a platform-wide concern, not a per-program concern.
+  if (typeof parsed.programId === 'string') {
+    if (!userCanAccessProgram(req.cognitoUser!, parsed.programId)) {
+      throw forbidden(
+        'forbidden_program_scope',
+        `You are not scoped to program ${parsed.programId}`,
+      );
+    }
+  } else if (!isAdminUser(req.cognitoUser!)) {
+    throw forbidden(
+      'forbidden_global_chip_profile',
+      'Creating a global chip profile (no programId) requires admin group membership',
+    );
+  }
   // Drop a null programId so Prisma treats it as "no relation" rather
   // than rejecting `null` on the CreateInput.  Use the Unchecked variant
   // so programId can live on the payload directly (checked mode demands
@@ -200,6 +248,35 @@ router.post('/', async (req, res) => {
 });
 
 router.patch('/:id', validateBody(patchSchema), async (req, res) => {
+  // Stage I.2 — must be scoped to the chip profile's CURRENT programId
+  // (or admin for globals).  If the patch moves the chip profile to a
+  // different program, also gate on the new program.
+  const existing = await prisma.chipProfile.findUnique({
+    where: { id: req.params.id },
+    select: { programId: true },
+  });
+  if (!existing) {
+    throw notFound('chip_profile_not_found', `ChipProfile ${req.params.id} not found`);
+  }
+  if (existing.programId === null) {
+    if (!isAdminUser(req.cognitoUser!)) {
+      throw forbidden(
+        'forbidden_global_chip_profile',
+        'Editing a global chip profile requires admin group membership',
+      );
+    }
+  } else if (!userCanAccessProgram(req.cognitoUser!, existing.programId)) {
+    throw forbidden(
+      'forbidden_program_scope',
+      `ChipProfile ${req.params.id} belongs to program ${existing.programId} which you are not scoped to`,
+    );
+  }
+  if (typeof req.body.programId === 'string' && !userCanAccessProgram(req.cognitoUser!, req.body.programId)) {
+    throw forbidden(
+      'forbidden_program_scope',
+      `You are not scoped to program ${req.body.programId}`,
+    );
+  }
   const data = { ...req.body };
   if (Array.isArray(data.dgiDefinitions)) {
     data.dgiDefinitions = data.dgiDefinitions.map((d: Record<string, unknown>) =>

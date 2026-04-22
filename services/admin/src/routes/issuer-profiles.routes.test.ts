@@ -31,6 +31,11 @@ vi.mock('@palisade/cognito-auth', () => ({
       next();
     };
   }),
+  // Stage I.2 helpers — pass-through (admin) defaults so existing
+  // tests aren't required to know about RBAC.
+  programFilterForUser: () => null,
+  userCanAccessProgram: () => true,
+  isAdminUser: () => true,
 }));
 
 import { prisma } from '@palisade/db';
@@ -318,6 +323,7 @@ describe('POST /api/issuer-profiles', () => {
 
 describe('PATCH /api/issuer-profiles/:id', () => {
   it('updates mutable fields and returns the full record', async () => {
+    findUnique().mockResolvedValueOnce({ programId: 'prog_x' });  // RBAC pre-check
     update().mockResolvedValue({ id: 'ip_1', aid: 'A0000000041010', appLabel: 'NEW LABEL' });
     const app = buildApp();
     const { status, body } = await inject(app, 'PATCH', '/api/issuer-profiles/ip_1', {
@@ -329,7 +335,7 @@ describe('PATCH /api/issuer-profiles/:id', () => {
   });
 
   it('404 when the profile does not exist', async () => {
-    update().mockRejectedValue({ code: 'P2025' });
+    findUnique().mockResolvedValueOnce(null);  // RBAC pre-check finds nothing
     const app = buildApp();
     const { status, body } = await inject(app, 'PATCH', '/api/issuer-profiles/ip_missing', {
       aid: 'A0000000041010',
@@ -355,6 +361,7 @@ describe('PATCH /api/issuer-profiles/:id', () => {
   });
 
   it('allows pasting a new key ARN', async () => {
+    findUnique().mockResolvedValueOnce({ programId: 'prog_x' });
     update().mockResolvedValue({ id: 'ip_1', tmkKeyArn: 'arn:aws:pc::999:key/new' });
     const app = buildApp();
     const { status, body } = await inject(app, 'PATCH', '/api/issuer-profiles/ip_1', {
@@ -405,6 +412,7 @@ describe('bankId / progId / postProvisionUrl', () => {
     );
 
     // --- patch them back ---
+    findUnique().mockResolvedValueOnce({ programId: 'prog_new' });  // RBAC pre-check
     update().mockResolvedValue({
       ...created,
       bankId: 0x44556677,
@@ -423,6 +431,7 @@ describe('bankId / progId / postProvisionUrl', () => {
   });
 
   it('accepts null to clear any of the three (legacy rows)', async () => {
+    findUnique().mockResolvedValueOnce({ programId: 'prog_x' });  // RBAC pre-check
     update().mockResolvedValue({ id: 'ip_1', bankId: null, progId: null, postProvisionUrl: null });
     const app = buildApp();
     const { status } = await inject(app, 'PATCH', '/api/issuer-profiles/ip_1', {

@@ -1,9 +1,30 @@
 import { Router } from 'express';
 import { S3Client, PutObjectCommand, DeleteObjectsCommand, ListObjectsV2Command, CopyObjectCommand } from '@aws-sdk/client-s3';
+import type { Request, Response, NextFunction } from 'express';
 import AdmZip from 'adm-zip';
 import { prisma } from '@palisade/db';
-import { badRequest, notFound } from '@palisade/core';
+import { badRequest, notFound, forbidden } from '@palisade/core';
+import { userCanAccessProgram } from '@palisade/cognito-auth';
 import { getAdminConfig } from '../env.js';
+
+// Stage I.2 — program-scoped RBAC.  Every microsites route is nested
+// under :programId, so a single param-extraction middleware does the
+// gate.  Mounted as `router.param('programId', ...)`; runs once per
+// request before the matching handler.
+function requireProgramAccess(
+  req: Request,
+  _res: Response,
+  next: NextFunction,
+  programId: string,
+): void {
+  if (!userCanAccessProgram(req.cognitoUser!, programId)) {
+    throw forbidden(
+      'forbidden_program_scope',
+      `You are not scoped to program ${programId}`,
+    );
+  }
+  next();
+}
 
 // ---------------------------------------------------------------------------
 // Microsites — per-program static websites served from S3+CloudFront.
@@ -20,6 +41,7 @@ import { getAdminConfig } from '../env.js';
 // ---------------------------------------------------------------------------
 
 const router: Router = Router();
+router.param('programId', requireProgramAccess);
 const s3 = new S3Client({ region: 'ap-southeast-2' });
 
 // Maximum upload size — 100 MB is plenty for a static site; any bigger is
