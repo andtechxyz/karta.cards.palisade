@@ -1022,9 +1022,10 @@ export class SessionManager {
     ]);
     const keygenHex = keygenApduBuf.toString('hex').toUpperCase();
 
-    // Temporary prototype-debug log so we can confirm on the wire what
-    // bytes rca is handing to the mobile.  Remove once pa-v3 e2e lands.
-    console.log(`[rca][debug] classical keygen APDU → session=${sessionId} hex=${keygenHex} (len=${keygenApduBuf.length}B)`);
+    // Prototype-debug log reverted 2026-04-22 now that pa-v3 is e2e
+    // verified against a physical JCOP 5 card (last successful
+    // provisioning tap: 2026-04-22T12:26:26).  The APDU hex can be
+    // reconstructed offline from sessionId if needed.
 
     return [{
       type: 'apdu',
@@ -1533,15 +1534,16 @@ export class SessionManager {
         where: { id: s.cardId },
         data: { status: 'PROVISIONED', provisionedAt: new Date() },
       });
-      await tx.sadRecord.update({
-        where: { id: s.sadRecordId },
-        data: { status: 'CONSUMED' },
-      });
-      // Mirror the SadRecord CONSUMED transition onto ParamRecord
-      // when the card rode the prototype path.  Belt-and-suspenders:
-      // the retention reaper would sweep READY-and-expired ParamRecords
-      // eventually, but an explicit CONSUMED matches the state-
-      // machine semantics callers expect.
+      // SadRecord flip is legacy-path only.  Prototype (PARAM_BUNDLE)
+      // cards don't carry a sadRecordId (nullable since migration
+      // 20260422140000), and their corresponding CONSUMED transition
+      // happens on the ParamRecord branch below.
+      if (s.sadRecordId) {
+        await tx.sadRecord.update({
+          where: { id: s.sadRecordId },
+          data: { status: 'CONSUMED' },
+        });
+      }
       if (s.card.paramRecordId) {
         await tx.paramRecord.update({
           where: { id: s.card.paramRecordId },
@@ -1563,8 +1565,11 @@ export class SessionManager {
       console.error('[rca] callback failed:', err),
     );
 
+    // proxyCardId sourcing: prefer SadRecord (legacy path), fall back
+    // to Card.proxyCardId directly for prototype cards (no SadRecord).
+    const outboundProxy = committed.sadRecord?.proxyCardId ?? committed.card.proxyCardId ?? '';
     return [
-      { type: 'complete', proxyCardId: committed.sadRecord.proxyCardId },
+      { type: 'complete', proxyCardId: outboundProxy },
     ];
   }
 
@@ -1920,10 +1925,15 @@ export class SessionManager {
         where: { id: s.cardId },
         data: { status: 'PROVISIONED', provisionedAt: new Date() },
       });
-      await tx.sadRecord.update({
-        where: { id: s.sadRecordId },
-        data: { status: 'CONSUMED' },
-      });
+      // SadRecord flip is legacy-path only (nullable since migration
+      // 20260422140000).  Prototype (PARAM_BUNDLE) cards use
+      // ParamRecord and don't carry a sadRecordId.
+      if (s.sadRecordId) {
+        await tx.sadRecord.update({
+          where: { id: s.sadRecordId },
+          data: { status: 'CONSUMED' },
+        });
+      }
       return s;
     });
 
@@ -1941,9 +1951,12 @@ export class SessionManager {
       console.error('[rca] callback failed:', err),
     );
 
+    // proxyCardId sourcing: prefer SadRecord (legacy), fall back to
+    // Card.proxyCardId for prototype cards (no SadRecord).
+    const outboundProxy = session.sadRecord?.proxyCardId ?? session.card.proxyCardId ?? '';
     return [{
       type: 'complete',
-      proxyCardId: session.sadRecord.proxyCardId,
+      proxyCardId: outboundProxy,
     }];
   }
 

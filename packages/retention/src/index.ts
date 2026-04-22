@@ -1,5 +1,6 @@
 export {
   purgeExpiredActivationSessions,
+  purgeExpiredParamRecords,
   scrubStaleCardOpScpState,
 } from './purge.js';
 export { startSweeper } from './sweeper.js';

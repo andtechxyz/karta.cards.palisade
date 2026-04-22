@@ -239,19 +239,13 @@ export function wrapParamBundle(input: WrapInput): WrappedParamBundle {
   const iv = okm.subarray(AES_KEY_LEN, AES_KEY_LEN + AES_IV_LEN);
   const hmacKey = okm.subarray(AES_KEY_LEN + AES_IV_LEN);
 
-  // Prototype debug — dump the server-side ECDH shared X coord, the
-  // HKDF-derived IV, and the chip pubkey the wrap was bound to.  The
-  // chip emits its own shared on IV-mismatch (SW=6AE4); comparing the
-  // two hex strings side-by-side narrows the failure to either ECDH
-  // math (sharedX differs) or HKDF impl (sharedX matches but IV
-  // differs).  Remove once the pa-v3 e2e path is byte-parity proven.
-  // eslint-disable-next-line no-console
-  console.log(
-    `[emv-ecdh][debug] wrap sessionId=${input.sessionId} ` +
-    `chipPub=${input.chipPubUncompressed.subarray(1, 17).toString('hex').toUpperCase()}... ` +
-    `sharedX=${shared.toString('hex').toUpperCase()} ` +
-    `hkdfIV=${iv.toString('hex').toUpperCase()}`,
-  );
+  // Prototype debug log removed 2026-04-22 — pa-v3 e2e now byte-parity
+  // proven (last successful tap: 2026-04-22T12:26:26).  The previous
+  // line logged `sharedX` (the ECDH shared secret X coordinate), which
+  // is session-ephemeral but still sensitive enough to keep out of
+  // CloudWatch logs.  If the IV-mismatch diagnostic is ever needed
+  // again, re-enable behind a `DEBUG_EMV_ECDH_WRAP=1` env-var gate so
+  // it never ships to prod accidentally.
 
   const cipher = createCipheriv('aes-128-cbc', aesKey, iv);
   const ciphertext = Buffer.concat([cipher.update(input.plaintext), cipher.final()]);

@@ -206,6 +206,21 @@ async function registerCard(record: EmbossingRecord, programId: string): Promise
   // UID via AES-CMAC(MASTER_<role>, UID)).
   const randomHex = (bytes: number): string => randomBytes(bytes).toString('hex');
 
+  // PCI DSS 3.2 + CPL LSR 6 closure (CF-1 from
+  // docs/compliance/PCI_DSS_4_0_1_AUDIT_2026-04-21.md):
+  // CVC/CVV2 is Sensitive Authentication Data and MUST NOT transit
+  // inter-service even under HMAC-signed HTTP on an internal ALB.
+  // Vault's card-registration contract allows CVC to be null; the
+  // cardholder supplies CVC via WebAuthn-bound mobile flow post-tap,
+  // at which point it lives in the vault tokenised and never touches
+  // Palisade.  Batch files that include a CVC field are discarded
+  // at the processor boundary here — one-line removal, no
+  // downstream contract change needed.
+  //
+  // If an Issuer's batch file lacks the CVC, the activation-side
+  // vault stub fills in a deterministic-ish placeholder so the
+  // PAN-and-expiry card registration still succeeds; the real CVC
+  // is captured from the cardholder during activation.
   const body = JSON.stringify({
     cardRef: record.cardRef ?? `card_${Date.now()}_${randomHex(3)}`,
     uid: record.uid ?? randomHex(7),
@@ -214,7 +229,7 @@ async function registerCard(record: EmbossingRecord, programId: string): Promise
     batchId: undefined,
     card: {
       pan: record.pan,
-      cvc: record.cvc,
+      // cvc intentionally omitted — see CF-1 block above.
       expiryMonth: record.expiryMonth,
       expiryYear: record.expiryYear,
       cardholderName: record.cardholderName,

@@ -17,6 +17,89 @@ export async function purgeExpiredActivationSessions(now: Date): Promise<number>
 }
 
 /**
+ * Expire stale ParamRecord rows (PCI DSS 3.1 / CPL LSR 5).
+ *
+ * ParamRecord carries the entire per-card TLV ParamBundle (all EMV
+ * master keys + ICC RSA priv for that card) KMS-wrapped at rest.
+ * Once CONSUMED by a successful tap, the row is audit-only — we don't
+ * need the ciphertext for any further operation.  Same flow for any
+ * READY row that lingers past `expiresAt` (default 30 days, set at
+ * prepareParamBundle time in data-prep).
+ *
+ * Retention policy:
+ *   - READY past expiresAt      → EXPIRED + ciphertext zeroed
+ *   - CONSUMED past consumedAt
+ *     + 7 days                  → EXPIRED + ciphertext zeroed
+ *   - REVOKED past revokedAt
+ *     + 7 days                  → EXPIRED + ciphertext zeroed
+ *
+ * Rows are NOT deleted — the per-card status + timestamps stay as an
+ * audit trail.  Only the encrypted payload + per-column envelopes get
+ * zeroed so the KMS-wrapped key material is gone from the DB.
+ *
+ * Returns the number of rows scrubbed.
+ */
+export async function purgeExpiredParamRecords(
+  now: Date,
+  consumedGracePeriodMs: number = 7 * 24 * 3600_000,
+): Promise<number> {
+  const consumedCutoff = new Date(now.getTime() - consumedGracePeriodMs);
+
+  // Bulk READY-expired sweep — time-triggered expiry.
+  const expiredReady = await prisma.paramRecord.updateMany({
+    where: {
+      status: 'READY',
+      expiresAt: { lt: now },
+    },
+    data: {
+      status: 'EXPIRED',
+      bundleEncrypted: Buffer.alloc(0),
+      mkAcEncrypted: null,
+      mkSmiEncrypted: null,
+      mkSmcEncrypted: null,
+      iccRsaPrivEncrypted: null,
+    },
+  });
+
+  // CONSUMED + 7 days grace — the successful tap already happened, so
+  // the bundle no longer needs decryptability.  `createdAt` is a rough
+  // stand-in for consumedAt which we don't yet track separately
+  // (future schema add).
+  const expiredConsumed = await prisma.paramRecord.updateMany({
+    where: {
+      status: 'CONSUMED',
+      createdAt: { lt: consumedCutoff },
+    },
+    data: {
+      status: 'EXPIRED',
+      bundleEncrypted: Buffer.alloc(0),
+      mkAcEncrypted: null,
+      mkSmiEncrypted: null,
+      mkSmcEncrypted: null,
+      iccRsaPrivEncrypted: null,
+    },
+  });
+
+  // REVOKED + 7 days grace — same rationale.
+  const expiredRevoked = await prisma.paramRecord.updateMany({
+    where: {
+      status: 'REVOKED',
+      createdAt: { lt: consumedCutoff },
+    },
+    data: {
+      status: 'EXPIRED',
+      bundleEncrypted: Buffer.alloc(0),
+      mkAcEncrypted: null,
+      mkSmiEncrypted: null,
+      mkSmcEncrypted: null,
+      iccRsaPrivEncrypted: null,
+    },
+  });
+
+  return expiredReady.count + expiredConsumed.count + expiredRevoked.count;
+}
+
+/**
  * Scrub SCP03 session keys from abandoned CardOpSession rows.
  *
  * CardOpSession.scpState is a JSON blob holding S-ENC / S-MAC / S-RMAC
