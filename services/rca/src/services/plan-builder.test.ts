@@ -26,19 +26,23 @@ function makeCtx(overrides: Partial<PlanContext> = {}): PlanContext {
 }
 
 describe('buildProvisioningPlan', () => {
-  it('emits exactly 5 steps in SELECT → KEYGEN → TRANSFER → FINAL → CONFIRM order', () => {
+  it('emits 6 steps in SELECT → WIPE → KEYGEN → TRANSFER → FINAL → CONFIRM order', () => {
     const plan = buildProvisioningPlan(makeCtx());
 
     expect(plan.type).toBe('plan');
     expect(plan.version).toBe(1);
-    expect(plan.steps).toHaveLength(5);
+    expect(plan.steps).toHaveLength(6);
 
     const indexes = plan.steps.map((s) => s.i);
-    expect(indexes).toEqual([0, 1, 2, 3, 4]);
+    expect(indexes).toEqual([0, 1, 2, 3, 4, 5]);
 
-    // Phase labels are contractual — mobile UI uses them for the 4-step strip.
+    // Phase labels are contractual — mobile UI uses them for the progress
+    // strip.  `wipe_applet` was added to close the re-perso-after-commit
+    // loop: without it, a chip latched STATE_COMMITTED from a prior tap
+    // returns SW_WRONG_STATE=0x6985 on the subsequent GENERATE_KEYS.
     expect(plan.steps.map((s) => s.phase)).toEqual([
       'select_pa',
+      'wipe_applet',
       'key_generation',
       'provisioning',
       'finalizing',
@@ -56,18 +60,28 @@ describe('buildProvisioningPlan', () => {
     expect(plan.steps[0].apdu).toBe('00A4040008A00000006250414C');
   });
 
-  it('GENERATE_KEYS step is the case-4 APDU (7 bytes: header + Lc=1 + body + Le=0)', () => {
+  it('WIPE step (CLA=80 INS=EA) runs between SELECT_PA and GENERATE_KEYS', () => {
     const plan = buildProvisioningPlan(makeCtx());
-    // 80 E0 00 00 Lc=01 body=01 Le=00 — case-4.  Le is required so pa-v3
-    // can call setOutgoingAndSend for the 65-byte pubkey response;
-    // without it the chip throws SW=6700 (wrong length).
-    expect(plan.steps[1].apdu).toBe('80E00000010100');
+    // WIPE at index 1 — before keygen.  processWipe() is state-agnostic
+    // (no guards) so it's safe for both fresh and committed chips.
+    expect(plan.steps[1].phase).toBe('wipe_applet');
+    expect(plan.steps[1].apdu).toBe('80EA000000');
+    expect(plan.steps[1].expectSw).toBe('9000');
   });
 
-  it('FINAL_STATUS + CONFIRM steps are zero-data case-2 APDUs', () => {
+  it('GENERATE_KEYS step (now at index 2) is the case-4 APDU', () => {
     const plan = buildProvisioningPlan(makeCtx());
-    expect(plan.steps[3].apdu).toBe('80E6000000');
-    expect(plan.steps[4].apdu).toBe('80E8000000');
+    // Shifted from index 1 → index 2 by the WIPE insertion.  Applet
+    // semantics: WIPE already ran, so chip is STATE_IDLE when keygen
+    // lands.
+    expect(plan.steps[2].phase).toBe('key_generation');
+    expect(plan.steps[2].apdu).toBe('80E00000010100');
+  });
+
+  it('FINAL_STATUS + CONFIRM at indices 4 + 5 respectively', () => {
+    const plan = buildProvisioningPlan(makeCtx());
+    expect(plan.steps[4].apdu).toBe('80E6000000');
+    expect(plan.steps[5].apdu).toBe('80E8000000');
   });
 
   it('every step requests SW=9000', () => {
@@ -81,7 +95,8 @@ describe('buildProvisioningPlan', () => {
     const plan = buildProvisioningPlan(
       makeCtx({ iccPrivateKeyDgi: 0x8001, iccPrivateKeyTag: 0x9F48 }),
     );
-    const transfer = plan.steps[2].apdu;
+    // TRANSFER_SAD moved from step 2 → step 3 with the WIPE insertion.
+    const transfer = plan.steps[3].apdu;
 
     // Header: CLA=80 INS=E2 P1=00 P2=00 Lc=<1 byte for a small payload>
     expect(transfer.slice(0, 8)).toBe('80E20000');
@@ -93,18 +108,21 @@ describe('buildProvisioningPlan', () => {
   it('different chipProfile values produce different TRANSFER_SAD bytes', () => {
     const a = buildProvisioningPlan(makeCtx({ iccPrivateKeyDgi: 0x8001, iccPrivateKeyTag: 0x9F48 }));
     const b = buildProvisioningPlan(makeCtx({ iccPrivateKeyDgi: 0x9000, iccPrivateKeyTag: 0xDF01 }));
-    expect(a.steps[2].apdu).not.toBe(b.steps[2].apdu);
+    // TRANSFER_SAD moved from step 2 → step 3 with the WIPE insertion.
+    expect(a.steps[3].apdu).not.toBe(b.steps[3].apdu);
     // Confirm the tail bytes differ as expected.
-    expect(b.steps[2].apdu.slice(-8).toUpperCase()).toBe('9000DF01');
+    expect(b.steps[3].apdu.slice(-8).toUpperCase()).toBe('9000DF01');
   });
 
   describe('includeAttestationChain option (patent C16/C23)', () => {
-    it('inserts GET_ATTESTATION_CHAIN between SELECT_PA and GENERATE_KEYS', () => {
+    it('inserts GET_ATTESTATION_CHAIN between WIPE and GENERATE_KEYS', () => {
       const plan = buildProvisioningPlan(makeCtx(), { includeAttestationChain: true });
 
-      expect(plan.steps).toHaveLength(6);
+      // Now 7 steps with both WIPE and GET_ATTESTATION_CHAIN in the plan.
+      expect(plan.steps).toHaveLength(7);
       expect(plan.steps.map((s) => s.phase)).toEqual([
         'select_pa',
+        'wipe_applet',
         'get_attestation_chain',
         'key_generation',
         'provisioning',
@@ -112,13 +130,15 @@ describe('buildProvisioningPlan', () => {
         'confirming',
       ]);
       // Indexes remain 0..N-1 contiguous so the step-cursor validates.
-      expect(plan.steps.map((s) => s.i)).toEqual([0, 1, 2, 3, 4, 5]);
+      expect(plan.steps.map((s) => s.i)).toEqual([0, 1, 2, 3, 4, 5, 6]);
     });
 
     it('GET_ATTESTATION_CHAIN APDU is CLA=80 INS=EE with Le=0 (max short response)', () => {
       const plan = buildProvisioningPlan(makeCtx(), { includeAttestationChain: true });
-      expect(plan.steps[1].apdu).toBe('80EE000000');
-      expect(plan.steps[1].expectSw).toBe('9000');
+      // GET_ATTESTATION_CHAIN is now at index 2 (after SELECT_PA + WIPE).
+      expect(plan.steps[2].phase).toBe('get_attestation_chain');
+      expect(plan.steps[2].apdu).toBe('80EE000000');
+      expect(plan.steps[2].expectSw).toBe('9000');
     });
 
     it('progress stays monotonically increasing with the extra step', () => {
@@ -128,11 +148,12 @@ describe('buildProvisioningPlan', () => {
       }
     });
 
-    it('default (no option) still emits the 5-step classical sequence', () => {
+    it('default (no option) still emits the 6-step classical sequence with WIPE', () => {
       const plan = buildProvisioningPlan(makeCtx());
-      expect(plan.steps).toHaveLength(5);
+      expect(plan.steps).toHaveLength(6);
       expect(plan.steps.map((s) => s.phase)).toEqual([
         'select_pa',
+        'wipe_applet',
         'key_generation',
         'provisioning',
         'finalizing',

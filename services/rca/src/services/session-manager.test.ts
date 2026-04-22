@@ -622,7 +622,8 @@ describe('SessionManager', () => {
 
       expect(plan.type).toBe('plan');
       expect(plan.version).toBe(1);
-      expect(plan.steps).toHaveLength(5);
+      // 6 steps now: SELECT_PA, WIPE, KEYGEN, TRANSFER_SAD, FINAL, CONFIRM.
+      expect(plan.steps).toHaveLength(6);
 
       // Decrypt was called with the session's ciphertext + sadKeyVersion=1.
       expect(mockDecryptSad).toHaveBeenCalledOnce();
@@ -634,7 +635,8 @@ describe('SessionManager', () => {
 
       // Step 2 (TRANSFER_SAD) must contain the real bankId/progId bytes
       // and the postProvisionUrl string — not the old placeholders.
-      const transfer = plan.steps[2].apdu.toUpperCase();
+      // TRANSFER_SAD is now at index 3 (was 2 pre-WIPE).
+      const transfer = plan.steps[3].apdu.toUpperCase();
       expect(transfer).toContain('AABBCCDD');    // bankId
       expect(transfer).toContain('11223344');    // progId
       const urlHex = Buffer.from('issuer.example.com', 'ascii').toString('hex').toUpperCase();
@@ -660,7 +662,8 @@ describe('SessionManager', () => {
       });
 
       const plan = await mgr.buildPlanForSession('session_01');
-      const transfer = plan.steps[2].apdu.toUpperCase();
+      // TRANSFER_SAD is now at index 3 (was 2 pre-WIPE).
+      const transfer = plan.steps[3].apdu.toUpperCase();
       // scheme sits between progId(4) and timestamp(4).  Look for the
       // exact metadata sequence: progId || scheme || ts ... ; we know
       // progId = 0x11223344 and scheme should now be 0x02.
@@ -682,12 +685,14 @@ describe('SessionManager', () => {
       const plan = await mgr.buildPlanForSession('session_01');
 
       // Plan shape is unchanged.
-      expect(plan.steps).toHaveLength(5);
+      // 6 steps now: SELECT_PA, WIPE, KEYGEN, TRANSFER_SAD, FINAL, CONFIRM.
+      expect(plan.steps).toHaveLength(6);
 
       // Minimal-SAD fallback produces the old placeholder bankId (0x00000001)
       // and progId (0x00000001), with scheme=0x01.  PA parses from the end
       // so we check explicit offsets after the SAD.  Minimal SAD = 13 bytes.
-      const transfer = plan.steps[2].apdu.toUpperCase();
+      // TRANSFER_SAD is now at index 3 (was 2 pre-WIPE).
+      const transfer = plan.steps[3].apdu.toUpperCase();
       const body = transfer.slice(10); // strip header
       const tail = body.slice(26); // strip 13-byte minimal SAD
       expect(tail.slice(0, 8)).toBe('00000001'); // bankId
@@ -720,7 +725,8 @@ describe('SessionManager', () => {
       });
 
       const plan = await mgr.buildPlanForSession('session_01');
-      expect(plan.steps).toHaveLength(5);
+      // 6 steps now: SELECT_PA, WIPE, KEYGEN, TRANSFER_SAD, FINAL, CONFIRM.
+      expect(plan.steps).toHaveLength(6);
       expect(mockDecryptSad).not.toHaveBeenCalled();
     });
   });
@@ -785,7 +791,7 @@ describe('SessionManager', () => {
   // -------------------------------------------------------------------------
 
   describe('handleMessage — plan-mode response routing', () => {
-    it('routes step 1 (keygen) response to iccPublicKey + attestation capture', async () => {
+    it('routes step 2 (keygen) response to iccPublicKey + attestation capture', async () => {
       const fakeIccPub = Buffer.alloc(65, 0x04);
       const fakeAttest = Buffer.alloc(72, 0xAA);
       const fakeCplc = Buffer.alloc(42, 0xBB);
@@ -794,13 +800,14 @@ describe('SessionManager', () => {
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
         makeSession('PLAN_SENT'),
       );
-      // Canonical 5-step plan: seed cursor at lastProcessed=0 so step 1
-      // is the expected next index.
-      _seedPlanStepStateForTests('session_01', 5, 0);
+      // Canonical 6-step plan (SELECT_PA, WIPE, KEYGEN, TRANSFER, FINAL,
+      // CONFIRM) — seed cursor at lastProcessed=1 (WIPE just acked) so
+      // step 2 (KEYGEN) is the expected next index.
+      _seedPlanStepStateForTests('session_01', 6, 1);
 
       const msg: WSMessage = {
         type: 'response',
-        i: 1,
+        i: 2,
         hex: responseData.toString('hex'),
         sw: '9000',
       };
@@ -846,11 +853,11 @@ describe('SessionManager', () => {
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
         makeSession('PLAN_SENT'),
       );
-      _seedPlanStepStateForTests('session_01', 5, 0);
+      _seedPlanStepStateForTests('session_01', 6, 1);
 
       await mgr.handleMessage('session_01', {
         type: 'response',
-        i: 1,
+        i: 2,
         hex: full.toString('hex'),
         sw: '9000',
       });
@@ -860,7 +867,7 @@ describe('SessionManager', () => {
       expect(updateCall.data.attestation.equals(sig)).toBe(true);
     });
 
-    it('step 3 success transitions to AWAITING_CONFIRM and emits no response', async () => {
+    it('step 4 (final_status success) transitions to AWAITING_CONFIRM and emits no response', async () => {
       const statusData = Buffer.concat([
         Buffer.from([0x01]),       // success byte
         Buffer.alloc(32, 0xCC),    // provenance hash
@@ -869,11 +876,13 @@ describe('SessionManager', () => {
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
         makeSession('AWAITING_CONFIRM'),
       );
-      _seedPlanStepStateForTests('session_01', 5, 2);
+      // FINAL_STATUS moved from i=3 → i=4 with WIPE inserted.  Seed
+      // lastProcessed=3 so step 4 is next.
+      _seedPlanStepStateForTests('session_01', 6, 3);
 
       const msg: WSMessage = {
         type: 'response',
-        i: 3,
+        i: 4,
         hex: statusData.toString('hex'),
         sw: '9000',
       };
@@ -890,17 +899,17 @@ describe('SessionManager', () => {
       );
     });
 
-    it('step 3 failure (status byte != 0x01) sends error and marks session FAILED', async () => {
+    it('step 4 (final_status failure) sends error and marks session FAILED', async () => {
       const statusData = Buffer.from([0x00]); // failure byte
 
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
         makeSession('FAILED'),
       );
-      _seedPlanStepStateForTests('session_01', 5, 2);
+      _seedPlanStepStateForTests('session_01', 6, 3);
 
       const msg: WSMessage = {
         type: 'response',
-        i: 3,
+        i: 4,
         hex: statusData.toString('hex'),
         sw: '9000',
       };
@@ -919,7 +928,7 @@ describe('SessionManager', () => {
       );
     });
 
-    it('step 4 (confirm) commits: card PROVISIONED + SAD CONSUMED + complete message', async () => {
+    it('step 5 (confirm) commits: card PROVISIONED + SAD CONSUMED + complete message', async () => {
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue({
         ...makeSession('COMPLETE'),
         cardId: 'card_01',
@@ -929,9 +938,10 @@ describe('SessionManager', () => {
       });
       (prisma.card.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
       (prisma.sadRecord.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
-      _seedPlanStepStateForTests('session_01', 5, 3);
+      // CONFIRM moved from i=4 → i=5 with WIPE insertion.
+      _seedPlanStepStateForTests('session_01', 6, 4);
 
-      const msg: WSMessage = { type: 'response', i: 4, hex: '', sw: '9000' };
+      const msg: WSMessage = { type: 'response', i: 5, hex: '', sw: '9000' };
       const responses = await mgr.handleMessage('session_01', msg);
 
       expect(responses).toHaveLength(1);
@@ -953,7 +963,9 @@ describe('SessionManager', () => {
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
         makeSession('FAILED'),
       );
-      _seedPlanStepStateForTests('session_01', 5, 1);
+      // KEYGEN now lives at index 2 (was 1 pre-WIPE).  Simulate a chip
+      // fail at keygen → expect failureReason to cite step_2.
+      _seedPlanStepStateForTests('session_01', 6, 1);
 
       const msg: WSMessage = { type: 'response', i: 2, hex: '', sw: '6A82' };
       const responses = await mgr.handleMessage('session_01', msg);
@@ -972,20 +984,27 @@ describe('SessionManager', () => {
       );
     });
 
-    it('step 0 (SELECT PA) and step 2 (TRANSFER_SAD) responses are logged but emit nothing', async () => {
+    it('step 0 (SELECT PA), step 1 (WIPE), step 3 (TRANSFER_SAD) responses are logged but emit nothing', async () => {
       // Fresh cursor at -1 for the first step 0; after processing the
-      // cursor advances to 0, then we need it at 1 to accept step 2.
-      _seedPlanStepStateForTests('session_01', 5, -1);
+      // cursor advances to 0, then we need to fast-forward for the
+      // subsequent assertions.
+      _seedPlanStepStateForTests('session_01', 6, -1);
       const select0: WSMessage = { type: 'response', i: 0, hex: '6F10A00000006250414C', sw: '9000' };
       const responses0 = await mgr.handleMessage('session_01', select0);
       expect(responses0).toHaveLength(0);
 
-      // Fast-forward the cursor so step 2 is the next expected index
-      // (skipping the step-1 keygen test dance in this specific case).
-      _seedPlanStepStateForTests('session_01', 5, 1);
-      const transfer2: WSMessage = { type: 'response', i: 2, hex: '00020021', sw: '9000' };
-      const responses2 = await mgr.handleMessage('session_01', transfer2);
-      expect(responses2).toHaveLength(0);
+      // WIPE step (new index 1) — chip returns 9000 with no data.
+      _seedPlanStepStateForTests('session_01', 6, 0);
+      const wipe1: WSMessage = { type: 'response', i: 1, hex: '', sw: '9000' };
+      const responses1 = await mgr.handleMessage('session_01', wipe1);
+      expect(responses1).toHaveLength(0);
+
+      // Fast-forward the cursor so step 3 (TRANSFER_SAD) is the next
+      // expected index (skipping the step-2 keygen test dance).
+      _seedPlanStepStateForTests('session_01', 6, 2);
+      const transfer3: WSMessage = { type: 'response', i: 3, hex: '00020021', sw: '9000' };
+      const responses3 = await mgr.handleMessage('session_01', transfer3);
+      expect(responses3).toHaveLength(0);
     });
 
     it('dispatches on semantic phase, not step index — attestation plan routes keygen to step 2', async () => {

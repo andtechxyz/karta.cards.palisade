@@ -158,6 +158,26 @@ const FINAL_STATUS_APDU = '80E6000000';
 const CONFIRM_APDU = '80E8000000';
 
 /**
+ * WIPE — resets the PA applet's state machine to STATE_IDLE and zeroes
+ * all per-session DGI buffers on the chip (`processWipe()` in the
+ * applet).  Accepts no state guard — safe to issue whether the chip is
+ * IDLE, AWAITING_CONFIRM, or COMMITTED.  Does NOT touch attestation
+ * material (privkey, cardCert, cplc) loaded at perso via
+ * STORE_ATTESTATION — those survive a WIPE so C16/C23 stays intact
+ * across re-perso cycles.
+ *
+ * Inserted as plan step 2 (right after SELECT_PA, before GENERATE_KEYS)
+ * so every provisioning plan is idempotent with respect to chip state.
+ * Without this, re-provisioning a previously-committed card returns
+ * SW_WRONG_STATE=0x6985 on the GENERATE_KEYS step, which is the exact
+ * failure mode observed after the CONFIRM race fix landed and a
+ * successful tap left the chip in STATE_COMMITTED — subsequent taps
+ * against the same chip (operator reset + retry) would hit 6985 until
+ * the operator wiped the applet manually.  This step closes that loop.
+ */
+const WIPE_APDU = '80EA000000';
+
+/**
  * GET_ATTESTATION_CHAIN (patent C16/C23).  Returns the per-card cert
  * blob loaded at perso (`card_pubkey[65] || cplc[42] || sig[DER]`).
  * The PA applet's IssuerAttestation.getCardCert() emits the blob
@@ -294,6 +314,11 @@ export function buildProvisioningPlan(
 
   steps.push(
     { i: i++, apdu: SELECT_PA_APDU,     phase: 'select_pa',      progress: 0.05, expectSw: '9000' },
+    // Idempotency guard — reset applet state before keygen so a prior
+    // committed session doesn't block re-perso with SW_WRONG_STATE.
+    // WIPE preserves attestation material (per
+    // ProvisioningAgentV3.processWipe) so C16/C23 stays intact.
+    { i: i++, apdu: WIPE_APDU,          phase: 'wipe_applet',    progress: 0.08, expectSw: '9000' },
   );
 
   if (options.includeAttestationChain) {

@@ -542,8 +542,13 @@ export function _seedPlanStepStateForTests(
    */
   phases?: string[],
 ): void {
+  // Canonical 6-step sequence with WIPE inserted between select_pa and
+  // key_generation (see plan-builder.ts).  Tests that want the older
+  // pre-WIPE shape for regression coverage pass an explicit `phases`
+  // array.
   const defaultPhases = [
     'select_pa',
+    'wipe_applet',
     'key_generation',
     'provisioning',
     'finalizing',
@@ -552,7 +557,7 @@ export function _seedPlanStepStateForTests(
   const resolvedPhases =
     phases ??
     defaultPhases.slice(0, expectedSteps).concat(
-      // Pad if the caller requested more steps than the canonical 5.
+      // Pad if the caller requested more steps than the canonical 6.
       Array(Math.max(0, expectedSteps - defaultPhases.length)).fill('unknown'),
     );
   planStepState.set(sessionId, {
@@ -1642,6 +1647,17 @@ export class SessionManager {
     switch (phase) {
       case 'select_pa':
         return []; // Phone parsed FCI locally; nothing server-side.
+      case 'wipe_applet':
+        // Idempotency guard — see plan-builder.ts:WIPE_APDU.  Chip
+        // returns SW=9000 with no data.  We just accept the step-cursor
+        // advance and continue.  Logging the wipe is useful for audit:
+        // every successful plan includes a reset of chip state before
+        // fresh key generation.
+        console.log(
+          `[rca][plan] wipe applied: session=${redactSid(sessionId)} — ` +
+            `applet now STATE_IDLE (attestation material preserved)`,
+        );
+        return [];
       case 'chip_challenge_select':
       case 'chip_challenge_fetch':
         // Audit-trail only today; PA applet doesn't consume the nonce
