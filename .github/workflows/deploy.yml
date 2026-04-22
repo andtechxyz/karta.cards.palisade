@@ -57,6 +57,9 @@ env:
 
 permissions:
   contents: read
+  # CPL LSR 9 — cosign keyless signing via Sigstore needs a GitHub
+  # OIDC token to exchange for a short-lived Fulcio cert.
+  id-token: write
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -87,6 +90,20 @@ jobs:
       - run: npx prisma generate --schema packages/db/prisma/schema.prisma
       - run: npx tsc -b
       - run: npx vitest run
+
+      # CPL LSR 9 — SBOM (Software Bill of Materials).  Attached as a
+      # workflow artifact on every successful test run so operators can
+      # diff the dependency set between releases.  Uses the OWASP
+      # CycloneDX format which is widely tool-supported (GitHub's
+      # dependency graph, Snyk, Trivy, sigstore/rekor).
+      - name: Generate CycloneDX SBOM
+        run: npx --yes @cyclonedx/cyclonedx-npm --output-format json --output-file sbom.cdx.json
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.cdx.json
+          retention-days: 90
 
   # ---------------------------------------------------------------------------
   # Build & Deploy — one job per service via matrix
@@ -196,6 +213,30 @@ jobs:
           # all intermediate layers (bigger cache, much faster rebuilds).
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      # CPL LSR 9 / PCI DSS 6.3 — cosign image signing.  Keyless mode
+      # via GitHub's OIDC identity + Sigstore's Fulcio CA → signature +
+      # transparency-log entry in rekor, verifiable against the repo +
+      # workflow identity.  Zero long-lived signing keys to rotate; the
+      # attestation is tied to the CI run that produced the image.
+      #
+      # Verify downstream with:
+      #   cosign verify <image> \
+      #     --certificate-identity-regexp 'https://github.com/andtechxyz/karta\\.cards\\.palisade' \
+      #     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+      - name: Install cosign
+        if: steps.filter.outputs.run == 'true'
+        uses: sigstore/cosign-installer@v3
+      - name: Sign image with cosign (keyless OIDC)
+        if: steps.filter.outputs.run == 'true'
+        env:
+          COSIGN_EXPERIMENTAL: 'true'
+          IMAGE_REF: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}@${{ steps.build.outputs.digest }}
+        run: |
+          # Sign by digest — tag-based signing is ambiguous (tags can
+          # move) and rekor-verified provenance needs a pinned digest
+          # to be meaningful.
+          cosign sign --yes "$IMAGE_REF"
 
       - name: Update ECS task definition and deploy
         if: steps.filter.outputs.run == 'true'
