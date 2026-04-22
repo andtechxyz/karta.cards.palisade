@@ -46,12 +46,15 @@ import javacard.security.Signature;
  *
  * RAM/NVM BUDGET:
  *
- *   attestKeyPair  EC P-256 KeyPair — EEPROM, ~96 B
- *   cardCert       EEPROM byte[256] + short len
- *   cplc           EEPROM byte[42]  + short len
- *   signer         Signature.ALG_ECDSA_SHA_256 instance — RAM ~64 B
+ *   attestPriv     ECPrivateKey (P-256)         — EEPROM, ~96 B
+ *   signer         Signature.ALG_ECDSA_SHA_256  — EEPROM, ~128 B incl bundled MD
+ *   cardCert       byte[ATTEST_CARD_CERT_MAX]   — EEPROM, 192 B
+ *   cplc           byte[ATTEST_CPLC_LEN]        — EEPROM, 42 B
  *
- * Total EEPROM footprint ≈ 400 B per installed applet.
+ * Total EEPROM footprint ≈ 460 B per installed applet.  The Signature
+ * fits alongside EcdhUnwrapper's MessageDigest because the JCOP 5
+ * per-applet ceiling is on TRANSIENT (CLEAR_ON_DESELECT) RAM, not on
+ * SHA-engine count; see ProvisioningAgentV3 buffer-sizing comment.
  */
 public final class IssuerAttestation {
 
@@ -83,23 +86,23 @@ public final class IssuerAttestation {
         // Standalone ECPrivateKey — no corresponding ECPublicKey needed
         // on-card because we never ECDH with this key (it only signs
         // per-session iccPubkey attestation trailers).  Saves one
-        // ECPublicKey slot on JCOP 5 SKUs that enforce a per-applet
-        // asymmetric-key quota (the KeyPair-wrapper approach failed
-        // INSTALL 0x6F00 on the card we currently test with).
+        // ECPublicKey slot vs. the KeyPair-wrapper approach.
         attestPriv = (ECPrivateKey) KeyBuilder.buildKey(
             KeyBuilder.TYPE_EC_FP_PRIVATE,
             KeyBuilder.LENGTH_EC_FP_256,
             false
         );
-        // Curve params must be set before setS can write the private
-        // scalar.  Piggyback on ProvisioningAgentV3's curve constants
-        // so the icc keypair and the attestation key agree on domain bits.
+        // Curve params must be set before setS() can write the scalar;
+        // piggyback on ProvisioningAgentV3's curve constants so the
+        // icc keypair and the attestation key agree on domain bits.
         ProvisioningAgentV3.initP256Params(attestPriv);
 
-        // RETEST: eagerly allocate Signature.  Earlier this session this
-        // failed with INSTALL 0x6F00, but FIDO HEAD installs successfully
-        // with MD + Sig + KeyAgreement on this same card, so the previous
-        // diagnosis was wrong — retest before pursuing Option B.
+        // Eager Signature allocation — fail-fast at INSTALL if the
+        // applet ever exceeds the JCOP 5 per-applet TRANSIENT RAM cap
+        // (the real ceiling, not a SHA-engine quota — empirically
+        // verified by FIDO running MD + Sig + KeyAgreement happily on
+        // the same card SKU).  Lazy-init would defer the same failure
+        // to the first attested GENERATE_KEYS, much harder to diagnose.
         signer = Signature.getInstance(Signature.ALG_ECDSA_SHA_256, false);
 
         cardCert = new byte[Constants.ATTEST_CARD_CERT_MAX];
@@ -169,9 +172,7 @@ public final class IssuerAttestation {
         if (!privLoaded || !cplcLoaded) {
             ISOException.throwIt(Constants.SW_DBG_ATTEST_NOT_LOADED);
         }
-        if (signer == null) {
-            signer = Signature.getInstance(Signature.ALG_ECDSA_SHA_256, false);
-        }
+        // signer is eager-allocated in initOnce — no lazy branch needed.
         signer.init(attestPriv, Signature.MODE_SIGN);
         signer.update(prefixBuf, prefixOff, prefixLen);
         return signer.sign(cplc, (short) 0, cplcLen, out, outOff);

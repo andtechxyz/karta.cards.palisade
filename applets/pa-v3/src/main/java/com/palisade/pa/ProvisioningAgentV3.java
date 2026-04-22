@@ -198,80 +198,45 @@ public class ProvisioningAgentV3 extends Applet {
     // -----------------------------------------------------------------
 
     protected ProvisioningAgentV3(byte[] bArray, short bOffset, byte bLength) {
-        // EEPROM allocations.  Sized for MChip CVN 18 worst-case DGIs.
+        // Persistent EEPROM allocations.  Sized for observed MChip
+        // CVN 18 production payloads with a slack margin each.
         //
-        // DGI 8201 sizing breakdown (see DgiBuilderMchip.buildDgi8201):
-        //   9F52 MK-AC   : 2 + 1 +  16 =  19 B
-        //   9F53 MK-SMI  : 2 + 1 +  16 =  19 B
-        //   9F54 MK-SMC  : 2 + 1 +  16 =  19 B
-        //   9F46 PK cert : 2 + 1 + 112 = 115 B (short-form, 112<128)
-        //   DF73 RSA prv : 2 + 2 + 128 = 132 B (long-form,  128>=128)
-        //                                ---
-        //                                304 B  ← with today's 128B/112B
-        //   Worst case (both keys at the MAX_FIELD_LEN=255 cap):
-        //                       2+2+255 + 2+2+255 + 3*19 = 576 B
+        //   sessionId    64   cuid2 (24 B) + C4 chip nonce (16 B) = 40 B max
+        //   dgi0101Nvm  160   PAN TLV + Track 2 TLV, observed max ~112 B
+        //   dgi0102Nvm   32   AFL bytes (16-24 B) + 2 B TLV header
+        //   dgi8201Nvm  320   MK-AC/SMI/SMC + ICC PK cert + RSA priv:
+        //                       9F52 + 9F53 + 9F54: 3 × (3 + 16) = 57 B
+        //                       9F46 PK cert (short-form 112 B):  115 B
+        //                       DF73 RSA priv (long-form 128 B):  132 B
+        //                       total today                       304 B
+        //   dgi9201Nvm   96   CVM list + PDOL, observed max ~80 B
         //
-        // An earlier dgi8201Nvm=256 was too small for even the current
-        // data-prep defaults (304 B); buffer overflow during
-        // Util.arrayCopy inside beginTransaction caused the JCVM to
-        // mute the contactless interface mid-commit on tap.
-        // Bumped to 512 B to cover typical 1408-bit RSA paths and
-        // 2048-bit cert paths with some slack, still well inside the
-        // JCOP 5 EEPROM budget.
-        // sessionId stores incoming server session id (typ 24 B cuid2)
-        // followed by the 16-byte chip-side nonce generated at GEN_KEYS.
-        // 96 B leaves ample headroom for future id schemes without
-        // risking an off-by-one when the nonce is appended.  See
-        // processGenerateKeys for the C4 nonce binding that extends
-        // sessionIdLen by 16 after keygen and uses the combined buffer
-        // as HKDF info during TRANSFER_PARAMS.
-        // MEMORY SQUEEZE for C16 attestation Signature headroom.
-        // Dropped oversized buffers to the smallest power-of-2 that
-        // comfortably fits observed max payload; saves ~288 B persistent
-        // EEPROM which lets IssuerAttestation's Signature fit.
-        //
-        //   sessionId   96 → 64   (cuid2=24B + 16B C4 nonce = 40B max)
-        //   dgi0101Nvm 256 → 160  (Track2+PAN max observed ~112 B)
-        //   dgi8201Nvm 512 → 320  (real 8201 = 304 B; was over-bumped)
-        //   dgi9201Nvm 128 → 96   (CVM list + PDOL max ~80 B)
-        //   dgi0102Nvm  64 → 32   (AFL 16-24 B + 2 B header)
+        // An earlier dgi8201Nvm=256 overflowed during commit and muted
+        // the contactless interface; 3×-oversized buffers (dgi0101=256,
+        // dgi8201=512, dgi9201=128, sessionId=96) were then installed
+        // for "slack" but tipped the applet into INSTALL 0x6F00 once
+        // IssuerAttestation's Signature was added.  Current sizing was
+        // verified on hardware with live provisioning flows.
         sessionId  = new byte[64];
         dgi0101Nvm = new byte[160];
         dgi0102Nvm = new byte[32];
         dgi8201Nvm = new byte[320];
         dgi9201Nvm = new byte[96];
 
-        // Transient RAM — auto-cleared on deselect.  We need the full
-        // APDU body in RAM for ECDH unwrap since the HMAC tag verify
-        // needs the full ciphertext in one pass.  Real TRANSFER_PARAMS
-        // bodies run ~700-800 B (65 pubkey + 16 IV + 16 HMAC + ct
-        // where ct is the AES-CBC-padded bundle ~ 600 B).  1024 B
-        // leaves headroom for larger ParamBundles (iCVV rotation,
-        // post-provisioning URLs longer than 64 B, etc.).
+        // Transient RAM — auto-cleared on deselect.  Sizes were tuned
+        // against the JCOP 5 per-applet CLEAR_ON_DESELECT budget; the
+        // applet hits the transient cap (not a crypto-engine quota) if
+        // these plus EcdhUnwrapper's ~280 B + IssuerAttestation's
+        // Signature internal scratch exceed ~2.5 KB total.  Original
+        // 3×1024 tripped INSTALL 0x6F00 once the attestation Signature
+        // was added; the current sizing has been hardware-verified.
         //
-        // dgiWorkBuf is the scratch used by DgiBuilderMchip to assemble
-        // one DGI at a time before the caller copies it to the matching
-        // NVM slot.  Must be >= the largest DGI output (8201 @ 304 B
-        // today, up to 576 B in worst case), so we use 1024 B to match
-        // wireBuf / bundleBuf and leave plenty of slack.
-        //
-        // JCOP 5 transient RAM budget is 4-8 KB so 1024+1024+1024 stays
-        // within budget even with EcdhUnwrapper's ~280 B of statics.
-        // TRANSIENT SQUEEZE for C16 attestation Signature headroom.
-        // The original 3×1024 = 3 KB CLEAR_ON_DESELECT allocation hit
-        // the JCOP 5 per-applet transient cap once IssuerAttestation's
-        // eager Signature.ALG_ECDSA_SHA_256 was added; INSTALL returned
-        // 0x6F00 at the applet constructor.
-        //
-        // Freeing 512 B transient by tightening the two smaller buffers
-        // (bundleBuf 1024→768, dgiWorkBuf 1024→512) fits the Signature's
-        // internal transient scratch.  wireBuf STAYS at 1024 — real
-        // TRANSFER_PARAMS wire is 65+16+ct+16 ≈ 800 B worst case, and
-        // bundle-length bumps (iCVV rotation, longer postProvisionUrl)
-        // will push it toward 900 B; 768 B is too tight.  Real bundle
-        // plaintext caps at ~550 B (ICC PK cert + ICC RSA priv dominate)
-        // — 768 B has 200 B slack, comfortable.  Max DGI builder output
-        // is 8201 at ~320 B — 512 B dgiWorkBuf has 190 B slack.
+        //   wireBuf     1024  — TRANSFER_PARAMS worst case 65+16+ct+16
+        //                       ≈ 900 B with iCVV rotation / long URL
+        //   bundleBuf    768  — plaintext max ~550 B (ICC PK cert +
+        //                       ICC RSA priv dominate), 200 B slack
+        //   dgiWorkBuf   512  — max DGI output is 8201 @ ~320 B,
+        //                       ~190 B slack
         wireBuf    = JCSystem.makeTransientByteArray((short) 1024, JCSystem.CLEAR_ON_DESELECT);
         bundleBuf  = JCSystem.makeTransientByteArray((short) 768, JCSystem.CLEAR_ON_DESELECT);
         dgiWorkBuf = JCSystem.makeTransientByteArray((short) 512, JCSystem.CLEAR_ON_DESELECT);
@@ -670,12 +635,10 @@ public class ProvisioningAgentV3 extends Applet {
             );
             Util.arrayCopy(dgiWorkBuf, (short) 0, dgi9201Nvm, (short) 0, dgi9201Len);
 
-            // Also extract + persist per-card metadata (bankId, progId,
-            // postProvisionUrl) that existed in the v2 TRANSFER_SAD
-            // metadata-trailer format.  Same tags; just pull via
-            // ParamBundleParser.findTag.
-            failStep = Constants.SW_DBG_METADATA_FAIL;
-            persistMetadata(bundleBuf, (short) 0, bundleLen);
+            // Per-card metadata (bankId/progId/postProvisionUrl) is
+            // held server-side in the Card DB row; no chip-side copy
+            // is needed and never was.  The v2 stub that parsed these
+            // tags into non-existent NVM arrays has been removed.
 
             state = Constants.STATE_PARAMS_COMMITTED;
 
@@ -741,25 +704,6 @@ public class ProvisioningAgentV3 extends Applet {
         // No response body — SW=9000 signals success.
     }
 
-    /**
-     * Extract per-card metadata from the ParamBundle and persist.
-     * Called inside the TRANSFER_PARAMS transaction.
-     */
-    private void persistMetadata(byte[] bBuf, short bOff, short bLen) {
-        // bankId (4 BE bytes)
-        if (ParamBundleParser.findTag(bBuf, bOff, bLen, Constants.PB_BANK_ID, scratch)) {
-            // TODO: Util.arrayCopy into bankIdNvm[0..4]
-        }
-        // progId
-        if (ParamBundleParser.findTag(bBuf, bOff, bLen, Constants.PB_PROG_ID, scratch)) {
-            // TODO: arrayCopy into progIdNvm[0..4]
-        }
-        // postProvisionUrl
-        if (ParamBundleParser.findTag(bBuf, bOff, bLen, Constants.PB_POST_PROVISION_URL, scratch)) {
-            // TODO: arrayCopy into urlNvm[0..urlLen]
-        }
-    }
-
     // -----------------------------------------------------------------
     // FINAL_STATUS — unchanged from v2; port verbatim
     // -----------------------------------------------------------------
@@ -805,9 +749,10 @@ public class ProvisioningAgentV3 extends Applet {
         // into the APDU response buffer at the provenance offset.
         //
         // We borrow EcdhUnwrapper.sha256 rather than allocating our own
-        // MessageDigest — JCOP 5 caps the number of crypto objects
-        // per applet, and having two SHA-256 instances makes INSTALL
-        // fail 0x6F00 during the applet constructor.
+        // MessageDigest — code-size win and avoids carrying a second
+        // engine for a single hash per session.  Safe because the
+        // FINAL_STATUS path always runs after TRANSFER_PARAMS has
+        // already used and reset() the engine.
         EcdhUnwrapper.sha256.reset();
         EcdhUnwrapper.sha256.update(dgi0101Nvm, (short) 0, dgi0101Len);
         EcdhUnwrapper.sha256.update(dgi0102Nvm, (short) 0, dgi0102Len);

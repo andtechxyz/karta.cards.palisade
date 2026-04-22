@@ -68,12 +68,14 @@ public final class EcdhUnwrapper {
 
     private static KeyAgreement keyAgreement;
     /**
-     * SHA-256 engine.  Package-private so ProvisioningAgentV3 can
-     * reuse the same instance for FINAL_STATUS provenance hashing —
-     * JCOP 5 appears to limit the number of MessageDigest objects an
-     * applet can allocate (installing a second one in the applet
-     * constructor fails INSTALL with 0x6F00).  Always reset() before
-     * use since any code path may leave the engine mid-update.
+     * Persistent SHA-256 engine.  Package-private so
+     * ProvisioningAgentV3 can reuse the same instance for FINAL_STATUS
+     * provenance hashing — sharing one MD instance across HKDF/HMAC
+     * here and the post-commit provenance hash there is a code-size
+     * win, not a quota workaround (JCOP 5's per-applet ceiling is on
+     * TRANSIENT RAM, not on persistent SHA-engine count).  Always
+     * reset() before use since any code path may leave the engine
+     * mid-update.
      */
     static MessageDigest sha256;
     private static Cipher aesCipher;
@@ -334,7 +336,15 @@ public final class EcdhUnwrapper {
     }
 
     // ---------------------------------------------------------------
-    // HMAC-SHA256 helpers (inline — no Signature.ALG_HMAC_SHA_256 in 3.0.4)
+    // HMAC-SHA256 helpers (inline RFC 2104).
+    //
+    // Note: JC 3.0.5 does expose Signature.ALG_HMAC_SHA_256 as a
+    // primitive, and switching to it would shave ~20-40ms per
+    // TRANSFER_PARAMS by avoiding the manual ipad/opad XOR + double-
+    // SHA-256 here.  Tracked as a perso-speed optimisation; deferred
+    // because the manual path is byte-parity-tested against the TS
+    // reference (packages/emv-ecdh) and a primitive swap risks
+    // breaking that without careful equivalence verification.
     // ---------------------------------------------------------------
 
     /**

@@ -33,13 +33,11 @@ public final class Constants {
     public static final byte INS_GENERATE_KEYS = (byte) 0xE0;
 
     /**
-     * INS_TRANSFER_PARAMS — replaces INS_TRANSFER_SAD (also 0xE2 but
-     * with different body semantics).  The chip accepts both in v3
-     * during migration: if the APDU body starts with the ECDH header
-     * (server_ephemeral_pub at offset 0 = 0x04), it's a ParamBundle;
-     * otherwise it's legacy SAD and falls through to processTransferSad.
-     *
-     * Once all fleet cards run v3 the legacy path can be deleted.
+     * INS_TRANSFER_PARAMS — same slot as pa-v1's INS_TRANSFER_SAD
+     * (0xE2) but body semantics differ: v3 always expects an ECDH-
+     * wrapped ParamBundle (see EcdhUnwrapper wire format).  There is
+     * no legacy-SAD fallback — mixing v1 and v3 cards in a fleet is
+     * handled by AID selection, not by dual-format TRANSFER_PARAMS.
      */
     public static final byte INS_TRANSFER_PARAMS = (byte) 0xE2;
 
@@ -87,9 +85,10 @@ public final class Constants {
     public static final short ATTEST_CPLC_LEN = (short) 42;
     /** Upper bound for the card cert blob allocation.  Real format is
      *  card_pubkey(65) + cplc(42) + DER sig(~72) = ~179 B; 192 B gives
-     *  ~13 B slack and saves 64 B vs. the old 256 B cap which was
-     *  tipping the applet over the per-applet EEPROM budget when
-     *  IssuerAttestation's Signature object is added. */
+     *  ~13 B slack.  Don't grow without re-verifying applet install on
+     *  the target JCOP 5 SKU — this, sessionId, and the four DGI NVM
+     *  byte arrays together live in a persistent EEPROM pool sized to
+     *  fit alongside the persistent Signature + MessageDigest for C16. */
     public static final short ATTEST_CARD_CERT_MAX = (short) 192;
 
     // -----------------------------------------------------------------
@@ -117,9 +116,10 @@ public final class Constants {
     public static final byte PB_IAC_DENIAL          = (byte) 0x10;
     public static final byte PB_IAC_ONLINE          = (byte) 0x11;
     public static final byte PB_CVM_LIST            = (byte) 0x12;
-    public static final byte PB_BANK_ID             = (byte) 0x13;
-    public static final byte PB_PROG_ID             = (byte) 0x14;
-    public static final byte PB_POST_PROVISION_URL  = (byte) 0x15;
+    // Tags 0x13 (bankId), 0x14 (progId), 0x15 (postProvisionUrl) are
+    // emitted by the server in the ParamBundle but have no chip-side
+    // consumer — they're server-DB-held metadata.  The chip ignores
+    // them; ParamBundleParser just walks past.  Reserved values.
     public static final byte PB_ICC_RSA_PRIV        = (byte) 0x16;
     public static final byte PB_ICC_PK_CERT         = (byte) 0x17;
     public static final byte PB_APP_LABEL           = (byte) 0x18;
@@ -283,8 +283,9 @@ public final class Constants {
     public static final short SW_DBG_BUILD_8201_FAIL  = (short) 0x6AF3;
     /** Debug — DgiBuilderMchip.buildDgi9201 threw an uncaught runtime. */
     public static final short SW_DBG_BUILD_9201_FAIL  = (short) 0x6AF4;
-    /** Debug — persistMetadata failed (should never happen; stubs only). */
-    public static final short SW_DBG_METADATA_FAIL    = (short) 0x6AF5;
+    // 0x6AF5 was SW_DBG_METADATA_FAIL — retired with the v2
+    // persistMetadata stub; slot reserved to avoid renumbering the
+    // adjacent BUILD_*/COMMIT_FAIL codes that rca log-greps for.
     /** Debug — commitTransaction itself threw (transaction buffer full?). */
     public static final short SW_DBG_COMMIT_FAIL      = (short) 0x6AF6;
 
