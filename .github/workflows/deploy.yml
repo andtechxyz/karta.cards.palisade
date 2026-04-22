@@ -206,6 +206,57 @@ jobs:
         # isn't available on the default docker driver).
         uses: docker/setup-buildx-action@v3
 
+      # Stage H.1 follow-up — verify cosign signatures on any CAP file
+      # that has a sibling .bundle.  This runs only for the card-ops
+      # service (the only one that actually ships cap-files/) so other
+      # service builds don't pay the install-cosign cost for nothing.
+      #
+      # Bundles are produced off-pipeline by an operator running:
+      #   cosign sign-blob --bundle cap-files/<name>.cap.bundle \
+      #                    --yes cap-files/<name>.cap
+      # (uses the operator's own GitHub OIDC keyless identity; signed
+      # bundle commits alongside the CAP).  See
+      # docs/runbooks/cap-signing.md for the full playbook.
+      #
+      # Missing bundle = warning (transitional; bundles roll out per
+      # CAP).  Present bundle that fails verification = CI failure
+      # (a tampered CAP must not land in the runtime image).
+      - name: Verify CAP cosign signatures (card-ops only)
+        if: steps.filter.outputs.run == 'true' && matrix.service == 'card-ops'
+        uses: sigstore/cosign-installer@v3
+      - name: cosign verify-blob over cap-files/*.cap
+        if: steps.filter.outputs.run == 'true' && matrix.service == 'card-ops'
+        env:
+          # Allowlist regex for accepted signing identities.  Default:
+          # any commit/PR member of the two repos that share the
+          # gha-oidc-deploy IAM role.  Tighten in prod to a specific
+          # operator-account list once the human signers are picked.
+          COSIGN_ID_REGEX: 'https://github\.com/(andtechxyz|.+@.+)'
+          COSIGN_OIDC_ISSUER: 'https://token.actions.githubusercontent.com'
+        run: |
+          shopt -s nullglob
+          fail=0
+          for cap in services/card-ops/cap-files/*.cap; do
+            bundle="${cap}.bundle"
+            if [[ -f "$bundle" ]]; then
+              echo "::group::cosign verify-blob $cap"
+              if cosign verify-blob \
+                  --bundle "$bundle" \
+                  --certificate-identity-regexp "$COSIGN_ID_REGEX" \
+                  --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
+                  "$cap"; then
+                echo "::endgroup::"
+              else
+                echo "::endgroup::"
+                echo "::error file=$cap::cosign verify-blob FAILED for $cap"
+                fail=1
+              fi
+            else
+              echo "::warning file=$cap::no .bundle next to $cap (transitional; sign with docs/runbooks/cap-signing.md)"
+            fi
+          done
+          if [[ "$fail" != "0" ]]; then exit 1; fi
+
       - name: Compute short SHA
         if: steps.filter.outputs.run == 'true'
         id: sha
