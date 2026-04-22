@@ -52,6 +52,112 @@ declare global {
 }
 
 // ---------------------------------------------------------------------------
+// Pure verifier (transport-agnostic) — used by Express middleware below
+// AND by the card-ops WS upgrade handler (no req/res context there).
+// ---------------------------------------------------------------------------
+
+/**
+ * Outcome of `verifyCognitoToken`.  `ok=false` carries an error code +
+ * message that the caller can map to whatever response shape it needs
+ * (HTTP 401/403, WS close code, etc.).
+ */
+export type VerifyResult =
+  | { ok: true; user: CognitoUser }
+  | { ok: false; status: 401 | 403; code: string; message: string };
+
+/**
+ * Build a reusable verifier from a CognitoAuthConfig.  The returned
+ * function takes a raw JWT string and returns a VerifyResult — no HTTP
+ * coupling.  JWKS is fetched + cached lazily on first call (via the
+ * `jose` `createRemoteJWKSet` cache).
+ *
+ * Validates: signature (RS256), expiry, issuer, token_use → audience/
+ * client_id, optional group membership, optional email allowlist.
+ *
+ * Accepts both Cognito ID tokens (`aud=clientId`) and access tokens
+ * (`client_id=clientId`).  See createCognitoAuthMiddleware below for
+ * the rationale.
+ */
+export function createCognitoTokenVerifier(
+  config: CognitoAuthConfig,
+): (token: string) => Promise<VerifyResult> {
+  const region = config.region ?? config.userPoolId.split('_')[0];
+  const issuer = `https://cognito-idp.${region}.amazonaws.com/${config.userPoolId}`;
+  const jwksUrl = new URL(`${issuer}/.well-known/jwks.json`);
+  const jwks = createRemoteJWKSet(jwksUrl);
+
+  return async (token: string): Promise<VerifyResult> => {
+    try {
+      const { payload } = await jwtVerify(token, jwks, {
+        issuer,
+        algorithms: ['RS256'],
+      });
+
+      const tokenUse = payload['token_use'];
+      if (tokenUse === 'access') {
+        if (payload['client_id'] !== config.clientId) {
+          return {
+            ok: false,
+            status: 401,
+            code: 'invalid_token',
+            message: `"client_id" claim mismatch: got ${String(payload['client_id'])}, expected ${config.clientId}`,
+          };
+        }
+      } else if (tokenUse === 'id') {
+        if (payload.aud !== config.clientId) {
+          return {
+            ok: false,
+            status: 401,
+            code: 'invalid_token',
+            message: `"aud" claim mismatch: got ${String(payload.aud)}, expected ${config.clientId}`,
+          };
+        }
+      } else {
+        return {
+          ok: false,
+          status: 401,
+          code: 'invalid_token',
+          message: `unsupported "token_use": ${String(tokenUse)} (expected "access" or "id")`,
+        };
+      }
+
+      const user = extractUser(payload);
+
+      if (config.requiredGroup && !user.groups.includes(config.requiredGroup)) {
+        return {
+          ok: false,
+          status: 403,
+          code: 'forbidden',
+          message: `Requires membership in '${config.requiredGroup}' group`,
+        };
+      }
+
+      if (config.emailAllowlist) {
+        const email = user.email?.toLowerCase();
+        const list = config.emailAllowlist.map((e) => e.toLowerCase());
+        if (!email || !list.includes(email)) {
+          return {
+            ok: false,
+            status: 403,
+            code: 'forbidden',
+            message: 'Email not on admin allowlist',
+          };
+        }
+      }
+
+      return { ok: true, user };
+    } catch (err) {
+      return {
+        ok: false,
+        status: 401,
+        code: 'invalid_token',
+        message: err instanceof Error ? err.message : 'Token verification failed',
+      };
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
@@ -63,14 +169,11 @@ declare global {
  * - Validates signature, expiry, issuer, and audience/client_id.
  * - On success: populates `req.cognitoUser` and calls `next()`.
  * - On failure: responds with a 401 JSON error.
+ *
+ * Implementation now thin-wraps the pure `createCognitoTokenVerifier`.
  */
 export function createCognitoAuthMiddleware(config: CognitoAuthConfig): RequestHandler {
-  const region = config.region ?? config.userPoolId.split('_')[0];
-  const issuer = `https://cognito-idp.${region}.amazonaws.com/${config.userPoolId}`;
-  const jwksUrl = new URL(`${issuer}/.well-known/jwks.json`);
-
-  // `createRemoteJWKSet` handles fetching + caching automatically.
-  const jwks = createRemoteJWKSet(jwksUrl);
+  const verify = createCognitoTokenVerifier(config);
 
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     const auth = req.headers.authorization;
@@ -79,85 +182,14 @@ export function createCognitoAuthMiddleware(config: CognitoAuthConfig): RequestH
       return;
     }
 
-    const token = auth.slice(7);
-
-    try {
-      // We accept BOTH Cognito ID tokens and access tokens.  The two have
-      // different shapes:
-      //   ID token     → has `aud` = clientId, `token_use="id"`
-      //   Access token → has `client_id` = clientId, `token_use="access"`
-      //                  and NO `aud` claim
-      //
-      // jose's `audience` option only checks the standard `aud` claim, so
-      // configuring it would reject every access token outright.  Verify
-      // signature + issuer here, then dispatch on token_use to check the
-      // right client-binding claim ourselves.
-      //
-      // Mobile API callers typically send the access token (it's what
-      // AWS Amplify / cognito-identity returns from `getCurrentUser`),
-      // so failing access tokens here breaks every authenticated call.
-      // Pin alg to RS256 (Cognito default) — defence in depth against a future
-      // jose default change or a misissued JWK.  `algorithms` is the defined
-      // allowlist name in jose v5.
-      const { payload } = await jwtVerify(token, jwks, {
-        issuer,
-        algorithms: ['RS256'],
-      });
-
-      const tokenUse = payload['token_use'];
-      if (tokenUse === 'access') {
-        if (payload['client_id'] !== config.clientId) {
-          throw new Error(
-            `"client_id" claim mismatch: got ${String(payload['client_id'])}, expected ${config.clientId}`,
-          );
-        }
-      } else if (tokenUse === 'id') {
-        if (payload.aud !== config.clientId) {
-          throw new Error(
-            `"aud" claim mismatch: got ${String(payload.aud)}, expected ${config.clientId}`,
-          );
-        }
-      } else {
-        throw new Error(
-          `unsupported "token_use": ${String(tokenUse)} (expected "access" or "id")`,
-        );
-      }
-
-      const user = extractUser(payload);
-
-      // Enforce group membership if configured
-      if (config.requiredGroup && !user.groups.includes(config.requiredGroup)) {
-        res.status(403).json({
-          error: 'forbidden',
-          message: `Requires membership in '${config.requiredGroup}' group`,
-        });
-        return;
-      }
-
-      // Enforce email allowlist if configured.  Case-insensitive match
-      // because Cognito preserves original email casing but operators
-      // should be able to type the list in any consistent form.  An
-      // empty-but-present allowlist means "no one" — explicitly reject
-      // so a misconfigured env doesn't silently open the door.
-      if (config.emailAllowlist) {
-        const email = user.email?.toLowerCase();
-        const list = config.emailAllowlist.map((e) => e.toLowerCase());
-        if (!email || !list.includes(email)) {
-          res.status(403).json({
-            error: 'forbidden',
-            message: 'Email not on admin allowlist',
-          });
-          return;
-        }
-      }
-
-      req.cognitoUser = user;
-      next();
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Token verification failed';
-      res.status(401).json({ error: 'invalid_token', message });
+    const result = await verify(auth.slice(7));
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.code, message: result.message });
+      return;
     }
+
+    req.cognitoUser = result.user;
+    next();
   };
 }
 

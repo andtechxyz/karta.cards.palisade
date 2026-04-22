@@ -831,7 +831,19 @@ model CardOpSession {
   operation String
 
   // Cognito sub of the admin who initiated the session (audit trail).
+  // Populated by activation's POST /api/admin/card-op/start from
+  // req.cognitoUser.sub.  PCI DSS 10.2.5 attribution.
   initiatedBy String
+
+  // Cognito sub of the admin whose WS connection actually drove the
+  // APDUs (PCI DSS 10.2.5 / Stage C.2).  The card-ops WS upgrade
+  // handler requires a fresh Cognito JWT as an ?id_token query param
+  // and verifies the JWT's sub matches initiatedBy before accepting
+  // the connection — but we persist the connecting sub here separately
+  // so the audit trail distinguishes "who started it" from "who drove
+  // the APDUs", in case a future relay-by-proxy flow splits them.
+  wsConnectedBy String?
+  wsConnectedAt DateTime?
 
   // READY → RUNNING → COMPLETE | FAILED
   phase String @default("READY")

@@ -29,6 +29,7 @@ import {
 import { prisma } from '@palisade/db';
 import { startSweeper, scrubStaleCardOpScpState } from '@palisade/retention';
 import { verifyHandoff, HandoffError } from '@palisade/handoff';
+import { createCognitoTokenVerifier } from '@palisade/cognito-auth';
 
 import { getCardOpsConfig } from './env.js';
 import { createRegisterRouter } from './routes/register.routes.js';
@@ -37,6 +38,16 @@ import { handleRelayConnection } from './ws/relay-handler.js';
 const config = getCardOpsConfig();
 const app = express();
 const server = createServer(app);
+
+// Cognito token verifier for WS upgrade auth (PCI DSS 10.2.5 strict
+// reading: bind every WS connection to the operator who created the
+// session, not just to the session cuid).  Pulls pool ID + client ID
+// from the same env defaults the activation service uses, so a single
+// Cognito pool covers both ends of the admin → card-ops handoff.
+const verifyCognito = createCognitoTokenVerifier({
+  userPoolId: process.env.COGNITO_USER_POOL_ID ?? 'ap-southeast-2_Db4d1vpIV',
+  clientId: process.env.COGNITO_CLIENT_ID ?? '7pj9230obhsa6h6vrvk9tru7do',
+});
 
 app.set('trust proxy', 1);
 
@@ -105,9 +116,10 @@ wss.on('connection', async (ws, req) => {
   }
 
   // Validate the session: exists, READY (or RUNNING on reconnect-retry),
-  // and not expired.  The sessionId itself is the auth token — it's a
-  // cuid with 25+ chars of entropy, returned only via activation's
-  // Cognito+allowlist-gated /api/admin/card-op/start.
+  // and not expired.  Plus PCI DSS 10.2.5 / Stage C.2 — bind to the
+  // specific operator who created the session.  An attacker who somehow
+  // exfiltrated wsUrl + tok still can't hijack the session unless they
+  // also hold the original operator's Cognito session.
   try {
     const session = await prisma.cardOpSession.findUnique({
       where: { id: sessionId },
@@ -125,6 +137,50 @@ wss.on('connection', async (ws, req) => {
       ws.close(4001, 'Session expired');
       return;
     }
+
+    // PCI 10.2.5 — operator identity binding.  ?id_token=<JWT> is
+    // required; we verify against the same Cognito pool activation
+    // gates with, then assert the connecting user is the one who
+    // created this session (session.initiatedBy was stamped at
+    // activation's POST /api/admin/card-op/start).  CLI ops tools
+    // grab the JWT from `aws cognito-idp admin-initiate-auth` (or
+    // the token cache) and append it to the wsUrl before connecting.
+    const idToken = parsedUrl.searchParams.get('id_token');
+    if (!idToken) {
+      console.warn(
+        `[card-ops-ws] missing id_token for ${redactSid(sessionId)} — operator identity unverifiable`,
+      );
+      ws.close(4001, 'Missing id_token query param');
+      return;
+    }
+    const verifyResult = await verifyCognito(idToken);
+    if (!verifyResult.ok) {
+      console.warn(
+        `[card-ops-ws] cognito verify failed for ${redactSid(sessionId)}: ${verifyResult.code}`,
+      );
+      ws.close(4001, `id_token rejected: ${verifyResult.code}`);
+      return;
+    }
+    if (verifyResult.user.sub !== session.initiatedBy) {
+      console.warn(
+        `[card-ops-ws] operator mismatch for ${redactSid(sessionId)}: ` +
+          `connecting=${redactSid(verifyResult.user.sub)} initiated=${redactSid(session.initiatedBy)}`,
+      );
+      ws.close(4001, 'Operator does not match session initiator');
+      return;
+    }
+    // Stamp who actually connected onto the audit trail.  This is a
+    // separate field from initiatedBy because edge cases exist where
+    // the connecting operator could differ (e.g. a future relay-by-
+    // proxy mode); for now they're equal by the check above, but the
+    // explicit stamp removes ambiguity in audit reads.
+    await prisma.cardOpSession.update({
+      where: { id: sessionId },
+      data: {
+        wsConnectedBy: verifyResult.user.sub,
+        wsConnectedAt: new Date(),
+      },
+    });
   } catch (err) {
     console.error('[card-ops-ws] session validation error:', err);
     ws.close(4001, 'Session validation failed');

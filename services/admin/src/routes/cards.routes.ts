@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { validateBody, badRequest, notFound, conflict } from '@palisade/core';
 import { prisma } from '@palisade/db';
 
+// GET   /api/cards                            — list cards for admin Cards tab
 // PATCH /api/cards/:id                        — admin-only program reassignment
 // POST  /api/cards/:cardRef/mark-sold         — flip retail card SHIPPED → SOLD
 // POST  /api/cards/:cardRef/credentials       — inject a pre-registered FIDO cred
@@ -12,6 +13,80 @@ import { prisma } from '@palisade/db';
 // Registration (POST /api/cards/register) belongs to the activation service.
 
 const router: Router = Router();
+
+// GET /api/cards
+//
+// Cards list for the admin SPA's Cards tab.  Returns the shape the
+// frontend's `Card` interface expects (services/admin/frontend/src/
+// features/cards/types.ts in the Vera repo): card row + program join
+// + credentials (pre-registered FIDO creds from the Credential
+// table) + activation sessions.
+//
+// vaultEntry is intentionally omitted at list time — vault lookups
+// are an extra cross-service call per row, expensive at scale.  The
+// drawer view fetches vaultEntry on demand for one card via the
+// vault-proxy.  Frontend Card type already has vaultEntry as
+// optional so this matches the contract.
+//
+// Pagination: simple LIMIT 500 + offset.  Card count at prototype
+// scale is ~hundreds; will need cursor pagination + filters before
+// we hit ~10k.
+const listQuerySchema = z.object({
+  limit: z.coerce.number().int().positive().max(500).default(500),
+  offset: z.coerce.number().int().nonnegative().default(0),
+});
+
+router.get('/', async (req, res) => {
+  const parsed = listQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    throw badRequest('validation_failed', 'Bad limit/offset query params');
+  }
+  const { limit, offset } = parsed.data;
+
+  const cards = await prisma.card.findMany({
+    take: limit,
+    skip: offset,
+    orderBy: { createdAt: 'desc' },
+    select: {
+      id: true,
+      cardRef: true,
+      status: true,
+      retailSaleStatus: true,
+      retailSoldAt: true,
+      chipSerial: true,
+      programId: true,
+      // NOTE: frontend Card type expects program.currency but Program
+      // schema has no currency field today.  Frontend renders undefined
+      // for currency until a follow-up adds Program.currency + a
+      // migration to backfill from BIN tables.
+      program: {
+        select: { id: true, name: true, programType: true },
+      },
+      batchId: true,
+      createdAt: true,
+      credentials: {
+        select: {
+          id: true,
+          kind: true,
+          deviceName: true,
+          createdAt: true,
+          lastUsedAt: true,
+        },
+      },
+      activationSessions: {
+        select: {
+          id: true,
+          expiresAt: true,
+          consumedAt: true,
+          consumedDeviceLabel: true,
+          createdAt: true,
+        },
+        orderBy: { createdAt: 'desc' },
+      },
+    },
+  });
+  res.json(cards);
+});
 
 const patchSchema = z
   .object({
