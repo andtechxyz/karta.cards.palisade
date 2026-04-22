@@ -225,17 +225,21 @@ public class ProvisioningAgentV3 extends Applet {
         // processGenerateKeys for the C4 nonce binding that extends
         // sessionIdLen by 16 after keygen and uses the combined buffer
         // as HKDF info during TRANSFER_PARAMS.
-        sessionId  = new byte[96];
-        dgi0101Nvm = new byte[256]; // bumped from 128 for Track 2 + long PANs
-        // DGI 0102 = 1B tag(0x94) + 1B len + AFL bytes.  The karta-platinum
-        // seed sets AFL = 16 B (32 hex chars), so DGI 0102 = 18 B — the
-        // original 16 B buffer overflowed in Util.arrayCopy during the
-        // post-build NVM write and returned SW 6AF2.  Bumped to 64 B to
-        // cover realistic AFL lengths (4 records × 4 B each = 16 B is
-        // the common case, up to maybe 24-32 B for uncommon card designs).
-        dgi0102Nvm = new byte[64];
-        dgi8201Nvm = new byte[512]; // bumped from 256 — see note above
-        dgi9201Nvm = new byte[128]; // bumped from 64 for CVM-list headroom
+        // MEMORY SQUEEZE for C16 attestation Signature headroom.
+        // Dropped oversized buffers to the smallest power-of-2 that
+        // comfortably fits observed max payload; saves ~288 B persistent
+        // EEPROM which lets IssuerAttestation's Signature fit.
+        //
+        //   sessionId   96 → 64   (cuid2=24B + 16B C4 nonce = 40B max)
+        //   dgi0101Nvm 256 → 160  (Track2+PAN max observed ~112 B)
+        //   dgi8201Nvm 512 → 320  (real 8201 = 304 B; was over-bumped)
+        //   dgi9201Nvm 128 → 96   (CVM list + PDOL max ~80 B)
+        //   dgi0102Nvm  64 → 32   (AFL 16-24 B + 2 B header)
+        sessionId  = new byte[64];
+        dgi0101Nvm = new byte[160];
+        dgi0102Nvm = new byte[32];
+        dgi8201Nvm = new byte[320];
+        dgi9201Nvm = new byte[96];
 
         // Transient RAM — auto-cleared on deselect.  We need the full
         // APDU body in RAM for ECDH unwrap since the HMAC tag verify
@@ -253,9 +257,24 @@ public class ProvisioningAgentV3 extends Applet {
         //
         // JCOP 5 transient RAM budget is 4-8 KB so 1024+1024+1024 stays
         // within budget even with EcdhUnwrapper's ~280 B of statics.
+        // TRANSIENT SQUEEZE for C16 attestation Signature headroom.
+        // The original 3×1024 = 3 KB CLEAR_ON_DESELECT allocation hit
+        // the JCOP 5 per-applet transient cap once IssuerAttestation's
+        // eager Signature.ALG_ECDSA_SHA_256 was added; INSTALL returned
+        // 0x6F00 at the applet constructor.
+        //
+        // Freeing 512 B transient by tightening the two smaller buffers
+        // (bundleBuf 1024→768, dgiWorkBuf 1024→512) fits the Signature's
+        // internal transient scratch.  wireBuf STAYS at 1024 — real
+        // TRANSFER_PARAMS wire is 65+16+ct+16 ≈ 800 B worst case, and
+        // bundle-length bumps (iCVV rotation, longer postProvisionUrl)
+        // will push it toward 900 B; 768 B is too tight.  Real bundle
+        // plaintext caps at ~550 B (ICC PK cert + ICC RSA priv dominate)
+        // — 768 B has 200 B slack, comfortable.  Max DGI builder output
+        // is 8201 at ~320 B — 512 B dgiWorkBuf has 190 B slack.
         wireBuf    = JCSystem.makeTransientByteArray((short) 1024, JCSystem.CLEAR_ON_DESELECT);
-        bundleBuf  = JCSystem.makeTransientByteArray((short) 1024, JCSystem.CLEAR_ON_DESELECT);
-        dgiWorkBuf = JCSystem.makeTransientByteArray((short) 1024, JCSystem.CLEAR_ON_DESELECT);
+        bundleBuf  = JCSystem.makeTransientByteArray((short) 768, JCSystem.CLEAR_ON_DESELECT);
+        dgiWorkBuf = JCSystem.makeTransientByteArray((short) 512, JCSystem.CLEAR_ON_DESELECT);
         scratch    = JCSystem.makeTransientShortArray((short) 2, JCSystem.CLEAR_ON_DESELECT);
 
         // P-256 keypair — curve params installed once here; keypair regen

@@ -96,14 +96,11 @@ public final class IssuerAttestation {
         // so the icc keypair and the attestation key agree on domain bits.
         ProvisioningAgentV3.initP256Params(attestPriv);
 
-        // Defer Signature.getInstance to signAttestation's first call.
-        // The applet constructor running on JCOP 5 has a tight crypto-
-        // object budget — allocating a second asymmetric primitive
-        // object alongside EcdhUnwrapper's KeyAgreement + MessageDigest
-        // + AES Cipher sometimes trips INSTALL 0x6F00.  Lazy init in
-        // user code dodges the constructor-time quota check; by the
-        // time signAttestation is called we're in an APDU context
-        // where the JVM has committed enough resources to the applet.
+        // RETEST: eagerly allocate Signature.  Earlier this session this
+        // failed with INSTALL 0x6F00, but FIDO HEAD installs successfully
+        // with MD + Sig + KeyAgreement on this same card, so the previous
+        // diagnosis was wrong — retest before pursuing Option B.
+        signer = Signature.getInstance(Signature.ALG_ECDSA_SHA_256, false);
 
         cardCert = new byte[Constants.ATTEST_CARD_CERT_MAX];
         cplc     = new byte[Constants.ATTEST_CPLC_LEN];

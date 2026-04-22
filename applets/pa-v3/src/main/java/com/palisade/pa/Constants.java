@@ -85,11 +85,12 @@ public final class Constants {
     public static final short ATTEST_PRIV_KEY_LEN = (short) 32;
     /** NXP CPLC fixed width (per CPLC spec). */
     public static final short ATTEST_CPLC_LEN = (short) 42;
-    /** Upper bound for the card cert blob allocation.  Worst case:
-     *  card_pubkey(65) + cplc(42) + DER sig(~72) = ~179 B.  256 B
-     *  leaves room for longer-form DER variants or future cert
-     *  format changes without re-provisioning EEPROM. */
-    public static final short ATTEST_CARD_CERT_MAX = (short) 256;
+    /** Upper bound for the card cert blob allocation.  Real format is
+     *  card_pubkey(65) + cplc(42) + DER sig(~72) = ~179 B; 192 B gives
+     *  ~13 B slack and saves 64 B vs. the old 256 B cap which was
+     *  tipping the applet over the per-applet EEPROM budget when
+     *  IssuerAttestation's Signature object is added. */
+    public static final short ATTEST_CARD_CERT_MAX = (short) 192;
 
     // -----------------------------------------------------------------
     // ParamBundle tag numbers.  Mirror of `ParamTag` in
