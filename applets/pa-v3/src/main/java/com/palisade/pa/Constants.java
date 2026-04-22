@@ -54,9 +54,23 @@ public final class Constants {
      * INS_STORE_ATTESTATION (patent C16/C23).  Loads per-card
      * attestation material during personalisation.  P1 selects the
      * DGI sub-type:
+     *
+     *   ATTEST_P1_COMBINED  (0x00)  all three sub-DGIs in one APDU body,
+     *                               TLV-framed.  Preferred — saves two
+     *                               round-trips at perso (~100ms).
+     *                               Body layout (1-byte short-form TLV):
+     *                                 01 20 <32B priv>
+     *                                 02 B2 <178B cert>
+     *                                 03 2A <42B cplc>
+     *                               Total body 252 B, fits short APDU.
+     *
      *   ATTEST_P1_PRIV_KEY  (0x01)  raw 32-byte P-256 private scalar
-     *   ATTEST_P1_CARD_CERT (0x02)  card cert blob (issuer-signed)
+     *   ATTEST_P1_CARD_CERT (0x02)  card cert blob (issuer-signed, ≤192 B)
      *   ATTEST_P1_CPLC      (0x03)  42-byte NXP CPLC
+     *                               (legacy 3-APDU mode, kept for
+     *                               back-compat; current perso tools
+     *                               should use P1=0x00)
+     *
      * Only accepted in STATE_IDLE; post-keygen loads are rejected
      * with SW_WRONG_STATE so a mid-session material swap can't
      * masquerade as a legitimate attestation.
@@ -75,6 +89,7 @@ public final class Constants {
     public static final byte INS_GET_ATTESTATION_CHAIN = (byte) 0xEE;
 
     // --- STORE_ATTESTATION P1 dispatch values ---
+    public static final byte ATTEST_P1_COMBINED  = (byte) 0x00;
     public static final byte ATTEST_P1_PRIV_KEY  = (byte) 0x01;
     public static final byte ATTEST_P1_CARD_CERT = (byte) 0x02;
     public static final byte ATTEST_P1_CPLC      = (byte) 0x03;

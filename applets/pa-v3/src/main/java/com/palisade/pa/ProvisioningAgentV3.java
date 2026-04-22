@@ -817,6 +817,13 @@ public class ProvisioningAgentV3 extends Applet {
         short bodyOff = ISO7816.OFFSET_CDATA;
 
         switch (p1) {
+            case Constants.ATTEST_P1_COMBINED:
+                // Body is TLV-framed: [tag][len][value]... for each
+                // sub-DGI.  Short-form length only (max 255 per sub-DGI,
+                // which comfortably fits all three real values:
+                // priv=32, cert≤192, cplc=42).
+                loadCombinedAttestation(buf, bodyOff, bodyLen);
+                break;
             case Constants.ATTEST_P1_PRIV_KEY:
                 attestation.loadPrivKey(buf, bodyOff, bodyLen);
                 break;
@@ -830,6 +837,48 @@ public class ProvisioningAgentV3 extends Applet {
                 ISOException.throwIt(Constants.SW_DBG_ATTEST_BAD_P1);
         }
         // No response body.  SW=9000 signals successful load.
+    }
+
+    /**
+     * Parse a P1=ATTEST_P1_COMBINED body — a flat TLV stream
+     * (1-byte tag, 1-byte length, value) holding any non-empty
+     * subset of the three attestation sub-DGIs in arbitrary order.
+     * Each recognised tag is dispatched to the matching
+     * IssuerAttestation.loadXxx() helper; an unknown tag or a
+     * length overflow throws SW_DBG_ATTEST_BAD_P1 /
+     * SW_DBG_ATTEST_BAD_LEN and leaves the applet in whatever
+     * partial state the successfully-dispatched prefix produced.
+     * (STATE_IDLE gate above + !isFullyLoaded() guard on signing
+     * mean a partial load can't be exercised for attestation
+     * without a WIPE-and-retry.)
+     */
+    private void loadCombinedAttestation(byte[] buf, short bodyOff, short bodyLen) {
+        final short end = (short) (bodyOff + bodyLen);
+        short off = bodyOff;
+        while (off < end) {
+            if ((short) (off + 2) > end) {
+                ISOException.throwIt(Constants.SW_DBG_ATTEST_BAD_LEN);
+            }
+            byte tag  = buf[off++];
+            short len = (short) (buf[off++] & 0xFF);
+            if ((short) (off + len) > end) {
+                ISOException.throwIt(Constants.SW_DBG_ATTEST_BAD_LEN);
+            }
+            switch (tag) {
+                case Constants.ATTEST_P1_PRIV_KEY:
+                    attestation.loadPrivKey(buf, off, len);
+                    break;
+                case Constants.ATTEST_P1_CARD_CERT:
+                    attestation.loadCardCert(buf, off, len);
+                    break;
+                case Constants.ATTEST_P1_CPLC:
+                    attestation.loadCplc(buf, off, len);
+                    break;
+                default:
+                    ISOException.throwIt(Constants.SW_DBG_ATTEST_BAD_P1);
+            }
+            off = (short) (off + len);
+        }
     }
 
     // -----------------------------------------------------------------

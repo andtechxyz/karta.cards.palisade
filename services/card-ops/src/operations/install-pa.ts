@@ -280,44 +280,66 @@ export async function runInstallPa(
         );
       }
 
-      // Three STORE_ATTESTATION APDUs, one per DGI.  CLA=0x80 is the
-      // proprietary PA CLA; INS=0xEC is INS_STORE_ATTESTATION; P1
-      // selects the payload type per applet Constants.ATTEST_P1_*.
+      // STORE_ATTESTATION via the combined-APDU form (P1=0x00).  The
+      // applet accepts a TLV stream in the body — tag 0x01 = priv,
+      // 0x02 = cert, 0x03 = cplc — and dispatches each to the matching
+      // IssuerAttestation loader.  We ship two APDUs instead of three
+      // (priv+cplc together, cert alone) because the full three won't
+      // fit in a 255-byte short APDU Lc (1+178-cert B already caps it,
+      // let alone with priv+cplc added).  Extended APDUs are NOT used
+      // — some contactless readers in perso setups (ACR122U NFC) fail
+      // SCARD_E_NOT_TRANSACTED on them.
       //
-      // Order doesn't matter at the applet level (flags track per-
-      // DGI completion) but we choose priv-key → cert → cplc so that
-      // if a later step fails the applet has the least amount of
-      // partial material — and the operator's error line identifies
-      // the exact DGI that failed.
-      const steps: ReadonlyArray<{ p1: number; phase: string; payload: Buffer }> = [
-        { p1: 0x01, phase: 'ATTESTATION_STORE_PRIV', payload: attestBundle.cardAttestPrivRaw },
-        { p1: 0x02, phase: 'ATTESTATION_STORE_CERT', payload: attestBundle.cardCert },
-        { p1: 0x03, phase: 'ATTESTATION_STORE_CPLC', payload: cplc },
+      // Short-form TLV only (1-byte tag, 1-byte length).  Max per-sub-
+      // DGI length is 255, which all three real payloads fit within
+      // (priv=32, cplc=42, cert=178 observed / 192 capped).
+      //
+      // Order: priv+cplc first, cert second — same rationale as before
+      // (least partial material if a later step fails).  The applet
+      // tracks per-DGI completion flags, so either order works for
+      // correctness; ordering is an operator-diagnostic convention.
+      const certPayload = attestBundle.cardCert;
+      if (certPayload.length > 0xff) {
+        throw new Error(
+          `STORE_ATTESTATION cert payload ${certPayload.length}B exceeds single-APDU max 255B — ` +
+            `applet needs extended-APDU / chained support`,
+        );
+      }
+      const privPlusCplcBody = Buffer.concat([
+        Buffer.from([0x01, attestBundle.cardAttestPrivRaw.length]),
+        attestBundle.cardAttestPrivRaw,
+        Buffer.from([0x03, cplc.length]),
+        cplc,
+      ]);
+      const certBody = Buffer.concat([
+        Buffer.from([0x02, certPayload.length]),
+        certPayload,
+      ]);
+      const steps: ReadonlyArray<{ phase: string; body: Buffer }> = [
+        { phase: 'ATTESTATION_STORE_PRIV_CPLC', body: privPlusCplcBody },
+        { phase: 'ATTESTATION_STORE_CERT',      body: certBody },
       ];
       let stepIdx = 0;
       for (const step of steps) {
         stepIdx += 1;
         io.send({
           type: 'apdu', hex: '', phase: step.phase,
-          progress: 0.94 + 0.02 * stepIdx,
+          progress: 0.94 + 0.03 * stepIdx,
         });
-        if (step.payload.length > 0xff) {
+        if (step.body.length > 0xff) {
           throw new Error(
-            `STORE_ATTESTATION P1=${step.p1.toString(16)} payload ` +
-              `${step.payload.length}B exceeds single-APDU max 255B — ` +
-              `applet build needs chained-APDU support`,
+            `STORE_ATTESTATION combined body ${step.body.length}B exceeds 255B short-APDU cap`,
           );
         }
         const apdu = Buffer.concat([
-          Buffer.from([0x80, 0xEC, step.p1, 0x00, step.payload.length]),
-          step.payload,
+          Buffer.from([0x80, 0xEC, 0x00, 0x00, step.body.length]),
+          step.body,
         ]);
         const resp = await sendAndRecv(io, apdu, step.phase);
         const sw = (resp[resp.length - 2] << 8) | resp[resp.length - 1];
         if (sw !== 0x9000) {
           throw new Error(
-            `STORE_ATTESTATION P1=${step.p1.toString(16).padStart(2, '0')} ` +
-              `failed SW=${sw.toString(16).toUpperCase()}`,
+            `STORE_ATTESTATION combined (${step.phase}) failed SW=${sw.toString(16).toUpperCase()}`,
           );
         }
       }
