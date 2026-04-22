@@ -5,6 +5,7 @@ export {
   conflict,
   gone,
   unauthorized,
+  forbidden,
   internal,
   errorMiddleware,
 } from './error.js';

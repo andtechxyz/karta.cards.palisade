@@ -1,8 +1,9 @@
 import { Router } from 'express';
 import { Prisma, CredentialKind } from '@prisma/client';
 import { z } from 'zod';
-import { validateBody, badRequest, notFound, conflict } from '@palisade/core';
+import { validateBody, badRequest, notFound, conflict, forbidden } from '@palisade/core';
 import { prisma } from '@palisade/db';
+import { programFilterForUser, userCanAccessProgram } from '@palisade/cognito-auth';
 
 // GET   /api/cards                            — list cards for admin Cards tab
 // PATCH /api/cards/:id                        — admin-only program reassignment
@@ -43,10 +44,22 @@ router.get('/', async (req, res) => {
   }
   const { limit, offset } = parsed.data;
 
+  // Stage I.2 — program-scoped RBAC.  `admin` group = no filter; any
+  // `program:<id>` group(s) restricts visibility to those programs.
+  // A user with no `admin` and no `program:` groups sees zero cards.
+  const programFilter = programFilterForUser(req.cognitoUser!);
+  const where: Prisma.CardWhereInput | undefined =
+    programFilter === null
+      ? undefined
+      : programFilter.length === 0
+        ? { id: '__no_programs__' } // impossible id → empty result
+        : { programId: { in: programFilter } };
+
   const cards = await prisma.card.findMany({
     take: limit,
     skip: offset,
     orderBy: { createdAt: 'desc' },
+    ...(where ? { where } : {}),
     select: {
       id: true,
       cardRef: true,
@@ -98,6 +111,36 @@ const patchSchema = z
 
 router.patch('/:id', validateBody(patchSchema), async (req, res) => {
   const body = req.body as z.infer<typeof patchSchema>;
+
+  // Stage I.2 — program-scoped RBAC on write.  Two checks:
+  //   (a) the card's CURRENT program must be one the operator can
+  //       touch (otherwise an operator could reassign a card out
+  //       from under the rightful owner program);
+  //   (b) the NEW programId (if moving INTO a program) must also
+  //       be one the operator has access to.
+  // Admin users bypass both checks.  programId=null (disconnect)
+  // is permissive: removing scope doesn't require scope on the
+  // destination.
+  const existing = await prisma.card.findUnique({
+    where: { id: req.params.id },
+    select: { programId: true },
+  });
+  if (!existing) {
+    throw notFound('card_not_found', `Card ${req.params.id} not found`);
+  }
+  if (!userCanAccessProgram(req.cognitoUser!, existing.programId)) {
+    throw forbidden(
+      'forbidden_program_scope',
+      `Card currently belongs to program ${existing.programId} which you are not scoped to`,
+    );
+  }
+  if (body.programId !== undefined && !userCanAccessProgram(req.cognitoUser!, body.programId)) {
+    throw forbidden(
+      'forbidden_program_scope',
+      `You are not scoped to program ${body.programId}`,
+    );
+  }
+
   const data: Prisma.CardUpdateInput = {};
   if (body.programId !== undefined) {
     data.program = body.programId

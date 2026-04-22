@@ -9,6 +9,7 @@ vi.mock('@palisade/db', () => ({
   prisma: {
     card: {
       findUnique: vi.fn(),
+      findMany: vi.fn(),
       update: vi.fn(),
     },
     webAuthnCredential: {
@@ -32,9 +33,24 @@ import { errorMiddleware } from '@palisade/core';
 // Same pattern as provisioning.routes.test.ts so the two stay aligned.
 // ---------------------------------------------------------------------------
 
-function buildApp() {
+function buildApp(opts?: { userGroups?: string[] }) {
   const app = express();
   app.use(express.json());
+  // Test-only middleware that injects req.cognitoUser so the RBAC
+  // helpers (programFilterForUser / userCanAccessProgram) have a
+  // user to reason about.  Real prod path is
+  // @palisade/cognito-auth's createCognitoAuthMiddleware.
+  if (opts?.userGroups !== undefined) {
+    const groups = opts.userGroups;
+    app.use((req, _res, next) => {
+      (req as unknown as { cognitoUser: unknown }).cognitoUser = {
+        sub: 'test-sub',
+        email: 'test@karta.cards',
+        groups,
+      };
+      next();
+    });
+  }
   app.use('/api/cards', cardsRouter);
   app.use(errorMiddleware);
   return app;
@@ -228,5 +244,102 @@ describe('DELETE /:cardRef/credentials/:credId', () => {
     const res = await inject(buildApp(), 'DELETE', '/api/cards/abc/credentials/cred_1');
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe('not_preregistered');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stage I.2 — program-scoped RBAC on Card endpoints
+// ---------------------------------------------------------------------------
+
+describe('GET /api/cards (program-scoped RBAC)', () => {
+  const cardFindMany = () => prisma.card.findMany as unknown as ReturnType<typeof vi.fn>;
+
+  it('admin user gets unfiltered findMany call', async () => {
+    cardFindMany().mockResolvedValueOnce([]);
+    const res = await inject(buildApp({ userGroups: ['admin'] }), 'GET', '/api/cards');
+    expect(res.status).toBe(200);
+    const args = cardFindMany().mock.calls[0]![0]!;
+    // Admin = no `where` clause at all (prisma findMany returns everything).
+    expect(args.where).toBeUndefined();
+  });
+
+  it('program-scoped user gets findMany filtered to their programIds', async () => {
+    cardFindMany().mockResolvedValueOnce([]);
+    const res = await inject(
+      buildApp({ userGroups: ['program:prog_mc_plat_01', 'program:prog_visa_debit_au'] }),
+      'GET',
+      '/api/cards',
+    );
+    expect(res.status).toBe(200);
+    const args = cardFindMany().mock.calls[0]![0]!;
+    expect(args.where).toEqual({
+      programId: { in: ['prog_mc_plat_01', 'prog_visa_debit_au'] },
+    });
+  });
+
+  it('user with no admin and no program: groups gets empty result via impossible-id filter', async () => {
+    cardFindMany().mockResolvedValueOnce([]);
+    const res = await inject(buildApp({ userGroups: ['unrelated_group'] }), 'GET', '/api/cards');
+    expect(res.status).toBe(200);
+    const args = cardFindMany().mock.calls[0]![0]!;
+    expect(args.where).toEqual({ id: '__no_programs__' });
+  });
+});
+
+describe('PATCH /api/cards/:id (program-scoped RBAC)', () => {
+  const cardUpdate = () => prisma.card.update as unknown as ReturnType<typeof vi.fn>;
+
+  it('admin can move a card to any program', async () => {
+    cardFindUnique().mockResolvedValueOnce({ programId: 'prog_existing' });
+    cardUpdate().mockResolvedValueOnce({
+      id: 'card_1', cardRef: 'cr_1', programId: 'prog_new', program: { id: 'prog_new', name: 'New' },
+    });
+    const res = await inject(
+      buildApp({ userGroups: ['admin'] }),
+      'PATCH',
+      '/api/cards/card_1',
+      { programId: 'prog_new' },
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.programId).toBe('prog_new');
+  });
+
+  it('403 when scoped user tries to touch a card in a program they are not in', async () => {
+    cardFindUnique().mockResolvedValueOnce({ programId: 'prog_other' });
+    const res = await inject(
+      buildApp({ userGroups: ['program:prog_mine'] }),
+      'PATCH',
+      '/api/cards/card_1',
+      { programId: 'prog_mine' },
+    );
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('forbidden_program_scope');
+  });
+
+  it('403 when scoped user tries to move a card INTO a program they are not in', async () => {
+    cardFindUnique().mockResolvedValueOnce({ programId: 'prog_mine' });
+    const res = await inject(
+      buildApp({ userGroups: ['program:prog_mine'] }),
+      'PATCH',
+      '/api/cards/card_1',
+      { programId: 'prog_other' },
+    );
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('forbidden_program_scope');
+  });
+
+  it('scoped user can move a card within their allowed programs', async () => {
+    cardFindUnique().mockResolvedValueOnce({ programId: 'prog_a' });
+    cardUpdate().mockResolvedValueOnce({
+      id: 'card_1', cardRef: 'cr_1', programId: 'prog_b', program: { id: 'prog_b', name: 'B' },
+    });
+    const res = await inject(
+      buildApp({ userGroups: ['program:prog_a', 'program:prog_b'] }),
+      'PATCH',
+      '/api/cards/card_1',
+      { programId: 'prog_b' },
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.programId).toBe('prog_b');
   });
 });

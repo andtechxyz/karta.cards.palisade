@@ -249,3 +249,77 @@ function extractUser(payload: JWTPayload): CognitoUser {
     groups,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Stage I.2 — program-scoped RBAC helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Cognito groups model:
+ *   "admin"                 → super (read+write all programs, FIs, etc.)
+ *   "program:<programId>"   → scoped (read+write only that program's cards
+ *                              + transactions + embossing batches)
+ *
+ * Multiple group memberships union — e.g. an operator in
+ *   ["program:prog_mc_plat_01", "program:prog_visa_debit_au"]
+ * can act on cards in either program but no others.
+ *
+ * No schema change to the Cognito pool — groups are a built-in
+ * mechanism.  Group provisioning ops live in the Cognito console
+ * or via aws cognito-idp admin-add-user-to-group.
+ */
+const PROGRAM_GROUP_PREFIX = 'program:';
+export const ADMIN_GROUP = 'admin';
+
+/** True if the user is a global admin (full access). */
+export function isAdminUser(user: CognitoUser): boolean {
+  return user.groups.includes(ADMIN_GROUP);
+}
+
+/**
+ * The set of programIds the user is explicitly scoped to via
+ * `program:<id>` group memberships.  Returns the empty array for an
+ * admin (use {@link isAdminUser} to detect "no filter") or for a user
+ * with no program: groups.
+ */
+export function userProgramIds(user: CognitoUser): string[] {
+  return user.groups
+    .filter((g) => g.startsWith(PROGRAM_GROUP_PREFIX))
+    .map((g) => g.slice(PROGRAM_GROUP_PREFIX.length))
+    .filter(Boolean);
+}
+
+/**
+ * Filter for read endpoints.  Returns:
+ *   `null`              — user is admin; do not filter
+ *   `string[]`          — restrict to this programId set (may be [])
+ *
+ * Caller passes the array straight into Prisma `where: { programId: { in: ... } }`
+ * (or to a manual SQL IN clause).  `null` means "skip the where clause
+ * entirely".  `[]` is the most-restrictive case — no programs allowed.
+ */
+export function programFilterForUser(user: CognitoUser): string[] | null {
+  if (isAdminUser(user)) return null;
+  return userProgramIds(user);
+}
+
+/**
+ * Returns `true` if the user can access the given programId.  Callers
+ * use this to decide whether to throw a 403 (or filter a query).
+ *
+ * `programId === null` is treated as accessible — that's "no program"
+ * or "unassign from any program"; scope checks apply to joining a
+ * program, not leaving one.  Admin users pass for any programId.
+ *
+ * The helper doesn't throw itself (and doesn't depend on an HTTP error
+ * factory) so it stays usable from non-HTTP contexts like background
+ * sweeps and retention jobs.
+ */
+export function userCanAccessProgram(
+  user: CognitoUser,
+  programId: string | null,
+): boolean {
+  if (programId === null) return true;
+  if (isAdminUser(user)) return true;
+  return userProgramIds(user).includes(programId);
+}

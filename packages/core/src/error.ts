@@ -27,6 +27,9 @@ export const gone = (code: string, message: string) => new ApiError(410, code, m
 export const unauthorized = (code: string, message: string) =>
   new ApiError(401, code, message);
 
+export const forbidden = (code: string, message: string) =>
+  new ApiError(403, code, message);
+
 export const internal = (code: string, message: string, details?: unknown) =>
   new ApiError(500, code, message, details);
 
