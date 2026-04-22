@@ -39,6 +39,92 @@ describe('signRequest / verifyRequest', () => {
       now: NOW,
     });
     expect(result.keyId).toBe('pay');
+    // Legacy single-secret path → usedSecretIndex is always 0.
+    expect(result.usedSecretIndex).toBe(0);
+  });
+
+  describe('rotation (array-form keys)', () => {
+    // PCI DSS 8.3.6 / CPL LSR 2 — HMAC key rotation with a grace
+    // window where both the new and old secrets verify.  The verifier
+    // surfaces usedSecretIndex so operators can observe when all
+    // in-flight traffic has migrated to the new secret.
+
+    it('accepts a new-secret signature against a [new, old] array', () => {
+      // Caller already signed with the new secret.
+      const authNew = signRequest({
+        method: METHOD, pathAndQuery: PATH, body: BODY,
+        keyId: 'pay', secret: KEY_A, now: NOW,
+      });
+      const result = verifyRequest({
+        authorization: authNew,
+        method: METHOD, pathAndQuery: PATH, body: BODY,
+        keys: { pay: [KEY_A, KEY_B] },
+        now: NOW,
+      });
+      expect(result.keyId).toBe('pay');
+      expect(result.usedSecretIndex).toBe(0);
+    });
+
+    it('accepts a stragglers-signed-by-old signature during the grace window', () => {
+      // Caller not yet rotated — still signing with the old secret.
+      const authOld = signRequest({
+        method: METHOD, pathAndQuery: PATH, body: BODY,
+        keyId: 'pay', secret: KEY_B, now: NOW,
+      });
+      const result = verifyRequest({
+        authorization: authOld,
+        method: METHOD, pathAndQuery: PATH, body: BODY,
+        keys: { pay: [KEY_A, KEY_B] },
+        now: NOW,
+      });
+      expect(result.keyId).toBe('pay');
+      // usedSecretIndex=1 tells operators "there's still traffic
+      // signed by the old secret — don't retire it yet".
+      expect(result.usedSecretIndex).toBe(1);
+    });
+
+    it('rejects a signature signed by a retired secret no longer in the array', () => {
+      const KEY_C = 'c'.repeat(64);
+      const authRetired = signRequest({
+        method: METHOD, pathAndQuery: PATH, body: BODY,
+        keyId: 'pay', secret: KEY_C, now: NOW,
+      });
+      expect(() =>
+        verifyRequest({
+          authorization: authRetired,
+          method: METHOD, pathAndQuery: PATH, body: BODY,
+          keys: { pay: [KEY_A, KEY_B] },
+          now: NOW,
+        }),
+      ).toThrowError(expect.objectContaining({ code: 'bad_signature' }));
+    });
+
+    it('rejects when the array is empty', () => {
+      const auth = signed();
+      expect(() =>
+        verifyRequest({
+          authorization: auth,
+          method: METHOD, pathAndQuery: PATH, body: BODY,
+          keys: { pay: [] },
+          now: NOW,
+        }),
+      ).toThrowError(expect.objectContaining({ code: 'unknown_key' }));
+    });
+
+    it('rejects an unknown keyId even when the map has rotation arrays', () => {
+      const auth = signRequest({
+        method: METHOD, pathAndQuery: PATH, body: BODY,
+        keyId: 'someone-else', secret: KEY_A, now: NOW,
+      });
+      expect(() =>
+        verifyRequest({
+          authorization: auth,
+          method: METHOD, pathAndQuery: PATH, body: BODY,
+          keys: { pay: [KEY_A, KEY_B] },
+          now: NOW,
+        }),
+      ).toThrowError(expect.objectContaining({ code: 'unknown_key' }));
+    });
   });
 
   it('rejects a missing Authorization header', () => {

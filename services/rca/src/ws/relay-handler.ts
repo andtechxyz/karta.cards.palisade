@@ -58,11 +58,39 @@ export async function handleRelayConnection(
   const mode = options.planMode ? 'plan' : 'classical';
   console.log(`[rca-ws] relay connected: session=${redactSid(sessionId)}, mode=${mode}`);
 
+  // `sendLater` is the contract handleConfirmResponse + handlePlanConfirm
+  // use to fire a follow-up `complete` (or `error`) AFTER the atomic
+  // commit lands, while `card_done` returns synchronously.  The WS may
+  // have closed by then (unlikely but possible — mobile sometimes
+  // lifts the phone immediately on card_done), so we guard the send.
+  const sendLater = (m: WSMessage): void => {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify(m));
+      // Close the WS on the late terminal message — mobile has no
+      // more work once `complete` / `error` arrive.
+      if (m.type === 'complete' || m.type === 'error') {
+        ws.close(1000, 'Session ended');
+      }
+    } else {
+      // WS already closed.  `complete` commit succeeded but the phone
+      // isn't listening — not an error, just log for audit so the
+      // commit-vs-wire state divergence is observable.  The activation
+      // callback (inside handleConfirmResponse) still fired, so the
+      // downstream state is consistent.
+      console.log(
+        `[rca-ws] late-send skipped (WS closed) for session=${redactSid(sessionId)}, ` +
+          `type=${m.type}`,
+      );
+    }
+  };
+
   ws.on('message', async (raw) => {
     try {
       const message: WSMessage = JSON.parse(raw.toString());
 
-      const responses = await sessionManager.handleMessage(sessionId, message);
+      const responses = await sessionManager.handleMessage(sessionId, message, {
+        sendLater,
+      });
 
       for (const resp of responses) {
         if (ws.readyState === ws.OPEN) {
@@ -70,7 +98,9 @@ export async function handleRelayConnection(
         }
       }
 
-      // Close on terminal states
+      // Close ONLY on synchronously-terminal states.  `card_done` is
+      // a pre-terminal signal — the mobile app is allowed to keep
+      // the WS open so it can receive the follow-up `complete`.
       if (responses.some((r) => r.type === 'complete' || r.type === 'error')) {
         ws.close(1000, 'Session ended');
       }

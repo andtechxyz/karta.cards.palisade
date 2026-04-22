@@ -1,0 +1,41 @@
+{
+  "family": "palisade-card-ops",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::600743178530:role/vera-ecs-execution",
+  "taskRoleArn": "arn:aws:iam::600743178530:role/vera-card-ops-task",
+  "containerDefinitions": [
+    {
+      "name": "palisade-card-ops",
+      "image": "600743178530.dkr.ecr.ap-southeast-2.amazonaws.com/palisade-card-ops:REPLACE_SHA",
+      "essential": true,
+      "portMappings": [
+        {"containerPort": 3010, "hostPort": 3010, "protocol": "tcp"}
+      ],
+      "environment": [
+        {"name": "NODE_ENV", "value": "production"},
+        {"name": "PORT", "value": "3010"},
+        {"name": "AWS_REGION", "value": "ap-southeast-2"}
+      ],
+      "secrets": [
+        {"name": "DATABASE_URL", "valueFrom": "arn:aws:secretsmanager:ap-southeast-2:600743178530:secret:vera/DATABASE_URL-wC212j"},
+        {"name": "CARD_OPS_AUTH_KEYS", "valueFrom": "arn:aws:secretsmanager:ap-southeast-2:600743178530:secret:palisade/CARD_OPS_AUTH_KEYS-xZPzH9"},
+        {"name": "WS_TOKEN_SECRET", "valueFrom": "arn:aws:secretsmanager:ap-southeast-2:600743178530:secret:palisade/WS_TOKEN_SECRET-XUS6VL"},
+        {"name": "KMS_SAD_KEY_ARN", "valueFrom": "arn:aws:secretsmanager:ap-southeast-2:600743178530:secret:palisade/KMS_SAD_KEY_ARN-doqsLY"},
+        {"name": "KMS_ATTESTATION_ISSUER_ARN", "valueFrom": "arn:aws:secretsmanager:ap-southeast-2:600743178530:secret:palisade/KMS_ATTESTATION_ISSUER_ARN-CHu7NF"},
+        {"name": "CARD_OPS_PUBLIC_WS_BASE", "valueFrom": "arn:aws:secretsmanager:ap-southeast-2:600743178530:secret:palisade/CARD_OPS_PUBLIC_WS_BASE-Gl2q41"}
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/palisade-card-ops",
+          "awslogs-region": "ap-southeast-2",
+          "awslogs-stream-prefix": "ecs",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}

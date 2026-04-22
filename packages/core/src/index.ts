@@ -33,3 +33,10 @@ export { aesCmac } from './cmac.js';
 export { resolveSecretRefs } from './secrets-resolver.js';
 export type { ResolveOptions } from './secrets-resolver.js';
 export { redactSid } from './redact.js';
+export {
+  requestIdMiddleware,
+  newRequestId,
+  parseInboundRequestId,
+  getRequestId,
+  REQUEST_ID_HEADER,
+} from './request-id.js';

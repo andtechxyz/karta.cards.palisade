@@ -5,7 +5,7 @@ await resolveSecretRefs();
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import { errorMiddleware, serveFrontend, apiRateLimit } from '@palisade/core';
+import { errorMiddleware, serveFrontend, apiRateLimit, requestIdMiddleware } from '@palisade/core';
 import { createCognitoAuthMiddleware } from '@palisade/cognito-auth';
 import { getAdminConfig } from './env.js';
 import programsRouter from './routes/programs.routes.js';
@@ -34,6 +34,10 @@ app.use(helmet({
 }));
 app.use(cors({ origin: config.CORS_ORIGINS, credentials: false, allowedHeaders: ['content-type', 'authorization'] }));
 app.set('trust proxy', 1);
+
+// PCI DSS 10.x / CPL LSR 8 — correlation ID for cross-service tracing.
+app.use(requestIdMiddleware);
+
 app.use(express.json({ limit: '64kb' }));
 
 // Prod path-prefix normalisation.  The shared admin SPA (Vera-owned) calls

@@ -764,8 +764,12 @@ model ProvisioningSession {
   id          String    @id @default(cuid())
   cardId      String
   card        Card      @relation(fields: [cardId], references: [id])
-  sadRecordId String    @default("")
-  sadRecord   SadRecord @relation(fields: [sadRecordId], references: [id])
+  // Nullable on prototype (PARAM_BUNDLE) cards — those use ParamRecord
+  // exclusively and don't need a linked SadRecord.  Legacy SAD flow
+  // still populates this FK.  See Card.paramRecordId for the
+  // corresponding pointer on prototype cards.
+  sadRecordId String?
+  sadRecord   SadRecord? @relation(fields: [sadRecordId], references: [id])
 
   // Stable proxy card identifier — used by the RCA / data-prep services
   proxyCardId  String  @default("")

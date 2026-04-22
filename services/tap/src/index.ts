@@ -6,7 +6,7 @@ import { resolveSecretRefs } from '@palisade/core';
 await resolveSecretRefs();
 
 import express from 'express';
-import { errorMiddleware, authRateLimit } from '@palisade/core';
+import { errorMiddleware, authRateLimit, requestIdMiddleware } from '@palisade/core';
 import { getTapConfig } from './env.js';
 import sunTapRouter from './routes/sun-tap.routes.js';
 import postActivationTapRouter from './routes/post-activation-tap.routes.js';
@@ -17,6 +17,10 @@ const app = express();
 
 // No CORS — tap handles NFC redirects only (GET → 302).  No browser fetch calls.
 app.set('trust proxy', 1);
+
+// PCI DSS 10.x / CPL LSR 8 — correlation ID for cross-service tracing.
+// Mount FIRST so every downstream handler + log emits req.requestId.
+app.use(requestIdMiddleware);
 
 app.use(express.json({ limit: '64kb' }));
 

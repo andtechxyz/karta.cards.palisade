@@ -21,7 +21,11 @@ import { createServer } from 'node:http';
 import express from 'express';
 import { WebSocketServer } from 'ws';
 import { requireSignedRequest, captureRawBody } from '@palisade/service-auth';
-import { errorMiddleware, apiRateLimit } from '@palisade/core';
+import {
+  errorMiddleware,
+  apiRateLimit,
+  requestIdMiddleware,
+} from '@palisade/core';
 import { prisma } from '@palisade/db';
 import { startSweeper, scrubStaleCardOpScpState } from '@palisade/retention';
 import { verifyHandoff, HandoffError } from '@palisade/handoff';
@@ -35,6 +39,9 @@ const app = express();
 const server = createServer(app);
 
 app.set('trust proxy', 1);
+
+// PCI DSS 10.x / CPL LSR 8 — correlation ID for cross-service tracing.
+app.use(requestIdMiddleware);
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'card-ops' });

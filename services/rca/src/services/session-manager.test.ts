@@ -552,6 +552,44 @@ describe('SessionManager', () => {
         }),
       );
     });
+
+    it('emits card_done synchronously + fires complete via sendLater when opts.sendLater is provided (Stage E contract)', async () => {
+      // Mobile UX contract (docs/runbooks/in-flight-card-done.md):
+      // relay passes a sendLater callback; handler returns card_done
+      // synchronously, then the atomic commit resolves in the background
+      // and sendLater fires the `complete` message.
+      (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSession('CONFIRMING'),
+      );
+      (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...makeSession('COMPLETE'),
+        cardId: 'card_01',
+        sadRecordId: 'sad_01',
+        card: { cardRef: 'ref_01', chipSerial: 'CS001', paramRecordId: null },
+        sadRecord: { proxyCardId: 'pxy_abc123' },
+      });
+      (prisma.card.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      (prisma.sadRecord.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
+
+      const laterMessages: WSMessage[] = [];
+      const sendLater = (m: WSMessage) => laterMessages.push(m);
+
+      const msg: WSMessage = { type: 'response', hex: '', sw: '9000' };
+      const responses = await mgr.handleMessage('session_01', msg, { sendLater });
+
+      // Synchronous return: just the card_done signal.  complete lands
+      // later via sendLater once the async commit resolves.
+      expect(responses).toHaveLength(1);
+      expect(responses[0].type).toBe('card_done');
+
+      // Drain the microtask queue so the .then() on the $transaction
+      // commitWork promise has run.
+      await new Promise((r) => setImmediate(r));
+
+      expect(laterMessages).toHaveLength(1);
+      expect(laterMessages[0].type).toBe('complete');
+      expect(laterMessages[0].proxyCardId).toBe('pxy_abc123');
+    });
   });
 
   // -------------------------------------------------------------------------
