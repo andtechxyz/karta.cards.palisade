@@ -1,5 +1,22 @@
 # Autonomous execution handover — 2026-04-22
 
+> **Final state (after CI settled):** all 7 palisade-* services healthy on `c3fb174`.
+> palisade-tap:3 / activation:3 / data-prep:12 / rca:23 / batch-processor:3 /
+> sftp:4 / admin:4 — all COMPLETED, runningCount=1 everywhere.
+>
+> Incidental fix: palisade-admin had a latent port-drift bug — admin code
+> defaults to PORT=3009 (per-file comment says it's intentional to avoid
+> colliding with Vera-admin on shared dev boxes), but the ECS task def +
+> ALB TG are on 3005.  The pre-c3fb174 task was running a pre-port-change
+> image that really did listen on 3005, so the drift was invisible until
+> the new image tried to roll out and ALB rejected it.  Fixed by pinning
+> `PORT=3005` as an env override in palisade-admin:4.  Long-term: either
+> update env.ts default to 3005 or move the task def/TG to 3009, but
+> they're both disruptive changes — the env pin is sufficient and
+> self-documenting on the task def.
+
+
+
 **Window:** user away ~08:00–10:00 UTC+10.
 **Scope of ask:** "close out all gaps for admin and patent claim, with PCI and PCR implement everything except logging if it'll blow out costs. Assume all operations are remote. Once done, look at security reviews. Don't worry about pen-testing."
 
