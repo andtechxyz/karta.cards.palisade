@@ -57,7 +57,20 @@ function attestationConfigFor(mode: AttestationMode): AttestationVerifierConfig 
 // ---------------------------------------------------------------------------
 
 export interface WSMessage {
-  type: 'apdu' | 'response' | 'complete' | 'error' | 'pa_fci' | 'plan';
+  /**
+   * 'card_done': the chip has ACKed the last APDU (CONFIRM 9000) and
+   * the physical NFC work is complete.  Emitted server → mobile BEFORE
+   * the atomic $transaction commits Card.status=PROVISIONED etc, so
+   * the NFC modal can dismiss the instant the card stops being
+   * interacted with.  The follow-up `{type:'complete', proxyCardId}`
+   * arrives once the commit lands (typically 50-500ms later depending
+   * on RDS latency).  Mobile contract:
+   *   - on `card_done`   → dismiss NFC sheet, kick navigation.transition
+   *   - on `complete`    → update app state to PROVISIONED, close WS
+   *   - on `error`       → error UX, close WS (unchanged)
+   * See docs/runbooks/in-flight-card-done.md for the full wire spec.
+   */
+  type: 'apdu' | 'response' | 'complete' | 'error' | 'pa_fci' | 'plan' | 'card_done';
   hex?: string;
   sw?: string;
   phase?: string;
@@ -718,7 +731,23 @@ export class SessionManager {
    * the 4 server-waits embedded in classical mode.  See plan-builder.ts
    * for the protocol rationale.
    */
-  async handleMessage(sessionId: string, message: WSMessage): Promise<WSMessage[]> {
+  /**
+   * `opts.sendLater` — the relay-handler's callback for messages that
+   * can't be returned synchronously from this handler.  Used by the
+   * two CONFIRM handlers (`handleConfirmResponse` classical,
+   * `handlePlanConfirm` plan) to emit `{type:'complete'}` AFTER the
+   * atomic $transaction commits, while `card_done` returns
+   * synchronously so the mobile NFC sheet dismisses the instant the
+   * chip ACKs.  Missing `sendLater` (e.g. in older test paths) is
+   * treated as "no late-send available — collapse card_done +
+   * complete back into a single post-commit `complete` message" so
+   * the legacy callers keep working.
+   */
+  async handleMessage(
+    sessionId: string,
+    message: WSMessage,
+    opts: { sendLater?: (m: WSMessage) => void } = {},
+  ): Promise<WSMessage[]> {
     if (message.type === 'pa_fci') {
       return this.handlePaFci(sessionId);
     }
@@ -727,9 +756,9 @@ export class SessionManager {
       // Plan-mode responses carry `i` (the step index).  Classical-mode
       // responses don't — they're phase-driven and read only hex/sw.
       if (typeof message.i === 'number') {
-        return this.handlePlanResponse(sessionId, message);
+        return this.handlePlanResponse(sessionId, message, opts);
       }
-      return this.handleCardResponse(sessionId, message);
+      return this.handleCardResponse(sessionId, message, opts);
     }
 
     if (message.type === 'error') {
@@ -1053,7 +1082,11 @@ export class SessionManager {
    * native NFC transceive failure.  Distinguish that from a real chip error
    * so the logs point at the right layer.
    */
-  private async handleCardResponse(sessionId: string, msg: WSMessage): Promise<WSMessage[]> {
+  private async handleCardResponse(
+    sessionId: string,
+    msg: WSMessage,
+    opts: { sendLater?: (m: WSMessage) => void } = {},
+  ): Promise<WSMessage[]> {
     const rawHex = msg.hex ?? '';
     const rawSw = msg.sw ?? '';
     const appErrored = rawSw.length !== 4 && rawHex.length < 4;
@@ -1122,7 +1155,7 @@ export class SessionManager {
         // Card.status=PROVISIONED + emit `complete` to the mobile.
         // SW != 9000 already rejected upstream (line ~910), so
         // arriving here means the applet latched to STATE_COMMITTED.
-        return this.handleConfirmResponse(sessionId);
+        return this.handleConfirmResponse(sessionId, opts);
       default:
         return [];
     }
@@ -1523,8 +1556,23 @@ export class SessionManager {
    * atomic transaction, fires the activation callback, then emits
    * `complete` to the mobile client.
    */
-  private async handleConfirmResponse(sessionId: string): Promise<WSMessage[]> {
-    const committed = await prisma.$transaction(async (tx) => {
+  private async handleConfirmResponse(
+    sessionId: string,
+    opts: { sendLater?: (m: WSMessage) => void } = {},
+  ): Promise<WSMessage[]> {
+    // Mobile UX contract (docs/runbooks/in-flight-card-done.md):
+    // emit `card_done` the instant the chip ACKs CONFIRM (SW=9000
+    // already verified by the upstream dispatcher before we get
+    // here), so the NFC modal can dismiss immediately.  The atomic
+    // commit fires in the background; `complete` arrives ~50-500ms
+    // later via opts.sendLater once the DB write lands.
+    //
+    // Fallback when sendLater is absent (e.g. older test paths):
+    // collapse back to the old blocking shape — await the commit
+    // and return `complete` synchronously.  Never regress the
+    // contract (card_done without a follow-up complete would leave
+    // the mobile app in a limbo state).
+    const commitWork = prisma.$transaction(async (tx) => {
       const s = await tx.provisioningSession.update({
         where: { id: sessionId },
         data: { phase: 'COMPLETE', completedAt: new Date() },
@@ -1553,24 +1601,47 @@ export class SessionManager {
       return s;
     });
 
-    console.log(
-      `[rca] provisioning complete: session=${redactSid(sessionId)}, card=${redactSid(committed.cardId)}`,
-    );
-    metrics().counter('rca.provisioning.complete', 1, { mode: 'classical' });
+    const finishCommit = async (): Promise<WSMessage> => {
+      try {
+        const committed = await commitWork;
+        console.log(
+          `[rca] provisioning complete: session=${redactSid(sessionId)}, ` +
+          `card=${redactSid(committed.cardId)}`,
+        );
+        metrics().counter('rca.provisioning.complete', 1, { mode: 'classical' });
+        // Best-effort activation callback — idempotent on the
+        // activation side, safe to retry from the reaper.
+        this.fireCallback(committed.card.cardRef, committed.card.chipSerial ?? '').catch((err) =>
+          console.error('[rca] callback failed:', err),
+        );
+        const outboundProxy =
+          committed.sadRecord?.proxyCardId ?? committed.card.proxyCardId ?? '';
+        return { type: 'complete', proxyCardId: outboundProxy };
+      } catch (err) {
+        console.error(
+          `[rca] commit failed after card_done for session ${redactSid(sessionId)}:`,
+          err,
+        );
+        metrics().counter('rca.provisioning.commit_fail', 1, { mode: 'classical' });
+        return {
+          type: 'error',
+          code: 'commit_failed',
+          message: 'Provisioning commit failed after chip ACK; re-tap to recover.',
+        };
+      }
+    };
 
-    // Fire callback to activation — best-effort, idempotent on the
-    // activation side so a retry from here (or the retention reaper)
-    // is safe.
-    this.fireCallback(committed.card.cardRef, committed.card.chipSerial ?? '').catch((err) =>
-      console.error('[rca] callback failed:', err),
-    );
+    if (opts.sendLater) {
+      // Fire the commit in the background; dispatch its result via
+      // sendLater when it lands.
+      finishCommit().then((msg) => opts.sendLater?.(msg));
+      return [{ type: 'card_done' }];
+    }
 
-    // proxyCardId sourcing: prefer SadRecord (legacy path), fall back
-    // to Card.proxyCardId directly for prototype cards (no SadRecord).
-    const outboundProxy = committed.sadRecord?.proxyCardId ?? committed.card.proxyCardId ?? '';
-    return [
-      { type: 'complete', proxyCardId: outboundProxy },
-    ];
+    // Legacy path — no sendLater available, keep the old blocking
+    // shape so tests that don't plumb opts through still pass.
+    const msg = await finishCommit();
+    return [msg];
   }
 
   // -----------------------------------------------------------------------
@@ -1596,7 +1667,11 @@ export class SessionManager {
    * the phone to abort remaining steps when it receives the {type:'error'}
    * reply.
    */
-  private async handlePlanResponse(sessionId: string, msg: WSMessage): Promise<WSMessage[]> {
+  private async handlePlanResponse(
+    sessionId: string,
+    msg: WSMessage,
+    opts: { sendLater?: (m: WSMessage) => void } = {},
+  ): Promise<WSMessage[]> {
     const rawHex = msg.hex ?? '';
     const rawSw = msg.sw ?? '';
     const i = msg.i ?? -1;
@@ -1726,7 +1801,7 @@ export class SessionManager {
       case 'finalizing':
         return this.handlePlanFinalStatus(sessionId, data);
       case 'confirming':
-        return this.handlePlanConfirm(sessionId);
+        return this.handlePlanConfirm(sessionId, opts);
       default:
         console.warn(
           `[rca] unknown plan phase '${phase}' at step ${i} in session ${sessionId}`,
@@ -1906,13 +1981,22 @@ export class SessionManager {
    * Matches handleFinalStatus in the classical path, minus the CONFIRM
    * APDU send (phone already executed it before we got here).
    */
-  private async handlePlanConfirm(sessionId: string): Promise<WSMessage[]> {
-    // Same atomicity argument as handleFinalStatus in the classical path:
-    // a crash between writes would leave an orphaned COMPLETE session with
-    // an ACTIVATED (not PROVISIONED) card and a READY (not CONSUMED) SAD.
-    // $transaction groups them so either all commit or none do.  PCI 10.5 /
-    // patent C5.
-    const session = await prisma.$transaction(async (tx) => {
+  private async handlePlanConfirm(
+    sessionId: string,
+    opts: { sendLater?: (m: WSMessage) => void } = {},
+  ): Promise<WSMessage[]> {
+    // Mobile UX contract matches classical mode exactly: emit
+    // `card_done` synchronously (chip has already ACKed CONFIRM — SW
+    // was verified by handlePlanResponse before we got here), then
+    // run the atomic commit in the background and dispatch
+    // `complete` via sendLater when it lands.  See
+    // docs/runbooks/in-flight-card-done.md.
+    //
+    // Atomicity argument unchanged from pre-split: a crash inside
+    // $transaction rolls back all three writes, so we never end up
+    // with a COMPLETE session pointing at an ACTIVATED card.  PCI
+    // 10.5 / patent C5.
+    const commitWork = prisma.$transaction(async (tx) => {
       const s = await tx.provisioningSession.update({
         where: { id: sessionId },
         data: {
@@ -1925,9 +2009,6 @@ export class SessionManager {
         where: { id: s.cardId },
         data: { status: 'PROVISIONED', provisionedAt: new Date() },
       });
-      // SadRecord flip is legacy-path only (nullable since migration
-      // 20260422140000).  Prototype (PARAM_BUNDLE) cards use
-      // ParamRecord and don't carry a sadRecordId.
       if (s.sadRecordId) {
         await tx.sadRecord.update({
           where: { id: s.sadRecordId },
@@ -1937,27 +2018,47 @@ export class SessionManager {
       return s;
     });
 
-    console.log(
-      `[rca] plan-mode provisioning complete: session=${redactSid(sessionId)}, card=${redactSid(session.cardId)}`,
-    );
-    metrics().counter('rca.provisioning.complete', 1, { mode: 'plan' });
+    const finishCommit = async (): Promise<WSMessage> => {
+      try {
+        const session = await commitWork;
+        console.log(
+          `[rca] plan-mode provisioning complete: ` +
+          `session=${redactSid(sessionId)}, card=${redactSid(session.cardId)}`,
+        );
+        metrics().counter('rca.provisioning.complete', 1, { mode: 'plan' });
+        // Release the step cursor — session is terminal.
+        clearPlanStepState(sessionId);
+        // Best-effort activation callback.
+        this.fireCallback(session.card.cardRef, session.card.chipSerial ?? '').catch((err) =>
+          console.error('[rca] callback failed:', err),
+        );
+        const outboundProxy =
+          session.sadRecord?.proxyCardId ?? session.card.proxyCardId ?? '';
+        return { type: 'complete', proxyCardId: outboundProxy };
+      } catch (err) {
+        console.error(
+          `[rca] plan-mode commit failed after card_done for session ` +
+          `${redactSid(sessionId)}:`, err,
+        );
+        metrics().counter('rca.provisioning.commit_fail', 1, { mode: 'plan' });
+        clearPlanStepState(sessionId);
+        return {
+          type: 'error',
+          code: 'commit_failed',
+          message: 'Provisioning commit failed after chip ACK; re-tap to recover.',
+        };
+      }
+    };
 
-    // Release the step cursor — session is terminal, any further plan
-    // responses for this sessionId must fail at advancePlanStep.
-    clearPlanStepState(sessionId);
+    if (opts.sendLater) {
+      // Background the commit; fire `complete` or `error` via
+      // sendLater when it resolves.
+      finishCommit().then((msg) => opts.sendLater?.(msg));
+      return [{ type: 'card_done' }];
+    }
 
-    // Fire callback to activation service (async, non-blocking).
-    this.fireCallback(session.card.cardRef, session.card.chipSerial ?? '').catch((err) =>
-      console.error('[rca] callback failed:', err),
-    );
-
-    // proxyCardId sourcing: prefer SadRecord (legacy), fall back to
-    // Card.proxyCardId for prototype cards (no SadRecord).
-    const outboundProxy = session.sadRecord?.proxyCardId ?? session.card.proxyCardId ?? '';
-    return [{
-      type: 'complete',
-      proxyCardId: outboundProxy,
-    }];
+    const msg = await finishCommit();
+    return [msg];
   }
 
   /**

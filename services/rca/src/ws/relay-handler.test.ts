@@ -134,9 +134,15 @@ describe('handleRelayConnection', () => {
       expect(mockHandleMessage).toHaveBeenCalledOnce();
     });
 
+    // Post card_done wiring (Stage E): relay passes a third
+    // `opts` argument with a `sendLater` callback so handlers that
+    // split work across the chip-ACK / DB-commit boundary can emit
+    // `complete` after the fact.  Existing callers that don't use
+    // sendLater see no behaviour change.
     expect(mockHandleMessage).toHaveBeenCalledWith(
       'session_01',
       { type: 'pa_fci', hex: '6F00' },
+      expect.objectContaining({ sendLater: expect.any(Function) }),
     );
 
     // Response sent back
@@ -283,6 +289,7 @@ describe('handleRelayConnection', () => {
       expect(mockHandleMessage).toHaveBeenCalledWith(
         'session_01',
         { type: 'response', i: 4, hex: '', sw: '9000' },
+        expect.objectContaining({ sendLater: expect.any(Function) }),
       );
       // Plan mode still uses the same complete-message channel.
       const completeMsg = JSON.parse(ws.sent[0]);
