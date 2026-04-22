@@ -8,9 +8,10 @@
  *      tsx running from src/) and in prod (compiled dist/).
  */
 
+import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { parseCapFile, type CapFile } from './cap-parser.js';
 import { getCardOpsConfig } from '../env.js';
 
@@ -46,6 +47,13 @@ function resolveCapDir(): string {
  * Load and parse a CAP file by key.  Throws with a helpful error if
  * the file is missing — operations should surface this as
  * `CAP_FILE_MISSING` over the WS instead of a generic 500.
+ *
+ * Stage H.1 — also verifies the loaded bytes against the pinned
+ * SHA-256 in cap-files/cap-manifest.json BEFORE returning.  Refuses
+ * to return a CAP whose digest doesn't match the manifest entry, or
+ * whose key has no manifest entry at all.  Closes the supply-chain
+ * gap where a tampered or unintended CAP could be silently flashed
+ * to a card.
  */
 export function loadCap(key: CapKey): CapFile {
   const dir = resolveCapDir();
@@ -53,6 +61,7 @@ export function loadCap(key: CapKey): CapFile {
   if (!existsSync(path)) {
     throw new CapFileMissingError(key, path);
   }
+  verifyCapHash(key, path);
   return parseCapFile(path);
 }
 
@@ -80,6 +89,7 @@ export function loadCapByFilename(filename: string): CapFile {
     // since CapKey is just a string-literal union.
     throw new CapFileMissingError(filename as CapKey, path);
   }
+  verifyCapHash(filename as CapKey, path);
   return parseCapFile(path);
 }
 
@@ -87,5 +97,93 @@ export class CapFileMissingError extends Error {
   constructor(public readonly capKey: CapKey, public readonly path: string) {
     super(`CAP file ${capKey} not found at ${path}`);
     this.name = 'CapFileMissingError';
+  }
+}
+
+export class CapHashMismatchError extends Error {
+  constructor(
+    public readonly capKey: CapKey,
+    public readonly path: string,
+    public readonly expected: string,
+    public readonly actual: string,
+  ) {
+    super(
+      `CAP ${capKey} (${path}) sha256 ${actual} does not match pinned ${expected} ` +
+        `in cap-manifest.json — refusing to install.  If the CAP was intentionally ` +
+        `updated, regenerate the manifest entry (sha256 + version + builtAt).`,
+    );
+    this.name = 'CapHashMismatchError';
+  }
+}
+
+export class CapManifestMissingEntryError extends Error {
+  constructor(public readonly capKey: CapKey, public readonly path: string) {
+    super(
+      `CAP ${capKey} (${path}) has no entry in cap-manifest.json — refusing to ` +
+        `install an unpinned CAP.  Add the entry first (Stage H.1 supply-chain ` +
+        `enforcement: silent unpinned CAPs are exactly what this gate exists to prevent).`,
+    );
+    this.name = 'CapManifestMissingEntryError';
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Stage H.1 — manifest-based hash verification
+// -----------------------------------------------------------------------------
+
+interface CapManifestEntry {
+  sha256: string;       // empty string disables the check (transitional new entries)
+  version: string;
+  builtAt: string;
+  builtBy: string;
+}
+interface CapManifest {
+  entries: Record<string, CapManifestEntry>;
+}
+
+let manifestCache: CapManifest | null = null;
+
+function loadManifest(): CapManifest {
+  if (manifestCache) return manifestCache;
+  const path = join(resolveCapDir(), 'cap-manifest.json');
+  if (!existsSync(path)) {
+    throw new Error(
+      `cap-manifest.json missing at ${path} — Stage H.1 requires the manifest ` +
+        `to be present even if entries are empty.  Create with all currently-shipped ` +
+        `CAP keys + their sha256s.`,
+    );
+  }
+  const raw = readFileSync(path, 'utf8');
+  const parsed = JSON.parse(raw) as CapManifest;
+  if (!parsed || typeof parsed !== 'object' || !parsed.entries) {
+    throw new Error('cap-manifest.json: missing top-level "entries" object');
+  }
+  manifestCache = parsed;
+  return parsed;
+}
+
+/** Test-only: drop the manifest cache so a tweaked manifest reloads. */
+export function _resetCapManifestCache(): void {
+  manifestCache = null;
+}
+
+function verifyCapHash(capKey: CapKey, path: string): void {
+  const manifest = loadManifest();
+  const entry = manifest.entries[capKey as string];
+  if (!entry) {
+    throw new CapManifestMissingEntryError(capKey, path);
+  }
+  // Empty sha256 string = transitional disable.  Logged but not enforced.
+  if (!entry.sha256) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[cap-loader] ⚠️  CAP ${capKey} has empty pinned sha256 in manifest — skipping hash check (transitional).  Pin it as soon as the CAP is finalised.`,
+    );
+    return;
+  }
+  const bytes = readFileSync(path);
+  const actual = createHash('sha256').update(bytes).digest('hex');
+  if (actual.toLowerCase() !== entry.sha256.toLowerCase()) {
+    throw new CapHashMismatchError(capKey, path, entry.sha256, actual);
   }
 }

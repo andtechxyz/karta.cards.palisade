@@ -1,0 +1,49 @@
+{
+  "comment": [
+    "Stage H.1 — applet supply chain: pinned SHA-256 hashes of every CAP",
+    "card-ops will install on a chip.  cap-loader.ts hashes the loaded",
+    "bytes at install time and refuses any CAP whose digest doesn't match.",
+    "",
+    "Update protocol when a new CAP is dropped in cap-files/:",
+    "  1. shasum -a 256 cap-files/<file>.cap",
+    "  2. Update the entry below (sha256 + version + builtAt + builtBy)",
+    "  3. Commit the new CAP and the manifest in the same commit",
+    "",
+    "Future hardening (deferred): cosign signing of CAPs alongside Docker",
+    "images.  Adds a `cosignSig` field per entry verified at the same",
+    "checkpoint as the hash.  Tracked separately because the applet build",
+    "runs off the deploy pipeline today (no GHA cosign integration yet).",
+    "",
+    "An entry whose `sha256` field is empty disables the check for that",
+    "key (back-compat for new entries before we've pinned).  A FILE that",
+    "exists in cap-files/ but has no manifest entry is REJECTED at",
+    "loadCap() time — silent unpinned CAPs are exactly the supply-chain",
+    "gap H.1 closes."
+  ],
+  "entries": {
+    "pa": {
+      "sha256": "7d9beeb097fadcb627170263106de277ae87e9990013ee9b86c369dc03e2fddc",
+      "version": "v1",
+      "builtAt": "2026-04-19T17:29:00Z",
+      "builtBy": "operator (off-pipeline ant build)"
+    },
+    "pa-v3": {
+      "sha256": "41ed8ce9d7ace617c6b475a6b7a142b2cc34771bc5cfe9d74675e099837559b1",
+      "version": "3.0-pre-c16c23",
+      "builtAt": "2026-04-22T08:28:00Z",
+      "builtBy": "operator (off-pipeline ant build); pre-dates today's C16/C23 + cleanup commits.  Does NOT match the artefact currently on the trial card (which was installed via gp.jar directly during today's session).  Refresh this file + bump sha256 next time card-ops installs pa-v3 via the WS path."
+    },
+    "t4t": {
+      "sha256": "",
+      "version": "absent",
+      "builtAt": "",
+      "builtBy": "PalisadeT4T.cap not yet checked in to cap-files/; loadCap('t4t') returns CapFileMissing today."
+    },
+    "receiver": {
+      "sha256": "",
+      "version": "absent",
+      "builtAt": "",
+      "builtBy": "test-receiver.cap not yet checked in to cap-files/; loadCap('receiver') returns CapFileMissing today."
+    }
+  }
+}
