@@ -987,6 +987,93 @@ describe('SessionManager', () => {
       const responses2 = await mgr.handleMessage('session_01', transfer2);
       expect(responses2).toHaveLength(0);
     });
+
+    it('dispatches on semantic phase, not step index — attestation plan routes keygen to step 2', async () => {
+      // Patent C16/C23 plan shape (6 steps):
+      //   0: select_pa
+      //   1: get_attestation_chain   ← NEW
+      //   2: key_generation          ← keygen moved from index 1 → 2
+      //   3: provisioning
+      //   4: finalizing
+      //   5: confirming
+      //
+      // This test proves the session-manager dispatcher no longer
+      // hardcodes `case 1: handlePlanKeygen` — the phase list seeded
+      // into the cursor is the source of truth.
+      const attestationPhases = [
+        'select_pa',
+        'get_attestation_chain',
+        'key_generation',
+        'provisioning',
+        'finalizing',
+        'confirming',
+      ];
+
+      // Seed cursor at lastProcessed=1 so step 2 (key_generation) is the
+      // next expected index.  Must pass phases so phaseForPlanStep
+      // resolves 'key_generation' for i=2.
+      _seedPlanStepStateForTests('session_01', 6, 1, attestationPhases);
+
+      const pub = Buffer.alloc(65, 0x04);
+      const fakeSig = Buffer.alloc(72, 0xAA);
+      const cplc = Buffer.alloc(42, 0xBB);
+      const responseData = Buffer.concat([pub, fakeSig, cplc]);
+
+      (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSession('PLAN_SENT'),
+      );
+
+      const responses = await mgr.handleMessage('session_01', {
+        type: 'response',
+        i: 2, // <-- key_generation under the attestation plan shape
+        hex: responseData.toString('hex'),
+        sw: '9000',
+      });
+
+      expect(responses).toHaveLength(0);
+      // Keygen ran (iccPublicKey persisted) — proves phase dispatch
+      // routed step 2 to handlePlanKeygen, not handlePlanResponse's
+      // old `case 1:` hardcode which would have returned [] silently.
+      expect(prisma.provisioningSession.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            iccPublicKey: expect.any(Buffer),
+          }),
+        }),
+      );
+    });
+
+    it('routes get_attestation_chain step to the chain handler (no DB write, cardCert cached in memory)', async () => {
+      // Minimal cardCert blob (65 B card pubkey + 42 B CPLC + short DER sig).
+      // Contents don't matter for this test — we're only checking that
+      // the step is accepted by the dispatcher and produces no
+      // outbound WS messages.
+      const cardCert = Buffer.concat([
+        Buffer.alloc(65, 0x04),          // card_pubkey
+        Buffer.alloc(42, 0xCC),          // cplc
+        Buffer.from('3046022100' + '33'.repeat(32) + '0221' + '44'.repeat(33), 'hex'),
+      ]);
+
+      _seedPlanStepStateForTests(
+        'session_01',
+        6,
+        0,
+        ['select_pa', 'get_attestation_chain', 'key_generation', 'provisioning', 'finalizing', 'confirming'],
+      );
+
+      const responses = await mgr.handleMessage('session_01', {
+        type: 'response',
+        i: 1, // get_attestation_chain
+        hex: cardCert.toString('hex'),
+        sw: '9000',
+      });
+
+      expect(responses).toHaveLength(0);
+      // Chain step does NOT touch the DB — cert is cached in-memory
+      // and surfaced to the next keygen-step verify() call.  Any
+      // database call here would be spurious.
+      expect(prisma.provisioningSession.update).not.toHaveBeenCalled();
+    });
   });
 
   // -------------------------------------------------------------------------

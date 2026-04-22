@@ -97,6 +97,49 @@ describe('buildProvisioningPlan', () => {
     // Confirm the tail bytes differ as expected.
     expect(b.steps[2].apdu.slice(-8).toUpperCase()).toBe('9000DF01');
   });
+
+  describe('includeAttestationChain option (patent C16/C23)', () => {
+    it('inserts GET_ATTESTATION_CHAIN between SELECT_PA and GENERATE_KEYS', () => {
+      const plan = buildProvisioningPlan(makeCtx(), { includeAttestationChain: true });
+
+      expect(plan.steps).toHaveLength(6);
+      expect(plan.steps.map((s) => s.phase)).toEqual([
+        'select_pa',
+        'get_attestation_chain',
+        'key_generation',
+        'provisioning',
+        'finalizing',
+        'confirming',
+      ]);
+      // Indexes remain 0..N-1 contiguous so the step-cursor validates.
+      expect(plan.steps.map((s) => s.i)).toEqual([0, 1, 2, 3, 4, 5]);
+    });
+
+    it('GET_ATTESTATION_CHAIN APDU is CLA=80 INS=EE with Le=0 (max short response)', () => {
+      const plan = buildProvisioningPlan(makeCtx(), { includeAttestationChain: true });
+      expect(plan.steps[1].apdu).toBe('80EE000000');
+      expect(plan.steps[1].expectSw).toBe('9000');
+    });
+
+    it('progress stays monotonically increasing with the extra step', () => {
+      const plan = buildProvisioningPlan(makeCtx(), { includeAttestationChain: true });
+      for (let i = 1; i < plan.steps.length; i++) {
+        expect(plan.steps[i].progress).toBeGreaterThan(plan.steps[i - 1].progress);
+      }
+    });
+
+    it('default (no option) still emits the 5-step classical sequence', () => {
+      const plan = buildProvisioningPlan(makeCtx());
+      expect(plan.steps).toHaveLength(5);
+      expect(plan.steps.map((s) => s.phase)).toEqual([
+        'select_pa',
+        'key_generation',
+        'provisioning',
+        'finalizing',
+        'confirming',
+      ]);
+    });
+  });
 });
 
 describe('buildTransferSadApdu — real metadata plumbing', () => {

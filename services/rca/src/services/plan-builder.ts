@@ -158,6 +158,24 @@ const FINAL_STATUS_APDU = '80E6000000';
 const CONFIRM_APDU = '80E8000000';
 
 /**
+ * GET_ATTESTATION_CHAIN (patent C16/C23).  Returns the per-card cert
+ * blob loaded at perso (`card_pubkey[65] || cplc[42] || sig[DER]`).
+ * The PA applet's IssuerAttestation.getCardCert() emits the blob
+ * verbatim.  Le=00 = "send as much as available" — the chip tops out
+ * well below 256 B so short-form Le is safe.  Placed BEFORE
+ * GENERATE_KEYS so rca has the cardCert in hand when the keygen
+ * response's attestSig arrives, enabling the Root→Issuer→Card→session
+ * chain walk inside {@link AttestationVerifier.verify} to run
+ * synchronously against one captured buffer instead of a second RTT.
+ *
+ * Only emitted when {@link PlanOptions.includeAttestationChain}
+ * is set — off by default so legacy cards (pre-Drop 3 applet
+ * bytecode, which returns 6D00 INS-not-supported) still get a
+ * successful 5-step plan in permissive mode.
+ */
+const GET_ATTESTATION_CHAIN_APDU = '80EE000000';
+
+/**
  * Minimal "PALISADE" SAD blob — one DGI 0x0101 carrying TLV 0x50
  * (App Label).  Structurally enough to get the PA to SW=9000 on
  * TRANSFER_SAD but writes no real EMV content; only used behind
@@ -220,6 +238,23 @@ export function schemeByteForIssuer(scheme: string): number {
  */
 export interface PlanOptions {
   includeChipChallenge?: boolean;
+  /**
+   * Patent C16/C23 — emit a `GET_ATTESTATION_CHAIN` (CLA=80, INS=EE)
+   * step between SELECT_PA and GENERATE_KEYS so rca receives the
+   * per-card cert blob (loaded at perso via STORE_ATTESTATION) before
+   * the keygen response's attestSig arrives.  The session-manager
+   * stashes the returned cardCert and hands it to
+   * {@link AttestationVerifier.verify} as the `cardCertOverride`
+   * argument on the keygen step.
+   *
+   * Caller is expected to set this from the attestation mode gate:
+   *   - `strict`      → on  (cardCert required; verify fails without it)
+   *   - `permissive`  → off (legacy cards without Drop 3 bytecode would
+   *                          return 6D00 and fail-fast the whole plan)
+   *
+   * Default: off.
+   */
+  includeAttestationChain?: boolean;
 }
 
 /**
@@ -259,6 +294,22 @@ export function buildProvisioningPlan(
 
   steps.push(
     { i: i++, apdu: SELECT_PA_APDU,     phase: 'select_pa',      progress: 0.05, expectSw: '9000' },
+  );
+
+  if (options.includeAttestationChain) {
+    // Patent C16/C23 — fetch the per-card cert blob before keygen so
+    // the subsequent attestSig (trailer on GENERATE_KEYS) can be
+    // verified synchronously against the Root→Issuer→Card chain.
+    // Indexed BEFORE key_generation so the session-manager's
+    // handlePlanAttestationChain can stash the cardCert before
+    // handlePlanKeygen runs the verify.
+    steps.push({
+      i: i++, apdu: GET_ATTESTATION_CHAIN_APDU, phase: 'get_attestation_chain',
+      progress: 0.15, expectSw: '9000',
+    });
+  }
+
+  steps.push(
     { i: i++, apdu: GENERATE_KEYS_APDU, phase: 'key_generation', progress: 0.25, expectSw: '9000' },
     { i: i++, apdu: transferSadApdu,    phase: 'provisioning',   progress: 0.55, expectSw: '9000' },
     { i: i++, apdu: FINAL_STATUS_APDU,  phase: 'finalizing',     progress: 0.80, expectSw: '9000' },

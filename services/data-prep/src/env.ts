@@ -54,6 +54,19 @@ const { get: _getDataPrepConfigRaw, reset: _resetDataPrepConfigRaw } = defineEnv
   // bytes.  Rotate freely in dev (changes MK + iCVV for every card).
   DEV_UDK_ROOT_SEED: z.string().default(''),
 
+  // --- Patent C16/C23: Issuer CA KMS key ARN for per-card card cert signing ---
+  //
+  // alias/palisade-attestation-issuer — ECDSA-P256 signing key owned by
+  // Karta.  Signs the card cert body (card_pubkey || cplc) during
+  // perso so the rca verifier's Root → Issuer → Card chain walk
+  // succeeds.  Root CA stays offline; only the issuer key needs a KMS
+  // runtime handle.
+  //
+  // Empty default keeps `pnpm dev` + unit tests functional (tests use
+  // the in-memory signer from attestation-issuer.ts:makeInMemorySigner).
+  // Prod ECS task def MUST pass the real alias ARN via Secrets Manager.
+  KMS_ATTESTATION_ISSUER_ARN: z.string().default(''),
+
   // --- Patent C17/C22 full build-out: per-field envelope encryption ---
   // '0' (default): prepareParamBundle writes the entire TLV bundle into
   //                bundleEncrypted as today.  Legacy behaviour.

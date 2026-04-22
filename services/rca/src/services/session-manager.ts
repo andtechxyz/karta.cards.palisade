@@ -339,6 +339,57 @@ export function _resetChipNonceCacheForTests(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Card cert cache — patent C16/C23 cross-plan-step carry
+//
+// When includeAttestationChain is on, the GET_ATTESTATION_CHAIN step
+// runs BEFORE GENERATE_KEYS and returns the per-card cert blob (65 B
+// card pubkey + 42 B CPLC + ~72 B DER sig).  The verifier runs at
+// keygen-response time and needs that cardCert plus the attestSig
+// trailer off GEN_KEYS together.  We stash cardCert here between
+// steps — in-memory only, never persisted, cleared on terminal /
+// sweep just like the chip nonce cache.
+//
+// TTL is bounded the same way as chipNonceCache: [10 s, SAD_CACHE_
+// MAX_TTL_MS].  A plan that stalls between steps beyond that window
+// is going to hit the session WS timeout anyway; missing cardCert at
+// verify time surfaces as a normal strict-mode attestation failure
+// with warning 'cardCert not supplied'.
+// ---------------------------------------------------------------------------
+
+interface CardCertEntry {
+  cardCert: Buffer;
+  expiresAt: number;
+}
+const cardCertCache = new Map<string, CardCertEntry>();
+
+function putCardCert(sessionId: string, cardCert: Buffer, ttlMs: number): void {
+  cardCertCache.set(sessionId, {
+    cardCert,
+    expiresAt:
+      Date.now() + Math.min(Math.max(ttlMs, 10_000), SAD_CACHE_MAX_TTL_MS),
+  });
+}
+
+function getCardCert(sessionId: string): Buffer | undefined {
+  const e = cardCertCache.get(sessionId);
+  if (!e) return undefined;
+  if (Date.now() > e.expiresAt) {
+    cardCertCache.delete(sessionId);
+    return undefined;
+  }
+  return e.cardCert;
+}
+
+function clearCardCert(sessionId: string): void {
+  cardCertCache.delete(sessionId);
+}
+
+/** Test hook: clear the card-cert cache between runs. */
+export function _resetCardCertCacheForTests(): void {
+  cardCertCache.clear();
+}
+
+// ---------------------------------------------------------------------------
 // Plan-mode step sequencing (patent C5 state-machine enforcement)
 // ---------------------------------------------------------------------------
 //
@@ -368,6 +419,17 @@ interface PlanStepState {
   lastProcessed: number;
   /** Epoch-ms expiry for sweep — aligns with the session WS timeout. */
   expiresAt: number;
+  /**
+   * Ordered phase names — `phases[i]` is the `phase` field of
+   * `plan.steps[i]`.  Populated at initPlanStepState time so the
+   * inbound-response dispatcher in handlePlanResponse can switch on
+   * semantic phase (`key_generation`, `get_attestation_chain`, …)
+   * instead of a hardcoded index.  Fixes the latent bug where
+   * `includeAttestationChain` or `includeChipChallenge` shift the
+   * keygen step from index 1 to index 2 / 3 respectively and the
+   * original `case 1:` dispatch would mis-route.
+   */
+  phases: string[];
 }
 const planStepState = new Map<string, PlanStepState>();
 const PLAN_STEP_STATE_TTL_MS = 120_000;
@@ -377,12 +439,29 @@ const PLAN_STEP_STATE_TTL_MS = 120_000;
  * by buildPlanForSession() once the plan is built but before it's sent
  * on the wire.
  */
-function initPlanStepState(sessionId: string, stepCount: number): void {
+function initPlanStepState(
+  sessionId: string,
+  phases: string[],
+): void {
   planStepState.set(sessionId, {
-    expectedSteps: stepCount,
+    expectedSteps: phases.length,
     lastProcessed: -1,
     expiresAt: Date.now() + PLAN_STEP_STATE_TTL_MS,
+    phases: [...phases],
   });
+}
+
+/**
+ * Resolve the phase name for a given step index on a session.  Returns
+ * `null` if the session's plan state is gone (sweep / restart / never
+ * armed) — callers treat that as "unknown phase" and reject the
+ * response before dispatching.
+ */
+function phaseForPlanStep(sessionId: string, i: number): string | null {
+  const state = planStepState.get(sessionId);
+  if (!state) return null;
+  if (i < 0 || i >= state.phases.length) return null;
+  return state.phases[i] ?? null;
 }
 
 /**
@@ -423,6 +502,11 @@ function advancePlanStep(
 /** Release the step cursor on terminal / sweep. */
 function clearPlanStepState(sessionId: string): void {
   planStepState.delete(sessionId);
+  // Keep the three session-scoped caches in lockstep.  Anywhere we
+  // terminate / fail a session also scrubs the in-memory attestation
+  // cardCert + chip nonce + SAD pre-decrypt.  Easier to change one
+  // helper than audit four callsites every time.
+  clearCardCert(sessionId);
 }
 
 /** Best-effort sweep of expired plan-step cursors (called from startSession). */
@@ -449,11 +533,33 @@ export function _seedPlanStepStateForTests(
   sessionId: string,
   expectedSteps: number,
   lastProcessed: number = -1,
+  /**
+   * Optional phase names — when omitted the seeder synthesizes the
+   * canonical 5-step classical sequence so existing tests (which
+   * predate phase-based dispatch) keep working unchanged.  New tests
+   * exercising `includeAttestationChain` / `includeChipChallenge`
+   * pass their expected phase order explicitly.
+   */
+  phases?: string[],
 ): void {
+  const defaultPhases = [
+    'select_pa',
+    'key_generation',
+    'provisioning',
+    'finalizing',
+    'confirming',
+  ];
+  const resolvedPhases =
+    phases ??
+    defaultPhases.slice(0, expectedSteps).concat(
+      // Pad if the caller requested more steps than the canonical 5.
+      Array(Math.max(0, expectedSteps - defaultPhases.length)).fill('unknown'),
+    );
   planStepState.set(sessionId, {
     expectedSteps,
     lastProcessed,
     expiresAt: Date.now() + PLAN_STEP_STATE_TTL_MS,
+    phases: resolvedPhases,
   });
 }
 
@@ -676,12 +782,26 @@ export class SessionManager {
       session.sadRecord,
       sessionId,
     );
-    const plan = buildProvisioningPlan(ctx);
+    // Patent C16/C23 gate: strict mode MUST include GET_ATTESTATION_CHAIN
+    // because the verifier needs the cardCert to chain-walk the
+    // attestSig trailer.  Permissive mode leaves it off — legacy cards
+    // (pre-Drop-3 applet bytecode) return 6D00 on INS=0xEE and would
+    // fail-fast the whole plan.  Once every card in the fleet has been
+    // re-personalised with STORE_ATTESTATION material AND bumped to
+    // Drop 3 bytecode, permissive mode goes away and the gate collapses
+    // to "always on".
+    const attestationMode = getRcaConfig().PALISADE_ATTESTATION_MODE;
+    const plan = buildProvisioningPlan(ctx, {
+      includeAttestationChain: attestationMode === 'strict',
+    });
     // Patent C5: arm the per-session step cursor BEFORE the plan goes on
     // the wire.  Any inbound plan-mode response must then match the
     // cursor (step index must strictly increment by 1 starting at 0) —
-    // the server rejects anything else at handlePlanResponse.
-    initPlanStepState(sessionId, plan.steps.length);
+    // the server rejects anything else at handlePlanResponse.  Pass
+    // the phase list so the inbound dispatcher can switch on
+    // semantic phase rather than a hardcoded index (which would
+    // mis-route when optional steps shift the key_generation index).
+    initPlanStepState(sessionId, plan.steps.map((s) => s.phase));
     return plan;
   }
 
@@ -1507,14 +1627,40 @@ export class SessionManager {
       }];
     }
 
-    switch (i) {
-      case 0: return []; // SELECT PA — phone parsed FCI locally; nothing to do server-side
-      case 1: return this.handlePlanKeygen(sessionId, data);
-      case 2: return []; // TRANSFER_SAD — PA returns STATUS bytes; no server action
-      case 3: return this.handlePlanFinalStatus(sessionId, data);
-      case 4: return this.handlePlanConfirm(sessionId);
+    // Phase-based dispatch.  Optional plan steps (GET_ATTESTATION_CHAIN,
+    // chip-challenge pair) shift the canonical key_generation /
+    // provisioning / finalizing / confirming indices around — switching
+    // on the phase name resolves that without a per-option index table.
+    const phase = phaseForPlanStep(sessionId, i);
+    if (phase === null) {
+      console.warn(
+        `[rca] plan step ${i} has no phase mapping in session ${sessionId} ` +
+          `(advancePlanStep accepted it, so this is a state desync)`,
+      );
+      return [];
+    }
+    switch (phase) {
+      case 'select_pa':
+        return []; // Phone parsed FCI locally; nothing server-side.
+      case 'chip_challenge_select':
+      case 'chip_challenge_fetch':
+        // Audit-trail only today; PA applet doesn't consume the nonce
+        // yet.  The step-cursor advance was enough — no server action.
+        return [];
+      case 'get_attestation_chain':
+        return this.handlePlanAttestationChain(sessionId, data);
+      case 'key_generation':
+        return this.handlePlanKeygen(sessionId, data);
+      case 'provisioning':
+        return []; // PA returns STATUS bytes; no server action.
+      case 'finalizing':
+        return this.handlePlanFinalStatus(sessionId, data);
+      case 'confirming':
+        return this.handlePlanConfirm(sessionId);
       default:
-        console.warn(`[rca] unexpected plan step index ${i} in session ${sessionId}`);
+        console.warn(
+          `[rca] unknown plan phase '${phase}' at step ${i} in session ${sessionId}`,
+        );
         return [];
     }
   }
@@ -1534,6 +1680,46 @@ export class SessionManager {
    * execution on the real verdict once the mobile client supports the
    * protocol checkpoint mechanism (plan field {checkpointAfter: 1}).
    */
+  /**
+   * Step: GET_ATTESTATION_CHAIN response — stash the card cert blob
+   * for the subsequent keygen-step verify.
+   *
+   * Wire body (from IssuerAttestation.getCardCert on the applet):
+   *   card_pubkey(65) || cplc(42) || sig(DER ECDSA-SHA256)  — signed
+   *   by the Issuer CA over (card_pubkey || cplc).
+   *
+   * Parsing is lenient here: we accept anything the applet sent and
+   * pass it verbatim to AttestationVerifier.verify (which will
+   * parseCardCert + chain-walk).  A card running pre-Drop-3 bytecode
+   * would have returned 6D00 and the pre-switch fail-fast would
+   * have aborted the plan before we got here — so reaching this
+   * handler implies the chip's IssuerAttestation.getCardCert path
+   * returned 9000.
+   */
+  private async handlePlanAttestationChain(
+    sessionId: string,
+    data: Buffer,
+  ): Promise<WSMessage[]> {
+    if (data.length === 0) {
+      // Shouldn't happen on SW=9000, but treat as "no material loaded"
+      // — strict mode will catch it at verify time with a clearer
+      // 'cardCert missing' warning than anything we could emit here.
+      console.warn(
+        `[rca][plan] GET_ATTESTATION_CHAIN returned 9000 but zero bytes ` +
+          `for session ${redactSid(sessionId)}; verify will fail strict`,
+      );
+      return [];
+    }
+    putCardCert(sessionId, data, PLAN_STEP_STATE_TTL_MS);
+    // Echo a compact log line so operators can audit "did we actually
+    // receive a cert" without chasing per-phase logs across services.
+    console.log(
+      `[rca][plan] attestation chain received: session=${redactSid(sessionId)} ` +
+        `cardCertLen=${data.length}`,
+    );
+    return [];
+  }
+
   private async handlePlanKeygen(sessionId: string, data: Buffer): Promise<WSMessage[]> {
     const extracted = AttestationVerifier.extract(data);
     const { iccPubkey, attestation } = extracted;
@@ -1543,7 +1729,18 @@ export class SessionManager {
     // mode, we log a warning and continue — rollout path until the live
     // fleet has been re-personalised with issuer-signed attestation certs.
     const mode = getRcaConfig().PALISADE_ATTESTATION_MODE;
-    const verifyResult = AttestationVerifier.verify(extracted, mode, attestationConfigFor(mode));
+    // Pull the stashed cardCert off the per-session cache — written by
+    // handlePlanAttestationChain when includeAttestationChain is on.
+    // In permissive mode it's undefined (the step wasn't in the plan);
+    // verify() then falls back to extract.cardCert which is the legacy
+    // pre-split wire shape.
+    const cardCertOverride = getCardCert(sessionId);
+    const verifyResult = AttestationVerifier.verify(
+      extracted,
+      mode,
+      attestationConfigFor(mode),
+      cardCertOverride,
+    );
     metrics().counter('rca.attestation.verify', 1, {
       mode,
       result: verifyResult.ok ? 'ok' : 'fail',
