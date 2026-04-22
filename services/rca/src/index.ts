@@ -19,7 +19,11 @@ import { createServer } from 'node:http';
 import express from 'express';
 import { WebSocketServer } from 'ws';
 import { requireSignedRequest, captureRawBody } from '@palisade/service-auth';
-import { errorMiddleware, apiRateLimit } from '@palisade/core';
+import {
+  errorMiddleware,
+  apiRateLimit,
+  requestIdMiddleware,
+} from '@palisade/core';
 import { prisma } from '@palisade/db';
 import { verifyHandoff, HandoffError } from '@palisade/handoff';
 import { assertAttestationConfigForMode } from './services/attestation-verifier.js';
@@ -43,6 +47,9 @@ const app = express();
 const server = createServer(app);
 
 app.set('trust proxy', 1);
+
+// PCI DSS 10.x / CPL LSR 8 — correlation ID for cross-service tracing.
+app.use(requestIdMiddleware);
 
 // Health check (unauthenticated)
 app.get('/api/health', (_req, res) => {

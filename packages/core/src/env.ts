@@ -149,21 +149,34 @@ export function assertSdmEnv(cfg: {
 // -----------------------------------------------------------------------------
 
 /**
- * Zod schema for a JSON-encoded `{ keyId: hexSecret }` map.  Reused by every
- * service that verifies inbound HMAC-signed requests — each service binds it
- * to its own env-var name.
+ * Zod schema for a JSON-encoded `{ keyId: hexSecret }` or
+ * `{ keyId: [hexSecret, hexSecret, ...] }` map.  Reused by every
+ * service that verifies inbound HMAC-signed requests.
+ *
+ * Array form is the HMAC key-rotation contract (PCI DSS 8.3.6 /
+ * CPL LSR 2).  During a rotation window the map looks like:
+ *
+ *   { "activation": ["<newSecret>", "<oldSecret>"] }
+ *
+ * Callers update to sign with newSecret immediately; in-flight
+ * requests still signed with oldSecret keep verifying until the
+ * old entry is removed.  verifyRequest returns a usedSecretIndex
+ * so operators can observe when the old secret has drained and
+ * can be retired.
+ *
+ * Single-secret form (string value) stays backward compatible.
  */
 export const authKeysJson = z
   .string()
   .min(1)
-  .transform((raw, ctx): Record<string, string> => {
+  .transform((raw, ctx): Record<string, string | readonly string[]> => {
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
     } catch {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: 'value must be a JSON object mapping keyId to hex secret',
+        message: 'value must be a JSON object mapping keyId to hex secret(s)',
       });
       return z.NEVER;
     }
@@ -174,16 +187,56 @@ export const authKeysJson = z
       });
       return z.NEVER;
     }
-    const out: Record<string, string> = {};
+    const out: Record<string, string | readonly string[]> = {};
+    const hexSecretRe = /^[0-9a-fA-F]{64}$/;
     for (const [id, val] of Object.entries(parsed as Record<string, unknown>)) {
-      if (typeof val !== 'string' || !/^[0-9a-fA-F]{64}$/.test(val)) {
+      if (typeof val === 'string') {
+        if (!hexSecretRe.test(val)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `key "${id}" must be 32-byte hex (64 chars)`,
+          });
+          return z.NEVER;
+        }
+        out[id] = val;
+      } else if (Array.isArray(val)) {
+        // Rotation form — every element must be a 64-hex secret.
+        // Empty arrays are rejected so a typo doesn't silently
+        // disable a keyId.
+        if (val.length === 0) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `key "${id}" array must contain at least one secret`,
+          });
+          return z.NEVER;
+        }
+        // Cap at 3 entries — new + previous + previous-previous is
+        // plenty of rotation history.  Any more suggests a missed
+        // cleanup.
+        if (val.length > 3) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `key "${id}" array too long (max 3 entries for rotation history)`,
+          });
+          return z.NEVER;
+        }
+        for (const [idx, secret] of val.entries()) {
+          if (typeof secret !== 'string' || !hexSecretRe.test(secret)) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: `key "${id}"[${idx}] must be 32-byte hex (64 chars)`,
+            });
+            return z.NEVER;
+          }
+        }
+        out[id] = val as readonly string[];
+      } else {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: `key "${id}" must be 32-byte hex (64 chars)`,
+          message: `key "${id}" must be a hex string or an array of hex strings`,
         });
         return z.NEVER;
       }
-      out[id] = val;
     }
     if (Object.keys(out).length === 0) {
       ctx.addIssue({

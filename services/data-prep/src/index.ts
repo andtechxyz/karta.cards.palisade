@@ -14,7 +14,7 @@ await resolveSecretRefs();
 
 import express from 'express';
 import { requireSignedRequest, captureRawBody } from '@palisade/service-auth';
-import { errorMiddleware } from '@palisade/core';
+import { errorMiddleware, requestIdMiddleware } from '@palisade/core';
 import {
   purgeExpiredParamRecords,
   startSweeper,
@@ -27,6 +27,10 @@ const config = getDataPrepConfig();
 const app = express();
 
 app.set('trust proxy', 1);
+
+// PCI DSS 10.x / CPL LSR 8 — correlation ID.  See packages/core/src/
+// request-id.ts.  Mount FIRST so every downstream log line can tag.
+app.use(requestIdMiddleware);
 
 // Health check (unauthenticated — ALB needs it)
 app.get('/api/health', (_req, res) => {

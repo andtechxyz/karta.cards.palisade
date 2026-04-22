@@ -76,8 +76,21 @@ export interface VerifyRequestInput {
   pathAndQuery: string;
   /** Raw body bytes as received.  Pass empty buffer for GET / no body. */
   body: Buffer;
-  /** Map of keyId → 32-byte hex secret.  Supply multiple for rotation. */
-  keys: Record<string, string>;
+  /**
+   * Map of keyId → 32-byte hex secret.
+   *
+   * For rotation with zero downtime: set the value to an array of two
+   * secrets — [newSecret, oldSecret] — during the rotation grace
+   * window.  Verify walks the array in order, returning the first
+   * match.  Callers start signing with newSecret immediately;
+   * requests still carrying oldSecret keep working until the old
+   * entry is removed from the map.  PCI DSS 8.3.6 / CPL LSR 2:
+   * rotate HMAC key material without disrupting in-flight traffic.
+   *
+   * Single-secret case continues to be supported — string form is
+   * treated as [string].
+   */
+  keys: Record<string, string | readonly string[]>;
   /** Unix seconds.  Defaults to now; override for tests. */
   now?: number;
   /** Accept timestamps within ±window seconds of `now`.  Default 60. */
@@ -86,6 +99,14 @@ export interface VerifyRequestInput {
 
 export interface VerifiedRequest {
   keyId: string;
+  /**
+   * Index into the secrets array that matched.  0 means the first
+   * (typically `newSecret` during rotation); non-zero indicates a
+   * grace-period match against an older secret.  Callers can log
+   * `usedSecretIndex !== 0` as a rotation-stragglers metric to
+   * decide when the old secret can be retired.
+   */
+  usedSecretIndex: number;
 }
 
 /** Verify the header on an inbound request.  Throws ServiceAuthError on failure. */
@@ -93,20 +114,32 @@ export function verifyRequest(input: VerifyRequestInput): VerifiedRequest {
   if (!input.authorization) throw new ServiceAuthError('missing_auth');
   const parsed = parseAuthorization(input.authorization);
 
-  const secret = input.keys[parsed.keyId];
-  if (!secret) throw new ServiceAuthError('unknown_key');
+  const secretEntry = input.keys[parsed.keyId];
+  if (secretEntry === undefined) throw new ServiceAuthError('unknown_key');
+
+  // Normalise the entry to an ordered array so single-secret callers
+  // and rotating callers share the same match-against-each-secret
+  // loop.  Empty array means "keyId known but no valid secret
+  // configured" — treat as unknown_key rather than bad_signature so
+  // operators see the config error, not a wire error.
+  const candidates: readonly string[] = typeof secretEntry === 'string' ? [secretEntry] : secretEntry;
+  if (candidates.length === 0) throw new ServiceAuthError('unknown_key');
 
   const now = input.now ?? Math.floor(Date.now() / 1000);
   const window = input.windowSeconds ?? DEFAULT_WINDOW_SECONDS;
   if (Math.abs(now - parsed.ts) > window) throw new ServiceAuthError('clock_skew');
 
-  const expected = hmac(secret, canonical(input.method, input.pathAndQuery, parsed.ts, input.body));
   const got = Buffer.from(parsed.sig, 'hex');
-  if (expected.length !== got.length || !timingSafeEqual(expected, got)) {
-    throw new ServiceAuthError('bad_signature');
+  for (let i = 0; i < candidates.length; i++) {
+    const expected = hmac(
+      candidates[i],
+      canonical(input.method, input.pathAndQuery, parsed.ts, input.body),
+    );
+    if (expected.length === got.length && timingSafeEqual(expected, got)) {
+      return { keyId: parsed.keyId, usedSecretIndex: i };
+    }
   }
-
-  return { keyId: parsed.keyId };
+  throw new ServiceAuthError('bad_signature');
 }
 
 function parseAuthorization(header: string): { keyId: string; ts: number; sig: string } {
@@ -146,8 +179,13 @@ interface RequestWithRawBody extends Request {
 }
 
 export interface RequireSignedRequestOptions {
-  /** keyId → 32-byte hex secret. */
-  keys: Record<string, string>;
+  /**
+   * keyId → secret(s).  String form for single-secret (legacy).  Array
+   * form for rotation: `[newSecret, oldSecret]` — both accepted during
+   * the grace window.  See {@link VerifyRequestInput.keys} for the
+   * zero-downtime rotation playbook.
+   */
+  keys: Record<string, string | readonly string[]>;
   windowSeconds?: number;
   /** For tests — inject a clock instead of Date.now(). */
   now?: () => number;

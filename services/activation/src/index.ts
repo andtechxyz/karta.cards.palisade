@@ -11,7 +11,13 @@ await resolveSecretRefs();
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import { errorMiddleware, serveFrontend, authRateLimit, apiRateLimit } from '@palisade/core';
+import {
+  errorMiddleware,
+  serveFrontend,
+  authRateLimit,
+  apiRateLimit,
+  requestIdMiddleware,
+} from '@palisade/core';
 import { captureRawBody, requireSignedRequest } from '@palisade/service-auth';
 import { purgeExpiredActivationSessions, startSweeper } from '@palisade/retention';
 import { getActivationConfig } from './env.js';
@@ -29,6 +35,9 @@ const app = express();
 app.use(helmet());
 app.use(cors({ origin: config.CORS_ORIGINS, credentials: false }));
 app.set('trust proxy', 1);
+
+// PCI DSS 10.x / CPL LSR 8 — correlation ID for cross-service tracing.
+app.use(requestIdMiddleware);
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'activation' });
