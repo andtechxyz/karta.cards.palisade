@@ -23,13 +23,19 @@ import {
   buildDelete,
   buildInstallForLoad,
   buildInstallForInstall,
+  buildSelectByAid,
   chunkLoadBlock,
 } from '../gp/apdu-builder.js';
-import { establishScp03, type DriveIO } from './scp03-drive.js';
+import { establishScp03, sendAndRecv, type DriveIO } from './scp03-drive.js';
 import { getGpStaticKeys } from '../gp/static-keys.js';
 import { loadCap, CapFileMissingError, type CapKey } from '../gp/cap-loader.js';
 import { SECURITY_LEVEL } from '../gp/scp03.js';
 import { getCardOpsConfig } from '../env.js';
+import {
+  issueCardCert,
+  makeKmsIssuerSigner,
+  CPLC_LEN as ATTEST_CPLC_LEN,
+} from '@palisade/data-prep/services/attestation-issuer';
 import type { WSMessage } from '../ws/messages.js';
 
 type CardOpSessionWithCard = Prisma.CardOpSessionGetPayload<{ include: { card: true } }>;
@@ -194,6 +200,134 @@ export async function runInstallPa(
     });
     if (r4.sw !== 0x9000) {
       throw new Error(`INSTALL [install+selectable] failed SW=${r4.sw.toString(16).toUpperCase()}`);
+    }
+
+    // -----------------------------------------------------------------
+    // Patent C16/C23 — load per-card attestation material.
+    //
+    // Post-install, before returning complete, we:
+    //   (a) fetch CPLC via GET DATA 9F7F on the ISD (SCP03-wrapped)
+    //   (b) mint {privKey, cardCert} via issueCardCert(cplc, kmsSigner)
+    //   (c) close SCP03 + SELECT PA (the freshly-installed applet)
+    //   (d) emit three STORE_ATTESTATION APDUs (CLA=80 INS=EC):
+    //         P1=0x01  raw 32-byte priv scalar  (DGI A001)
+    //         P1=0x02  card cert blob           (DGI A002)
+    //         P1=0x03  42-byte CPLC             (DGI A003)
+    //
+    // Gated on:
+    //   - capKey === 'pa-v3' — only the v3 bytecode has the 0xEC
+    //     handler; legacy pa returns 6D00 and would abort install.
+    //   - KMS_ATTESTATION_ISSUER_ARN non-empty — dev installs without
+    //     the key proceed to complete without attestation; strict-
+    //     mode verify at tap time will then reject the card with a
+    //     clear warning and the operator re-runs install-pa.
+    //
+    // On any failure during the attestation phase we throw — the
+    // applet is installed-but-not-attested, which is benign (strict
+    // mode catches it at the next tap).  Operator retries install-pa
+    // to try again; per-card keypairs are cheap to remint.
+    // -----------------------------------------------------------------
+    const cfg = getCardOpsConfig();
+    const attestArn = cfg.KMS_ATTESTATION_ISSUER_ARN;
+    if (capKey === 'pa-v3' && attestArn) {
+      io.send({ type: 'apdu', hex: '', phase: 'ATTESTATION_FETCH_CPLC', progress: 0.92 });
+
+      // GET DATA 9F7F returns TLV `9F 7F 2A || 42-byte CPLC`.  Still
+      // SCP03-wrapped because we haven't scrubbed the session yet.
+      // Wrap's case-2 handling: passing `data: Buffer.alloc(0)` with
+      // p1/p2=9F/7F produces the minimal APDU the ISD expects.  The
+      // wrap driver adds its own MAC then reads the response.
+      const cplcResp = await send({
+        cla: 0x80, ins: 0xCA, p1: 0x9F, p2: 0x7F, data: Buffer.alloc(0),
+      });
+      if (cplcResp.sw !== 0x9000) {
+        throw new Error(
+          `GET DATA 9F7F (CPLC) failed SW=${cplcResp.sw.toString(16).toUpperCase()}`,
+        );
+      }
+      // Strip the 3-byte TLV header: 9F 7F 2A (42 decimal = length).
+      // The remaining 42 bytes are the CPLC payload.
+      if (cplcResp.data.length < 3 + ATTEST_CPLC_LEN) {
+        throw new Error(
+          `CPLC response too short: ${cplcResp.data.length} bytes ` +
+            `(expected at least ${3 + ATTEST_CPLC_LEN})`,
+        );
+      }
+      const cplc = cplcResp.data.subarray(3, 3 + ATTEST_CPLC_LEN);
+
+      // Mint the per-card keypair + sign the cert body via KMS.  This
+      // is the only synchronous AWS call in the install path — ~80 ms
+      // tail latency on a warm KMS client, which lands before the
+      // operator's admin UI has even re-rendered the progress bar.
+      const signer = makeKmsIssuerSigner(attestArn, cfg.AWS_REGION);
+      const attestBundle = await issueCardCert(cplc, signer);
+
+      // Close SCP03 before the raw STORE_ATTESTATION APDUs.  Those go
+      // to the PA applet (not the ISD), so SCP03's ISD-scoped MAC
+      // chain doesn't cover them; scrub ends the cryptographic
+      // session cleanly and the subsequent SELECT PA takes us out of
+      // ISD context at the card level.
+      scrub();
+
+      io.send({ type: 'apdu', hex: '', phase: 'ATTESTATION_SELECT_PA', progress: 0.94 });
+      const selectPaApdu = buildSelectByAid(PA_INSTANCE_AID);
+      const selectPaResp = await sendAndRecv(io, selectPaApdu, 'ATTESTATION_SELECT_PA');
+      const selectPaSw =
+        (selectPaResp[selectPaResp.length - 2] << 8) | selectPaResp[selectPaResp.length - 1];
+      if (selectPaSw !== 0x9000) {
+        throw new Error(
+          `SELECT PA for STORE_ATTESTATION failed SW=${selectPaSw.toString(16).toUpperCase()}`,
+        );
+      }
+
+      // Three STORE_ATTESTATION APDUs, one per DGI.  CLA=0x80 is the
+      // proprietary PA CLA; INS=0xEC is INS_STORE_ATTESTATION; P1
+      // selects the payload type per applet Constants.ATTEST_P1_*.
+      //
+      // Order doesn't matter at the applet level (flags track per-
+      // DGI completion) but we choose priv-key → cert → cplc so that
+      // if a later step fails the applet has the least amount of
+      // partial material — and the operator's error line identifies
+      // the exact DGI that failed.
+      const steps: ReadonlyArray<{ p1: number; phase: string; payload: Buffer }> = [
+        { p1: 0x01, phase: 'ATTESTATION_STORE_PRIV', payload: attestBundle.cardAttestPrivRaw },
+        { p1: 0x02, phase: 'ATTESTATION_STORE_CERT', payload: attestBundle.cardCert },
+        { p1: 0x03, phase: 'ATTESTATION_STORE_CPLC', payload: cplc },
+      ];
+      let stepIdx = 0;
+      for (const step of steps) {
+        stepIdx += 1;
+        io.send({
+          type: 'apdu', hex: '', phase: step.phase,
+          progress: 0.94 + 0.02 * stepIdx,
+        });
+        if (step.payload.length > 0xff) {
+          throw new Error(
+            `STORE_ATTESTATION P1=${step.p1.toString(16)} payload ` +
+              `${step.payload.length}B exceeds single-APDU max 255B — ` +
+              `applet build needs chained-APDU support`,
+          );
+        }
+        const apdu = Buffer.concat([
+          Buffer.from([0x80, 0xEC, step.p1, 0x00, step.payload.length]),
+          step.payload,
+        ]);
+        const resp = await sendAndRecv(io, apdu, step.phase);
+        const sw = (resp[resp.length - 2] << 8) | resp[resp.length - 1];
+        if (sw !== 0x9000) {
+          throw new Error(
+            `STORE_ATTESTATION P1=${step.p1.toString(16).padStart(2, '0')} ` +
+              `failed SW=${sw.toString(16).toUpperCase()}`,
+          );
+        }
+      }
+
+      // Scrub the in-memory private scalar immediately.  The Buffer
+      // came from issueCardCert — fill(0) is all the cleanup we can
+      // do at the JS layer; the original allocation from
+      // generateKeyPairSync's JWK export was already released when
+      // issueCardCert returned.
+      attestBundle.cardAttestPrivRaw.fill(0);
     }
 
     await prisma.cardOpSession.update({
