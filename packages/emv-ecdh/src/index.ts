@@ -551,3 +551,15 @@ export function scrub(...bufs: (Buffer | Uint8Array)[]): void {
 export function randomP256Scalar(): Buffer {
   return randomBytes(32);
 }
+
+// Attestation-bundle wrapping for remote-ops personalisation.  See
+// src/attestation-wrap.ts + docs/runbooks/attestation-priv-wrapping.md.
+export {
+  wrapAttestationBundle,
+  ATTEST_PRIV_SCALAR_LEN,
+  ATTEST_CPLC_LEN,
+  ATTEST_TLV_TAG_PRIV,
+  ATTEST_TLV_TAG_CERT,
+  ATTEST_TLV_TAG_CPLC,
+} from './attestation-wrap.js';
+export type { WrapAttestationBundleInput } from './attestation-wrap.js';
