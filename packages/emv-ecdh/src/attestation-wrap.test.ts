@@ -19,9 +19,12 @@ import {
 function bootstrapKeypair(): { pub: Buffer; priv: Buffer } {
   const ecdh = createECDH('prime256v1');
   ecdh.generateKeys();
+  // createECDH's Buffer-returning overloads — need explicit casts for
+  // TS's strict mode (the runtime shape is always Buffer when no
+  // encoding is passed).
   return {
-    pub: ecdh.getPublicKey(null, 'uncompressed') as Buffer,
-    priv: ecdh.getPrivateKey(null) as Buffer,
+    pub: ecdh.getPublicKey() as unknown as Buffer,
+    priv: ecdh.getPrivateKey() as unknown as Buffer,
   };
 }
 

@@ -121,9 +121,13 @@ jobs:
         # see ops_ecs_rename_tonight.md for the runbook).  Old vera-*
         # services are kept at desired-count=0 for 24h rollback.
         #
-        # admin now has palisade-admin in this cluster.  card-ops
-        # still has no ECS service of its own — it's invoked via
-        # admin's WS relay, not a standalone container.
+        # admin is palisade-admin.  card-ops joined the matrix
+        # 2026-04-22 now that remote-ops perso requires a dedicated
+        # service (LSR 6 closure).  The card-ops service + ALB target
+        # group + listener rule on card-ops.karta.cards were created
+        # out-of-band; CI just maintains the image + task-def going
+        # forward.  Deploy step tolerates "service not yet created"
+        # during bootstrap so the first push doesn't fail.
         include:
           - service: tap
             port: 3001
@@ -137,6 +141,8 @@ jobs:
             port: 3007
           - service: batch-processor
             port: 3008
+          - service: card-ops
+            port: 3010
           - service: sftp
             port: 22
             dockerfile: services/sftp/Dockerfile
@@ -245,12 +251,25 @@ jobs:
           SERVICE_NAME=palisade-${{ matrix.service }}
           FULL_IMAGE=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.sha.outputs.short }}
 
-          # Fetch the current task definition
-          TASK_DEF_ARN=$(aws ecs describe-services \
+          # Bootstrap tolerance: on the very first push of a new
+          # service (added to the matrix but not yet created in ECS),
+          # describe-services returns `MISSING`.  Image is already
+          # pushed to ECR at this point — operator can run
+          # `aws ecs create-service` referencing the built tag when
+          # ready.  Don't fail the whole deploy matrix on a
+          # missing-service entry.
+          EXISTING_TASK_DEF_ARN=$(aws ecs describe-services \
             --cluster ${{ env.ECS_CLUSTER }} \
             --services ${SERVICE_NAME} \
-            --query 'services[0].taskDefinition' \
-            --output text)
+            --query 'services[?status==`ACTIVE`].taskDefinition | [0]' \
+            --output text 2>/dev/null || echo "None")
+          if [ "${EXISTING_TASK_DEF_ARN}" = "None" ] || [ -z "${EXISTING_TASK_DEF_ARN}" ]; then
+            echo "::notice::Service ${SERVICE_NAME} not yet created; skipping task-def update after image push to ${FULL_IMAGE}.  Run aws ecs create-service manually to bootstrap."
+            exit 0
+          fi
+
+          # Fetch the current task definition
+          TASK_DEF_ARN=$EXISTING_TASK_DEF_ARN
 
           TASK_DEF=$(aws ecs describe-task-definition \
             --task-definition "${TASK_DEF_ARN}" \
