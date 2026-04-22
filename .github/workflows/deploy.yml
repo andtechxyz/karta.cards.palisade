@@ -76,8 +76,14 @@ jobs:
           cache: 'npm'
 
       - run: npm ci
+      # PCI DSS 4.0.1 §6.3.3 / CPL LSR 3: high-severity vulnerabilities in
+      # dependencies must block CI.  This step previously ran with
+      # `continue-on-error: true` which silently admitted CRITICAL+ vulns
+      # — removed 2026-04-21 per the PCI audit (see
+      # docs/compliance/PCI_DSS_4_0_1_AUDIT_2026-04-21.md §Req 5).
+      # Override for a specific CVE requires a documented exception in
+      # this workflow + a tracking issue.
       - run: npm audit --audit-level=high
-        continue-on-error: true
       - run: npx prisma generate --schema packages/db/prisma/schema.prisma
       - run: npx tsc -b
       - run: npx vitest run

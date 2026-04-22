@@ -1,0 +1,7 @@
+Contact: mailto:security@karta.cards
+Expires: 2027-04-21T00:00:00+00:00
+Preferred-Languages: en
+Canonical: https://karta.cards/.well-known/security.txt
+Policy: https://karta.cards/docs/compliance/SECURITY.md
+Acknowledgments: https://karta.cards/security/hall-of-thanks
+Hiring: https://karta.cards/careers
