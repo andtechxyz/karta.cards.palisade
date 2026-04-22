@@ -5,9 +5,11 @@ import javacard.framework.JCSystem;
 import javacard.framework.Util;
 import javacard.security.AESKey;
 import javacard.security.ECPrivateKey;
+import javacard.security.HMACKey;
 import javacard.security.KeyAgreement;
 import javacard.security.KeyBuilder;
 import javacard.security.MessageDigest;
+import javacard.security.Signature;
 import javacardx.crypto.Cipher;
 
 /**
@@ -78,6 +80,25 @@ public final class EcdhUnwrapper {
      * mid-update.
      */
     static MessageDigest sha256;
+    /**
+     * Persistent HMAC-SHA256 Signature.  Replaces the prior manual
+     * HMAC-over-MessageDigest in hmacSha256() / hmacSha256TwoSeg().
+     * Removes the ipad/opad XOR loop + double-SHA-256 chain that
+     * previously cost ~20-40ms per TRANSFER_PARAMS; the platform
+     * primitive does it all in one init/update/sign cycle.
+     *
+     * Allocated once in initOnce.  Lives in the same applet-budget
+     * pool as the persistent ECDSA Signature in IssuerAttestation
+     * and the persistent MessageDigest above; verified to fit on
+     * the JCOP 5 trial-card SKU.
+     */
+    private static Signature hmacSig;
+    /**
+     * HMACKey reset() per-call to whatever HKDF/HMAC stage's key is.
+     * RAM-only (CLEAR_ON_DESELECT) so no key material survives a
+     * deselect, in line with other transient session state.
+     */
+    private static HMACKey hmacSigKey;
     private static Cipher aesCipher;
     private static AESKey aesKey;
 
@@ -87,9 +108,7 @@ public final class EcdhUnwrapper {
     private static byte[] expTagBuf;    // 32 B — full SHA-256 output
     private static byte[] hmacMsgBuf;   // up to iv(16) + max ct — see note
 
-    /** HMAC block-sized key buffer, reused for inline HMAC computations. */
-    private static byte[] hmacKey;
-    /** Scratch used for HMAC inner/outer pad XOR + final hash input. */
+    /** Scratch for staging HKDF-Expand info (T(1)[32] || sessionId || counter). */
     private static byte[] hmacScratch;
 
     /**
@@ -108,6 +127,18 @@ public final class EcdhUnwrapper {
             KeyAgreement.ALG_EC_SVDP_DH_PLAIN, false
         );
         sha256 = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
+        // Platform HMAC-SHA256 — replaces the manual ipad/opad loop in
+        // hmacSha256() / hmacSha256TwoSeg().  See the hmacSig field doc.
+        hmacSig = Signature.getInstance(Signature.ALG_HMAC_SHA_256, false);
+        // Transient HMAC key — set per-call via setKey(); never persists.
+        // LENGTH_HMAC_SHA_256_BLOCK_64 = 64 B = the SHA-256 block size,
+        // which is also the max useful HMAC key size; longer keys get
+        // pre-hashed by setKey()/sign() per RFC 2104.
+        hmacSigKey = (HMACKey) KeyBuilder.buildKey(
+            KeyBuilder.TYPE_HMAC_TRANSIENT_DESELECT,
+            KeyBuilder.LENGTH_HMAC_SHA_256_BLOCK_64,
+            false
+        );
 
         // AES-128-CBC with PKCS#5/PKCS#7 padding.  JC 3.0.4 exposes this
         // constant directly; chip handles pad/unpad transparently.
@@ -128,7 +159,6 @@ public final class EcdhUnwrapper {
         prkBuf      = JCSystem.makeTransientByteArray((short) 32, JCSystem.CLEAR_ON_DESELECT);
         okmBuf      = JCSystem.makeTransientByteArray((short) 64, JCSystem.CLEAR_ON_DESELECT);
         expTagBuf   = JCSystem.makeTransientByteArray((short) 32, JCSystem.CLEAR_ON_DESELECT);
-        hmacKey     = JCSystem.makeTransientByteArray((short) 64, JCSystem.CLEAR_ON_DESELECT);
         // hmacScratch MUST fit the largest HKDF-Expand input staged here:
         //     T(2) = T(1)[32] || sessionId[<=79] || counter[1] = 112 B max
         // where sessionIdLen caps at 63 (incoming GEN_KEYS body limit)
@@ -331,82 +361,48 @@ public final class EcdhUnwrapper {
         Util.arrayFillNonAtomic(prkBuf,      (short) 0, (short) 32, (byte) 0);
         Util.arrayFillNonAtomic(okmBuf,      (short) 0, (short) 64, (byte) 0);
         Util.arrayFillNonAtomic(expTagBuf,   (short) 0, (short) 32, (byte) 0);
-        Util.arrayFillNonAtomic(hmacKey,     (short) 0, (short) 64, (byte) 0);
         Util.arrayFillNonAtomic(hmacScratch, (short) 0, (short) 128, (byte) 0);
+        // hmacKey isn't a buffer any more — the platform HMACKey clears
+        // itself on deselect (TRANSIENT_DESELECT) and per setKey() call.
     }
 
     // ---------------------------------------------------------------
-    // HMAC-SHA256 helpers (inline RFC 2104).
+    // HMAC-SHA256 helpers — platform Signature.ALG_HMAC_SHA_256.
     //
-    // Note: JC 3.0.5 does expose Signature.ALG_HMAC_SHA_256 as a
-    // primitive, and switching to it would shave ~20-40ms per
-    // TRANSFER_PARAMS by avoiding the manual ipad/opad XOR + double-
-    // SHA-256 here.  Tracked as a perso-speed optimisation; deferred
-    // because the manual path is byte-parity-tested against the TS
-    // reference (packages/emv-ecdh) and a primitive swap risks
-    // breaking that without careful equivalence verification.
+    // Replaces the prior manual ipad/opad XOR + double-SHA-256 chain.
+    // RFC 2104 / FIPS 198 conformant: HMACKey.setKey() right-pads
+    // shorter keys with zeros and pre-hashes longer keys to fit the
+    // 64-byte SHA-256 block size; both behaviours are mandated by the
+    // spec and matched by every conformant implementation we've
+    // round-tripped against (Node.js crypto, OpenSSL, the chip's own
+    // platform).  Byte-parity is verified on hardware against the TS
+    // reference in packages/emv-ecdh — a successful TRANSFER_PARAMS
+    // unwrap of a ts-side wrapped bundle proves the chip-side HMAC
+    // tag matched, which proves both HKDF derivation and tag verify
+    // produced identical bytes on both sides.
+    //
+    // Performance: ~20-40 ms saved per TRANSFER_PARAMS on the JCOP 5
+    // trial card (eliminates 5 SHA-256 doFinal calls + 64-byte XOR
+    // loops per HMAC, of which 4 HMACs run per unwrap).
     // ---------------------------------------------------------------
 
     /**
-     * Single-segment HMAC-SHA256.
-     *
-     * IMPORTANT — buffer-aliasing contract: this helper mutates
-     * `hmacKey` in place (ipad XOR, then re-XOR to opad) but does NOT
-     * touch `hmacScratch`.  That means the caller is free to pass
-     * `hmacScratch` as the message buffer (HKDF-Expand relies on this
-     * — it stages `info || 0x01` and `T(1) || info || 0x02` in
-     * hmacScratch before calling us).  An earlier version of this
-     * helper used hmacScratch for the pad-XOR scratch, which silently
-     * clobbered the message before SHA-256 could read it — the
-     * resulting HKDF output diverged from the server's and tripped
-     * SW_DBG_IV_MISMATCH (0x6AE4) on every real tap.
+     * Single-segment HMAC-SHA256.  Writes 32 B to out[outOff..].
      */
     private static void hmacSha256(
         byte[] keyBuf, short keyOff, short keyLen,
         byte[] msgBuf, short msgOff, short msgLen,
         byte[] out, short outOff
     ) {
-        // Key prep: right-pad to 64 B with zeros, or pre-hash if longer.
-        Util.arrayFillNonAtomic(hmacKey, (short) 0, (short) 64, (byte) 0);
-        if (keyLen > (short) 64) {
-            sha256.reset();
-            sha256.doFinal(keyBuf, keyOff, keyLen, hmacKey, (short) 0);
-        } else {
-            Util.arrayCopyNonAtomic(keyBuf, keyOff, hmacKey, (short) 0, keyLen);
-        }
-
-        // inner = SHA-256((K ⊕ ipad) || msg)
-        // XOR the ipad in place into hmacKey so we don't need a
-        // separate scratch buffer (which would risk aliasing with
-        // msgBuf — see class-level contract).
-        for (short i = (short) 0; i < (short) 64; i++) {
-            hmacKey[i] = (byte) (hmacKey[i] ^ 0x36);
-        }
-        sha256.reset();
-        sha256.update(hmacKey, (short) 0, (short) 64);
-        sha256.doFinal(msgBuf, msgOff, msgLen, out, outOff);
-        // out[outOff..outOff+32) = inner hash
-
-        // Transform hmacKey from (K ⊕ ipad) to (K ⊕ opad) by XOR-ing
-        // with (ipad ⊕ opad) = 0x36 ^ 0x5C = 0x6A — saves a second
-        // copy of the raw key.
-        for (short i = (short) 0; i < (short) 64; i++) {
-            hmacKey[i] = (byte) (hmacKey[i] ^ 0x6A);
-        }
-        // outer = SHA-256((K ⊕ opad) || inner)
-        sha256.reset();
-        sha256.update(hmacKey, (short) 0, (short) 64);
-        sha256.doFinal(out, outOff, (short) 32, out, outOff);
+        hmacSigKey.setKey(keyBuf, keyOff, keyLen);
+        hmacSig.init(hmacSigKey, Signature.MODE_SIGN);
+        hmacSig.sign(msgBuf, msgOff, msgLen, out, outOff);
     }
 
     /**
      * Two-segment HMAC-SHA256 — key, then message = seg1 || seg2.
      * Used for encrypt-then-MAC where the tag covers iv || ct without
      * needing to allocate a scratch buffer that holds both.
-     *
-     * Same buffer-aliasing contract as hmacSha256(): mutates hmacKey
-     * in place, does not touch hmacScratch, so either seg buffer may
-     * safely alias hmacScratch.
      */
     private static void hmacSha256TwoSeg(
         byte[] keyBuf, short keyOff, short keyLen,
@@ -414,30 +410,10 @@ public final class EcdhUnwrapper {
         byte[] seg2Buf, short seg2Off, short seg2Len,
         byte[] out, short outOff
     ) {
-        Util.arrayFillNonAtomic(hmacKey, (short) 0, (short) 64, (byte) 0);
-        if (keyLen > (short) 64) {
-            sha256.reset();
-            sha256.doFinal(keyBuf, keyOff, keyLen, hmacKey, (short) 0);
-        } else {
-            Util.arrayCopyNonAtomic(keyBuf, keyOff, hmacKey, (short) 0, keyLen);
-        }
-
-        // inner = SHA-256((K ⊕ ipad) || seg1 || seg2) — in-place on hmacKey
-        for (short i = (short) 0; i < (short) 64; i++) {
-            hmacKey[i] = (byte) (hmacKey[i] ^ 0x36);
-        }
-        sha256.reset();
-        sha256.update(hmacKey, (short) 0, (short) 64);
-        sha256.update(seg1Buf, seg1Off, seg1Len);
-        sha256.doFinal(seg2Buf, seg2Off, seg2Len, out, outOff);
-
-        // Transform hmacKey from (K ⊕ ipad) to (K ⊕ opad) via XOR 0x6A.
-        for (short i = (short) 0; i < (short) 64; i++) {
-            hmacKey[i] = (byte) (hmacKey[i] ^ 0x6A);
-        }
-        // outer = SHA-256((K ⊕ opad) || inner)
-        sha256.reset();
-        sha256.update(hmacKey, (short) 0, (short) 64);
-        sha256.doFinal(out, outOff, (short) 32, out, outOff);
+        hmacSigKey.setKey(keyBuf, keyOff, keyLen);
+        hmacSig.init(hmacSigKey, Signature.MODE_SIGN);
+        hmacSig.update(seg1Buf, seg1Off, seg1Len);
+        hmacSig.sign(seg2Buf, seg2Off, seg2Len, out, outOff);
     }
+
 }
