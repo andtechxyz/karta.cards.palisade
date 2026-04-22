@@ -49,6 +49,23 @@ const verifyCognito = createCognitoTokenVerifier({
   clientId: process.env.COGNITO_CLIENT_ID ?? '7pj9230obhsa6h6vrvk9tru7do',
 });
 
+// Stage C.2 rollout escape hatch — see env.ts comment.  When this
+// flag is on, the WS upgrade skips Cognito JWT validation entirely
+// (falling back to the pre-C.2 wsUrl+tok-only auth).  Loud startup
+// warning so the gap shows up in CloudWatch even if the operator
+// forgets they enabled it.
+const ALLOW_UNAUTH_WS = config.ALLOW_UNAUTHENTICATED_WS === '1';
+if (ALLOW_UNAUTH_WS) {
+  console.warn(
+    '[card-ops] ⚠️  ALLOW_UNAUTHENTICATED_WS=1 is set — Cognito JWT ' +
+      'validation on the WS upgrade is DISABLED.  Operator attribution ' +
+      'falls back to session-cuid trust (pre-Stage-C.2 baseline).  ' +
+      'PCI DSS 10.2.5 warning: connections will be accepted without ' +
+      'verifying the connecting client matches session.initiatedBy.  ' +
+      'Remove this env var as soon as all clients pass ?id_token=<JWT>.',
+  );
+}
+
 app.set('trust proxy', 1);
 
 // PCI DSS 10.x / CPL LSR 8 — correlation ID for cross-service tracing.
@@ -145,42 +162,57 @@ wss.on('connection', async (ws, req) => {
     // activation's POST /api/admin/card-op/start).  CLI ops tools
     // grab the JWT from `aws cognito-idp admin-initiate-auth` (or
     // the token cache) and append it to the wsUrl before connecting.
-    const idToken = parsedUrl.searchParams.get('id_token');
-    if (!idToken) {
+    //
+    // ALLOW_UNAUTHENTICATED_WS=1 escape hatch (env.ts) skips this
+    // entire block — see the startup warning above; transitional
+    // only.  When the flag is on we still stamp wsConnectedAt so
+    // audit reads can tell "WS connected" from "never connected"
+    // even without a connecting-operator sub.
+    if (ALLOW_UNAUTH_WS) {
       console.warn(
-        `[card-ops-ws] missing id_token for ${redactSid(sessionId)} — operator identity unverifiable`,
+        `[card-ops-ws] ⚠️  unauthenticated WS upgrade for ${redactSid(sessionId)} ` +
+          `(ALLOW_UNAUTHENTICATED_WS=1; PCI 10.2.5 reduced to session-cuid trust)`,
       );
-      ws.close(4001, 'Missing id_token query param');
-      return;
+      await prisma.cardOpSession.update({
+        where: { id: sessionId },
+        data: { wsConnectedAt: new Date() },
+      });
+    } else {
+      const idToken = parsedUrl.searchParams.get('id_token');
+      if (!idToken) {
+        console.warn(
+          `[card-ops-ws] missing id_token for ${redactSid(sessionId)} — operator identity unverifiable`,
+        );
+        ws.close(4001, 'Missing id_token query param');
+        return;
+      }
+      const verifyResult = await verifyCognito(idToken);
+      if (!verifyResult.ok) {
+        console.warn(
+          `[card-ops-ws] cognito verify failed for ${redactSid(sessionId)}: ${verifyResult.code}`,
+        );
+        ws.close(4001, `id_token rejected: ${verifyResult.code}`);
+        return;
+      }
+      if (verifyResult.user.sub !== session.initiatedBy) {
+        console.warn(
+          `[card-ops-ws] operator mismatch for ${redactSid(sessionId)}: ` +
+            `connecting=${redactSid(verifyResult.user.sub)} initiated=${redactSid(session.initiatedBy)}`,
+        );
+        ws.close(4001, 'Operator does not match session initiator');
+        return;
+      }
+      // Stamp who actually connected onto the audit trail.  Separate
+      // from initiatedBy because future relay-by-proxy modes could
+      // split the two; for now they're equal by the check above.
+      await prisma.cardOpSession.update({
+        where: { id: sessionId },
+        data: {
+          wsConnectedBy: verifyResult.user.sub,
+          wsConnectedAt: new Date(),
+        },
+      });
     }
-    const verifyResult = await verifyCognito(idToken);
-    if (!verifyResult.ok) {
-      console.warn(
-        `[card-ops-ws] cognito verify failed for ${redactSid(sessionId)}: ${verifyResult.code}`,
-      );
-      ws.close(4001, `id_token rejected: ${verifyResult.code}`);
-      return;
-    }
-    if (verifyResult.user.sub !== session.initiatedBy) {
-      console.warn(
-        `[card-ops-ws] operator mismatch for ${redactSid(sessionId)}: ` +
-          `connecting=${redactSid(verifyResult.user.sub)} initiated=${redactSid(session.initiatedBy)}`,
-      );
-      ws.close(4001, 'Operator does not match session initiator');
-      return;
-    }
-    // Stamp who actually connected onto the audit trail.  This is a
-    // separate field from initiatedBy because edge cases exist where
-    // the connecting operator could differ (e.g. a future relay-by-
-    // proxy mode); for now they're equal by the check above, but the
-    // explicit stamp removes ambiguity in audit reads.
-    await prisma.cardOpSession.update({
-      where: { id: sessionId },
-      data: {
-        wsConnectedBy: verifyResult.user.sub,
-        wsConnectedAt: new Date(),
-      },
-    });
   } catch (err) {
     console.error('[card-ops-ws] session validation error:', err);
     ws.close(4001, 'Session validation failed');

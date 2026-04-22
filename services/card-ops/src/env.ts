@@ -61,6 +61,24 @@ const { get: _getCardOpsConfigRaw, reset: _resetCardOpsConfig } = defineEnv({
   // 64 hex chars (32 bytes).
   WS_TOKEN_SECRET: z.string().regex(/^[0-9a-fA-F]{64}$/, 'WS_TOKEN_SECRET must be 64 hex chars (32 bytes)'),
 
+  // TEMPORARY escape hatch for Stage C.2 rollout — when set to '1',
+  // the WS upgrade handler skips the Cognito JWT validation that
+  // requires `?id_token=<JWT>` matching session.initiatedBy.
+  //
+  // Defaults UNSET (= validation enforced).  CLI ops tools that
+  // pre-date the JWT requirement should append the token to wsUrl;
+  // this flag exists only to keep them limping while operators
+  // update their tooling.
+  //
+  // PCI DSS 10.2.5 — setting this in production weakens operator
+  // attribution from "Cognito-verified" to "session-cuid trusted",
+  // which is the pre-Stage-C.2 baseline.  The card-ops process
+  // logs a loud warning at startup AND on every WS connect that
+  // bypasses validation, so the gap is visible in CloudWatch.
+  // Remove from env (and delete this branch) once all clients
+  // pass id_token.
+  ALLOW_UNAUTHENTICATED_WS: z.string().optional(),
+
   // --- Patent C16/C23: Issuer CA KMS key ARN for per-card attestation
   // material minting during install-pa perso.  Direct-imports
   // issueCardCert + makeKmsIssuerSigner from @palisade/data-prep so
