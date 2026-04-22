@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Ant build for pa-v3.cap — Palisade Provisioning Agent v3 with
+  chip-computed-DGI support for MChip CVN 18.
+
+  See applets/pa-v3/README.md for architectural overview + APDU ref.
+
+  AIDs:
+    Package AID:   A000000062504103        (bumped from v1's A0000000625041)
+    Module AID:    A0000000625041034C      (same convention: package || 0x4C)
+    Instance AID:  A0000000625041034C      (same as module)
+
+  Coexists with v1 on-card so a deployment with mixed v1 + v3 cards can
+  run for the migration window — v1 continues to accept legacy
+  TRANSFER_SAD, v3 accepts the new TRANSFER_PARAMS.
+
+  Usage:
+    ant -f build.xml build
+
+  Requires:
+    JC_HOME pointing to Java Card Classic API 3.0.5 SDK
+    ant-javacard.jar in this directory (copy from applets/pav2/)
+-->
+<project name="pa-v3" default="build" basedir=".">
+    <property environment="env"/>
+    <property name="JC_SDK" value="${env.JC_HOME}"/>
+
+    <taskdef name="javacard" classname="pro.javacard.ant.JavaCard" classpath="ant-javacard.jar"/>
+
+    <target name="build">
+        <javacard jckit="${JC_SDK}">
+            <cap aid="A0:00:00:00:62:50:41:03"
+                 package="com.palisade.pa"
+                 version="3.0"
+                 output="build/pa-v3.cap"
+                 sources="src/main/java">
+                <applet class="com.palisade.pa.ProvisioningAgentV3"
+                        aid="A0:00:00:00:62:50:41:03:4C"/>
+            </cap>
+        </javacard>
+    </target>
+
+    <target name="clean">
+        <delete dir="build"/>
+    </target>
+</project>

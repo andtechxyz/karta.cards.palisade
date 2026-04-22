@@ -3,9 +3,11 @@
 This directory is the resolution root for every CAP file card-ops loads
 at runtime. Two resolution paths:
 
-- **Dictionary keys** (`loadCap(key)` in `src/gp/cap-loader.ts`) — three
+- **Dictionary keys** (`loadCap(key)` in `src/gp/cap-loader.ts`) — four
   canonical keys baked into `CAP_NAMES`:
-  - `pa` → `pa.cap`
+  - `pa` → `pa.cap` (legacy PA v1, `INS_TRANSFER_SAD`)
+  - `pa-v3` → `pa-v3.cap` (prototype PA v3, `INS_TRANSFER_PARAMS` with
+    ECDH-wrapped ParamBundle; dual-mode fallback to SAD)
   - `t4t` → `PalisadeT4T.cap`
   - `receiver` → `test-receiver.cap`
 - **Filename lookup** (`loadCapByFilename(filename)`) — used by the
@@ -17,6 +19,7 @@ at runtime. Two resolution paths:
 | Filename | Status | Source |
 |---|---|---|
 | `pa.cap` | present | built from `Palisade/tools/jcbuild/` in the reference tree; also lives at `Palisade/pa.cap` |
+| `pa-v3.cap` | present | built from `applets/pa-v3/` in this worktree via `ant -f applets/pa-v3/build.xml` (JDK 11 + JCDK 3.0.4); 28 KB |
 | `PalisadeT4T.cap` | **missing** | drop in from palisade-t4t build; `t4t` key is wired but ops will throw `CAP_FILE_MISSING` until the file arrives |
 | `test-receiver.cap` | **missing** | drop in from test harness; same behaviour |
 | `mchip_advance_v1.2.3.cap` | **missing** | NXP M/Chip Advance v1.2.3 (CVN 18); linked from 545490 Pty Ltd's `ChipProfile.paymentAppletCapFilename`; ships in the M/Chip Advance license delivery |

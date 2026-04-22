@@ -1,104 +1,200 @@
+/**
+ * Tests for the post-Option-A attestation verifier.  No X.509 — compact
+ * binary certs only.  Fixtures are built from real P-256 keypairs so
+ * every ECDSA path is exercised against node:crypto, not mocked.
+ */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createSign, generateKeyPairSync } from 'node:crypto';
+import {
+  createPrivateKey,
+  createSign,
+  generateKeyPairSync,
+  type KeyObject,
+} from 'node:crypto';
 import {
   AttestationVerifier,
   STUB_MODE_WARNING,
   ICC_PUBKEY_LEN,
+  SEC1_UNCOMPRESSED_LEN,
   CPLC_LEN,
+  ISSUER_ID_LEN,
+  assertAttestationConfigForMode,
   verifyAttestationSignature,
   type AttestationExtractResult,
+  type AttestationVerifierConfig,
 } from './attestation-verifier.js';
 
-/** Build an extract result for the verifier unit tests. */
-function mkExtract(
-  attestation: Buffer,
-  certChain: Buffer = Buffer.alloc(0),
-): AttestationExtractResult {
+// ---------------------------------------------------------------------------
+// Fixture helpers — build real compact certs from real P-256 keys so the
+// strict-mode verify path exercises the full Root → Issuer → Card → attest
+// chain end-to-end.
+// ---------------------------------------------------------------------------
+
+interface Keypair {
+  priv: KeyObject;
+  pub: KeyObject;
+  /** 65-byte SEC1 uncompressed: 0x04 || X || Y. */
+  pubRaw: Buffer;
+}
+
+function newKeypair(): Keypair {
+  const { publicKey, privateKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  const spki = publicKey.export({ format: 'der', type: 'spki' }) as Buffer;
+  // SPKI tail = raw 65-byte SEC1 point.
+  const pubRaw = spki.subarray(spki.length - SEC1_UNCOMPRESSED_LEN);
+  return { priv: privateKey, pub: publicKey, pubRaw };
+}
+
+function signDer(priv: KeyObject, msg: Buffer): Buffer {
+  const s = createSign('SHA256');
+  s.update(msg);
+  return s.sign(priv);
+}
+
+function buildIssuerCertBlob(root: Keypair, issuer: Keypair, issuerId: number): Buffer {
+  const idBuf = Buffer.alloc(ISSUER_ID_LEN);
+  idBuf.writeUInt32BE(issuerId);
+  const body = Buffer.concat([issuer.pubRaw, idBuf]);
+  const sig = signDer(root.priv, body);
+  return Buffer.concat([body, sig]);
+}
+
+function buildCardCertBlob(issuer: Keypair, card: Keypair, cplc: Buffer): Buffer {
+  if (cplc.length !== CPLC_LEN) throw new Error(`cplc must be ${CPLC_LEN} bytes`);
+  const body = Buffer.concat([card.pubRaw, cplc]);
+  const sig = signDer(issuer.priv, body);
+  return Buffer.concat([body, sig]);
+}
+
+function buildKeygenResponse(
+  icc: Keypair,
+  card: Keypair,
+  cplc: Buffer,
+  cardCert: Buffer,
+): Buffer {
+  // attestSig is signed by the per-card attestation key (card.priv) over
+  // (iccPubkey || cplc) — i.e. the card attests this session's ephemeral pubkey.
+  const attestSig = signDer(card.priv, Buffer.concat([icc.pubRaw, cplc]));
+  return Buffer.concat([icc.pubRaw, attestSig, cardCert]);
+}
+
+/** Build a complete config + response pair.  Every test that needs the full
+ *  chain starts here so fixture drift stays confined to one place. */
+function buildChainFixture() {
+  const root = newKeypair();
+  const issuer = newKeypair();
+  const card = newKeypair();
+  const icc = newKeypair();
+  const cplc = Buffer.alloc(CPLC_LEN, 0xAB);
+  const issuerCert = buildIssuerCertBlob(root, issuer, /*issuerId=*/ 42);
+  const cardCert = buildCardCertBlob(issuer, card, cplc);
+  const keygenResponse = buildKeygenResponse(icc, card, cplc, cardCert);
+  const config: AttestationVerifierConfig = {
+    rootPubkey: root.pubRaw,
+    issuerCert,
+  };
+  return { root, issuer, card, icc, cplc, config, keygenResponse };
+}
+
+/** Build a minimal AttestationExtractResult for permissive-mode tests. */
+function mkExtract(attestSig: Buffer, cardCert: Buffer = Buffer.alloc(0)): AttestationExtractResult {
   return {
     iccPubkey: Buffer.alloc(ICC_PUBKEY_LEN, 0x04),
-    attestation,
+    attestSig,
+    attestation: attestSig,
+    cardCert,
+    certChain: cardCert,
     cplc: Buffer.alloc(CPLC_LEN, 0xcc),
-    certChain,
   };
 }
 
+// ---------------------------------------------------------------------------
+
 describe('AttestationVerifier.extract', () => {
-  it('splits a well-formed response into pubkey(65) + attestation(var) + cplc(42)', () => {
-    const pub = Buffer.alloc(ICC_PUBKEY_LEN, 0x04);
-    const sig = Buffer.from('3045022100' + 'AA'.repeat(32) + '022000' + 'BB'.repeat(30), 'hex');
-    const cplc = Buffer.alloc(CPLC_LEN, 0xCC);
-    const full = Buffer.concat([pub, sig, cplc]);
+  it('splits a well-formed response into iccPubkey / attestSig / cardCert', () => {
+    const { keygenResponse, icc, card, cplc } = buildChainFixture();
 
-    const { iccPubkey, attestation, cplc: cplcOut, certChain } = AttestationVerifier.extract(full);
+    const out = AttestationVerifier.extract(keygenResponse);
 
-    expect(iccPubkey.length).toBe(ICC_PUBKEY_LEN);
-    expect(iccPubkey.equals(pub)).toBe(true);
-    expect(attestation.length).toBe(sig.length);
-    expect(attestation.equals(sig)).toBe(true);
-    expect(cplcOut.length).toBe(CPLC_LEN);
-    expect(cplcOut.equals(cplc)).toBe(true);
-    // No cert chain in legacy layout.
-    expect(certChain.length).toBe(0);
-  });
-
-  it('handles the typical 72-byte attestation signature length', () => {
-    const pub = Buffer.alloc(ICC_PUBKEY_LEN, 0x04);
-    const sig = Buffer.alloc(72, 0x30);
-    const cplc = Buffer.alloc(CPLC_LEN, 0xCC);
-    const full = Buffer.concat([pub, sig, cplc]);
-
-    const { attestation } = AttestationVerifier.extract(full);
-    expect(attestation.length).toBe(72);
-  });
-
-  it('returns empty attestation when the response is exactly pubkey + cplc', () => {
-    const pub = Buffer.alloc(ICC_PUBKEY_LEN, 0x04);
-    const cplc = Buffer.alloc(CPLC_LEN, 0xCC);
-    const full = Buffer.concat([pub, cplc]);
-
-    const { iccPubkey, attestation, cplc: cplcOut } = AttestationVerifier.extract(full);
-    expect(iccPubkey.length).toBe(ICC_PUBKEY_LEN);
-    expect(attestation.length).toBe(0);
-    expect(cplcOut.length).toBe(CPLC_LEN);
-  });
-
-  it('tolerates a truncated buffer: short response → partial pubkey, empty trailers', () => {
-    const truncated = Buffer.alloc(40, 0xEE);
-    const { iccPubkey, attestation, cplc } = AttestationVerifier.extract(truncated);
-    expect(iccPubkey.length).toBe(40);
-    expect(attestation.length).toBe(0);
-    expect(cplc.length).toBe(0);
-  });
-
-  it('tolerates a buffer that has pubkey + a short attestation but no full CPLC', () => {
-    const pub = Buffer.alloc(ICC_PUBKEY_LEN, 0x04);
-    const partial = Buffer.alloc(20, 0xAA);
-    const full = Buffer.concat([pub, partial]);
-
-    const { iccPubkey, attestation, cplc } = AttestationVerifier.extract(full);
-    expect(iccPubkey.length).toBe(ICC_PUBKEY_LEN);
-    expect(attestation.length).toBe(20);
-    expect(cplc.length).toBe(0);
-  });
-
-  it('splits pubkey(65) + sig(var) + cplc(42) + chainLen(2) + chain(var)', () => {
-    const pub = Buffer.alloc(ICC_PUBKEY_LEN, 0x04);
-    const sig = Buffer.from('3045022100' + 'AA'.repeat(32) + '022000' + 'BB'.repeat(30), 'hex');
-    const cplc = Buffer.alloc(CPLC_LEN, 0xCC);
-    const chain = Buffer.from('3082010A' + '00'.repeat(262), 'hex'); // a 266-byte "cert"-shaped buffer
-    const chainLen = Buffer.alloc(2);
-    chainLen.writeUInt16BE(chain.length);
-    const full = Buffer.concat([pub, sig, cplc, chainLen, chain]);
-
-    const out = AttestationVerifier.extract(full);
-    expect(out.iccPubkey.equals(pub)).toBe(true);
-    expect(out.attestation.equals(sig)).toBe(true);
+    expect(out.iccPubkey.equals(icc.pubRaw)).toBe(true);
+    // attestSig is DER ECDSA — 68..72 bytes for P-256
+    expect(out.attestSig.length).toBeGreaterThanOrEqual(68);
+    expect(out.attestSig.length).toBeLessThanOrEqual(72);
+    expect(out.attestSig[0]).toBe(0x30);
+    // cardCert = card_pubkey(65) || cplc(42) || sig(DER)
+    expect(out.cardCert.length).toBeGreaterThanOrEqual(65 + 42 + 68);
+    expect(out.cardCert.subarray(0, 65).equals(card.pubRaw)).toBe(true);
+    expect(out.cardCert.subarray(65, 107).equals(cplc)).toBe(true);
+    // Convenience CPLC peeled out of the card cert body
     expect(out.cplc.equals(cplc)).toBe(true);
-    expect(out.certChain.equals(chain)).toBe(true);
+    // Back-compat aliases
+    expect(out.attestation).toBe(out.attestSig);
+    expect(out.certChain).toBe(out.cardCert);
+  });
+
+  it('returns empty fields for an empty response', () => {
+    const out = AttestationVerifier.extract(Buffer.alloc(0));
+    expect(out.iccPubkey.length).toBe(0);
+    expect(out.attestSig.length).toBe(0);
+    expect(out.cardCert.length).toBe(0);
+    expect(out.cplc.length).toBe(0);
+  });
+
+  it('tolerates a truncated buffer: partial pubkey, empty trailers', () => {
+    const truncated = Buffer.alloc(40, 0xEE);
+    const out = AttestationVerifier.extract(truncated);
+    expect(out.iccPubkey.length).toBe(40);
+    expect(out.attestSig.length).toBe(0);
+    expect(out.cardCert.length).toBe(0);
+  });
+
+  it('post-C4 shape: pubkey + 16B chipNonce + no attestSig produces empty attestSig', () => {
+    // Under the new wire format the parser skips 16 bytes of chipNonce
+    // (byte 65..81) before looking for DER.  A 81-byte response is the
+    // minimal no-attestation shape — iccPubkey carved out, no trailer.
+    const pub = Buffer.alloc(SEC1_UNCOMPRESSED_LEN, 0x04);
+    const nonce = Buffer.alloc(16, 0xFA);
+    const out = AttestationVerifier.extract(Buffer.concat([pub, nonce]));
+    expect(out.iccPubkey.length).toBe(SEC1_UNCOMPRESSED_LEN);
+    expect(out.attestSig.length).toBe(0);
+    expect(out.cardCert.length).toBe(0);
+  });
+
+  it('post-C4 shape: pubkey + 16B chipNonce + malformed trailer gives empty attestSig', () => {
+    // 81 B minimum + non-DER trailer — parser finds no 0x30 at offset 81
+    // so attestSig stays empty; cardCert also stays empty under the new
+    // wire format (cardCert comes from GET_ATTESTATION_CHAIN, not here).
+    const pub = Buffer.alloc(SEC1_UNCOMPRESSED_LEN, 0x04);
+    const nonce = Buffer.alloc(16, 0xFA);
+    const trailer = Buffer.from('DEADBEEF', 'hex');
+    const out = AttestationVerifier.extract(Buffer.concat([pub, nonce, trailer]));
+    expect(out.attestSig.length).toBe(0);
+    // The 4 trailing bytes are captured as cardCert for debug only —
+    // strict verify() will reject on the empty attestSig before it
+    // looks at cardCert, and under the GET_ATTESTATION_CHAIN flow the
+    // caller passes cardCertOverride explicitly anyway.
+    expect(out.cardCert.equals(trailer)).toBe(true);
+  });
+
+  it('legacy pre-C4 shape: DER SEQUENCE at offset 65 is parsed as attestSig', () => {
+    // Pre-C4 applets put attestSig immediately after iccPubkey with
+    // no nonce.  The parser detects this by peeking byte 65 for 0x30
+    // and picks the legacy layout.
+    const pub = Buffer.alloc(SEC1_UNCOMPRESSED_LEN, 0x04);
+    // Valid DER ECDSA-P256 sig: SEQ(0x45) { INT(0x21, 0x00||32×0x11), INT(0x20, 0x00||31×0x22) }
+    const sig = Buffer.from(
+      '3045022100' + '11'.repeat(32) + '022000' + '22'.repeat(31),
+      'hex',
+    );
+    const out = AttestationVerifier.extract(Buffer.concat([pub, sig]));
+    expect(out.iccPubkey.length).toBe(SEC1_UNCOMPRESSED_LEN);
+    expect(out.attestSig.length).toBe(sig.length);
+    expect(out.attestSig.equals(sig)).toBe(true);
   });
 });
 
-describe('AttestationVerifier.verify (permissive mode)', () => {
+// ---------------------------------------------------------------------------
+
+describe('AttestationVerifier.verify — permissive mode', () => {
   let warnSpy: ReturnType<typeof vi.spyOn>;
   let logSpy: ReturnType<typeof vi.spyOn>;
 
@@ -112,42 +208,32 @@ describe('AttestationVerifier.verify (permissive mode)', () => {
     logSpy.mockRestore();
   });
 
-  it('defaults to permissive mode — always returns ok=true with a warning', () => {
-    expect(AttestationVerifier.verify(mkExtract(Buffer.alloc(72, 0xAA)))).toMatchObject({
-      ok: true,
-    });
-    expect(AttestationVerifier.verify(mkExtract(Buffer.alloc(0)))).toMatchObject({
-      ok: true,
-    });
-    expect(AttestationVerifier.verify(mkExtract(Buffer.from('DEADBEEF', 'hex')))).toMatchObject({
-      ok: true,
-    });
+  it('defaults to permissive and always returns ok=true', () => {
+    expect(AttestationVerifier.verify(mkExtract(Buffer.alloc(72, 0xAA)))).toMatchObject({ ok: true });
+    expect(AttestationVerifier.verify(mkExtract(Buffer.alloc(0)))).toMatchObject({ ok: true });
   });
 
-  it('emits the STUB_MODE_WARNING banner on every permissive-mode call', () => {
+  it('emits STUB_MODE_WARNING on every permissive call', () => {
     AttestationVerifier.verify(mkExtract(Buffer.alloc(0)));
-    AttestationVerifier.verify(mkExtract(Buffer.alloc(10)));
     AttestationVerifier.verify(mkExtract(Buffer.alloc(72)));
-
-    expect(warnSpy).toHaveBeenCalledTimes(3);
+    expect(warnSpy).toHaveBeenCalledTimes(2);
     for (const call of warnSpy.mock.calls) {
       expect(call[0]).toBe(STUB_MODE_WARNING);
     }
   });
 
-  it('logs a 16-byte sample of the attestation bytes so logs stay small', () => {
+  it('logs a 16-byte sample so CloudWatch logs stay small', () => {
     const sig = Buffer.from('30450221' + '00'.repeat(60), 'hex');
     AttestationVerifier.verify(mkExtract(sig));
-
-    expect(logSpy).toHaveBeenCalledTimes(1);
     const logged = logSpy.mock.calls[0][0] as string;
-    expect(logged).toContain(`attLen=${sig.length}`);
-    const prefix = sig.subarray(0, 16).toString('hex').toUpperCase();
-    expect(logged).toContain(`first16=${prefix}`);
+    expect(logged).toContain(`sigLen=${sig.length}`);
+    expect(logged).toContain(sig.subarray(0, 16).toString('hex').toUpperCase());
   });
 });
 
-describe('AttestationVerifier.verify (strict mode)', () => {
+// ---------------------------------------------------------------------------
+
+describe('AttestationVerifier.verify — strict mode', () => {
   let warnSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
@@ -160,124 +246,217 @@ describe('AttestationVerifier.verify (strict mode)', () => {
     vi.restoreAllMocks();
   });
 
-  it('rejects empty cert chain in strict mode', () => {
-    const r = AttestationVerifier.verify(mkExtract(Buffer.alloc(72)), 'strict');
-    expect(r.ok).toBe(false);
-    expect(r.warning).toContain('non-empty attestation cert chain');
+  it('accepts a well-formed end-to-end chain (Root → Issuer → Card → attest)', () => {
+    const { keygenResponse, config } = buildChainFixture();
+    const extracted = AttestationVerifier.extract(keygenResponse);
+    const r = AttestationVerifier.verify(extracted, 'strict', config);
+    expect(r.ok).toBe(true);
+    expect(r.issuerId).toBe(42);
   });
 
-  it('rejects malformed attestation (empty sig or bad CPLC length)', () => {
-    const r1 = AttestationVerifier.verify(
-      {
-        iccPubkey: Buffer.alloc(ICC_PUBKEY_LEN, 0x04),
-        attestation: Buffer.alloc(0),
-        cplc: Buffer.alloc(CPLC_LEN, 0xcc),
-        certChain: Buffer.from('aabb', 'hex'),
-      },
-      'strict',
-    );
-    expect(r1.ok).toBe(false);
-
-    const r2 = AttestationVerifier.verify(
-      {
-        iccPubkey: Buffer.alloc(ICC_PUBKEY_LEN, 0x04),
-        attestation: Buffer.alloc(72, 0x30),
-        cplc: Buffer.alloc(10, 0xcc),
-        certChain: Buffer.from('aabb', 'hex'),
-      },
-      'strict',
-    );
-    expect(r2.ok).toBe(false);
+  it('requires a config in strict mode', () => {
+    const { keygenResponse } = buildChainFixture();
+    const extracted = AttestationVerifier.extract(keygenResponse);
+    const r = AttestationVerifier.verify(extracted, 'strict'); // no config
+    expect(r.ok).toBe(false);
+    expect(r.warning).toMatch(/requires AttestationVerifierConfig/);
   });
 
-  it('rejects when cert chain bytes do not parse as DER certs', () => {
-    const r = AttestationVerifier.verify(
-      mkExtract(Buffer.alloc(72, 0x30), Buffer.from('deadbeef', 'hex')),
-      'strict',
-    );
+  it('rejects when root pubkey is malformed (not 65 bytes SEC1)', () => {
+    const { keygenResponse, config } = buildChainFixture();
+    const extracted = AttestationVerifier.extract(keygenResponse);
+    const bad: AttestationVerifierConfig = {
+      ...config,
+      rootPubkey: Buffer.alloc(64, 0x04), // wrong length
+    };
+    const r = AttestationVerifier.verify(extracted, 'strict', bad);
     expect(r.ok).toBe(false);
-    expect(r.warning).toMatch(/could not parse/);
+    expect(r.warning).toMatch(/rootPubkey malformed/);
+  });
+
+  it('rejects a forged issuer cert (signed by the wrong root)', () => {
+    const { keygenResponse } = buildChainFixture();
+    const attackerRoot = newKeypair();
+    const issuer = newKeypair();
+    const forgedIssuer = buildIssuerCertBlob(attackerRoot, issuer, 1);
+    // Feed the real pinned root but an attacker-signed issuer cert
+    const config: AttestationVerifierConfig = {
+      rootPubkey: newKeypair().pubRaw, // the pinned root is a different root still
+      issuerCert: forgedIssuer,
+    };
+    const extracted = AttestationVerifier.extract(keygenResponse);
+    const r = AttestationVerifier.verify(extracted, 'strict', config);
+    expect(r.ok).toBe(false);
+    expect(r.warning).toMatch(/issuer cert signature does not verify/);
+  });
+
+  it('rejects a card cert signed by an attacker posing as the issuer', () => {
+    const { root, icc, cplc, config } = buildChainFixture();
+    const attackerIssuer = newKeypair();
+    const card = newKeypair();
+    const rogueCardCert = buildCardCertBlob(attackerIssuer, card, cplc);
+    const response = buildKeygenResponse(icc, card, cplc, rogueCardCert);
+
+    // config still pins the real root + real issuer cert
+    void root;
+    const extracted = AttestationVerifier.extract(response);
+    const r = AttestationVerifier.verify(extracted, 'strict', config);
+    expect(r.ok).toBe(false);
+    expect(r.warning).toMatch(/card cert signature does not verify/);
+    expect(r.issuerId).toBe(42); // issuer parse succeeded before card cert failed
+  });
+
+  it('rejects an attestSig that was signed over a different iccPubkey', () => {
+    // Build a full chain then swap iccPubkey bytes at the head of the
+    // response — attestSig now covers bytes that no longer match.
+    const { keygenResponse, config } = buildChainFixture();
+    const tampered = Buffer.from(keygenResponse);
+    tampered[0] = 0x04; // keep SEC1 prefix
+    tampered[1] ^= 0xFF; // flip one X coord byte
+    const extracted = AttestationVerifier.extract(tampered);
+    const r = AttestationVerifier.verify(extracted, 'strict', config);
+    expect(r.ok).toBe(false);
+    expect(r.warning).toMatch(/attestation signature does not verify/);
+  });
+
+  it('rejects a bit-flipped attestSig', () => {
+    const { keygenResponse, config } = buildChainFixture();
+    const tampered = Buffer.from(keygenResponse);
+    // Flip a byte in the middle of the attestSig (starts at offset 65, ~70 bytes long)
+    tampered[65 + 20] ^= 0x01;
+    const extracted = AttestationVerifier.extract(tampered);
+    const r = AttestationVerifier.verify(extracted, 'strict', config);
+    expect(r.ok).toBe(false);
+  });
+
+  it('rejects a truncated issuer cert', () => {
+    const { keygenResponse, config } = buildChainFixture();
+    const truncated: AttestationVerifierConfig = {
+      ...config,
+      issuerCert: config.issuerCert.subarray(0, 60), // chop mid-payload
+    };
+    const extracted = AttestationVerifier.extract(keygenResponse);
+    const r = AttestationVerifier.verify(extracted, 'strict', truncated);
+    expect(r.ok).toBe(false);
+    expect(r.warning).toMatch(/malformed issuerCert/);
   });
 });
 
 // ---------------------------------------------------------------------------
-// verifyAttestationSignature — signature-verify unit tests
+
+describe('assertAttestationConfigForMode', () => {
+  it('does nothing in permissive mode regardless of config', () => {
+    expect(() =>
+      assertAttestationConfigForMode('permissive', {
+        KARTA_ATTESTATION_ROOT_PUBKEY: undefined,
+        KARTA_ATTESTATION_ISSUER_CERT: undefined,
+      }),
+    ).not.toThrow();
+  });
+
+  it('throws when strict mode is set with no root pubkey', () => {
+    expect(() =>
+      assertAttestationConfigForMode('strict', {
+        KARTA_ATTESTATION_ROOT_PUBKEY: '',
+        KARTA_ATTESTATION_ISSUER_CERT: 'aa'.repeat(140),
+      }),
+    ).toThrow(/KARTA_ATTESTATION_ROOT_PUBKEY/);
+  });
+
+  it('throws when root pubkey is wrong length', () => {
+    expect(() =>
+      assertAttestationConfigForMode('strict', {
+        KARTA_ATTESTATION_ROOT_PUBKEY: 'aa'.repeat(32), // 64 hex = 32 bytes, not 65
+        KARTA_ATTESTATION_ISSUER_CERT: 'aa'.repeat(140),
+      }),
+    ).toThrow(/65-byte SEC1/);
+  });
+
+  it('throws when root pubkey lacks the 0x04 SEC1 prefix', () => {
+    expect(() =>
+      assertAttestationConfigForMode('strict', {
+        KARTA_ATTESTATION_ROOT_PUBKEY: '02' + 'aa'.repeat(64),
+        KARTA_ATTESTATION_ISSUER_CERT: 'aa'.repeat(140),
+      }),
+    ).toThrow(/leading byte 0x04/);
+  });
+
+  it('throws on all-zero root pubkey (placeholder sentinel)', () => {
+    expect(() =>
+      assertAttestationConfigForMode('strict', {
+        KARTA_ATTESTATION_ROOT_PUBKEY: '00'.repeat(65),
+        KARTA_ATTESTATION_ISSUER_CERT: 'aa'.repeat(140),
+      }),
+    ).toThrow(/all zeros/);
+  });
+
+  it('throws on truncated issuer cert blob', () => {
+    expect(() =>
+      assertAttestationConfigForMode('strict', {
+        KARTA_ATTESTATION_ROOT_PUBKEY: '04' + 'aa'.repeat(64),
+        KARTA_ATTESTATION_ISSUER_CERT: 'aa'.repeat(50), // way too short
+      }),
+    ).toThrow(/truncated/);
+  });
+
+  it('passes with shape-correct config', () => {
+    expect(() =>
+      assertAttestationConfigForMode('strict', {
+        KARTA_ATTESTATION_ROOT_PUBKEY: '04' + 'aa'.repeat(64),
+        KARTA_ATTESTATION_ISSUER_CERT: 'aa'.repeat(140),
+      }),
+    ).not.toThrow();
+  });
+});
+
 // ---------------------------------------------------------------------------
-//
-// The full strict-mode verify() path also walks a cert chain to a pinned
-// vendor root.  Synthesising an X.509 chain in tests requires a library
-// (node-forge / @peculiar/x509) we don't take as a dep for this alone,
-// so the chain-walk path is exercised only via the negative-path tests
-// above ("malformed DER", "empty chain").  The SIGNATURE VERIFY portion
-// — the actual ECDSA over (iccPubkey || cplc) — is what distinguishes
-// a genuine chip attestation from a replay, so we cover it in isolation
-// here with an in-memory P-256 keypair playing the role of the leaf.
+// verifyAttestationSignature — the leaf-level ECDSA helper, exercised
+// independently so a regression in this single helper is easy to locate.
 
 describe('verifyAttestationSignature', () => {
-  it('accepts a real ECDSA-SHA256 signature over (iccPubkey || cplc)', () => {
-    const { publicKey, privateKey } = generateKeyPairSync('ec', {
-      namedCurve: 'P-256',
-    });
+  // Prevent unused import lint hit when fixture helpers don't reference it.
+  void createPrivateKey;
+
+  it('accepts a real ECDSA-SHA256 over (iccPubkey || cplc)', () => {
+    const { publicKey, privateKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
     const iccPubkey = Buffer.alloc(ICC_PUBKEY_LEN, 0x04);
     const cplc = Buffer.alloc(CPLC_LEN, 0xAA);
-    const signer = createSign('SHA256');
-    signer.update(Buffer.concat([iccPubkey, cplc]));
-    const sig = signer.sign(privateKey);
-
+    const sig = signDer(privateKey, Buffer.concat([iccPubkey, cplc]));
     expect(verifyAttestationSignature(iccPubkey, cplc, sig, publicKey)).toBe(true);
   });
 
   it('rejects a signature over the wrong message', () => {
-    const { publicKey, privateKey } = generateKeyPairSync('ec', {
-      namedCurve: 'P-256',
-    });
+    const { publicKey, privateKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
     const iccPubkey = Buffer.alloc(ICC_PUBKEY_LEN, 0x04);
     const cplc = Buffer.alloc(CPLC_LEN, 0xAA);
-    const signer = createSign('SHA256');
-    signer.update(Buffer.from('OTHER MESSAGE'));
-    const sig = signer.sign(privateKey);
-
+    const sig = signDer(privateKey, Buffer.from('SOME OTHER BYTES'));
     expect(verifyAttestationSignature(iccPubkey, cplc, sig, publicKey)).toBe(false);
   });
 
   it('rejects a signature from the wrong key', () => {
-    const kpSigner = generateKeyPairSync('ec', { namedCurve: 'P-256' });
-    const kpVerifier = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+    const signerKp = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+    const verifierKp = generateKeyPairSync('ec', { namedCurve: 'P-256' });
     const iccPubkey = Buffer.alloc(ICC_PUBKEY_LEN, 0x04);
     const cplc = Buffer.alloc(CPLC_LEN, 0xAA);
-    const signer = createSign('SHA256');
-    signer.update(Buffer.concat([iccPubkey, cplc]));
-    const sig = signer.sign(kpSigner.privateKey);
-
-    // Signed with kpSigner but verifying against kpVerifier — must fail.
-    expect(verifyAttestationSignature(iccPubkey, cplc, sig, kpVerifier.publicKey)).toBe(false);
+    const sig = signDer(signerKp.privateKey, Buffer.concat([iccPubkey, cplc]));
+    expect(verifyAttestationSignature(iccPubkey, cplc, sig, verifierKp.publicKey)).toBe(false);
   });
 
   it('rejects a bit-flipped signature', () => {
-    const { publicKey, privateKey } = generateKeyPairSync('ec', {
-      namedCurve: 'P-256',
-    });
+    const { publicKey, privateKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
     const iccPubkey = Buffer.alloc(ICC_PUBKEY_LEN, 0x04);
     const cplc = Buffer.alloc(CPLC_LEN, 0xAA);
-    const signer = createSign('SHA256');
-    signer.update(Buffer.concat([iccPubkey, cplc]));
-    const sig = Buffer.from(signer.sign(privateKey));
-    // Flip a byte deep in the signature payload.
+    const sig = Buffer.from(signDer(privateKey, Buffer.concat([iccPubkey, cplc])));
     sig[Math.floor(sig.length / 2)] ^= 0x01;
-
     expect(verifyAttestationSignature(iccPubkey, cplc, sig, publicKey)).toBe(false);
   });
 
-  it('returns false (not throws) on structurally-invalid DER signature', () => {
+  it('returns false on structurally-invalid DER (does not throw)', () => {
     const { publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
     const iccPubkey = Buffer.alloc(ICC_PUBKEY_LEN, 0x04);
     const cplc = Buffer.alloc(CPLC_LEN, 0xAA);
-    // 72 bytes of 0x00 — not a valid DER ECDSA signature.
-    const bogusSig = Buffer.alloc(72, 0x00);
-
-    expect(() =>
-      verifyAttestationSignature(iccPubkey, cplc, bogusSig, publicKey),
-    ).not.toThrow();
-    expect(verifyAttestationSignature(iccPubkey, cplc, bogusSig, publicKey)).toBe(false);
+    const bogus = Buffer.alloc(72, 0x00);
+    expect(() => verifyAttestationSignature(iccPubkey, cplc, bogus, publicKey)).not.toThrow();
+    expect(verifyAttestationSignature(iccPubkey, cplc, bogus, publicKey)).toBe(false);
   });
 });

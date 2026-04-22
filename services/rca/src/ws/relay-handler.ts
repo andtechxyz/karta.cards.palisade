@@ -126,15 +126,67 @@ export async function handleRelayConnection(
   }
 
   // Classical mode: send SELECT PA and let the phase machine drive the
-  // rest via pa_fci → GENERATE_KEYS → TRANSFER_SAD → FINAL_STATUS →
-  // CONFIRM.  AID A00000006250414C is the converter default for
-  // com.palisade.pa (package AID A0000000625041 + module tag 0x4C),
-  // matching Palisade's reference perso (`gp --install pa.cap` with no
-  // --create override).
+  // rest via pa_fci → GENERATE_KEYS → TRANSFER_SAD | TRANSFER_PARAMS →
+  // FINAL_STATUS → CONFIRM.  AID picked based on the Card's
+  // ChipProfile.provisioningMode, same toggle that routes data-prep's
+  // prepare() and card-ops' install_pa:
+  //
+  //   SAD_LEGACY   → A00000006250414C   (pa-v1, 8-byte AID)
+  //   PARAM_BUNDLE → A0000000625041034C (pa-v3, 9-byte AID — package
+  //                  A000000062504103 + module tag 0x4C)
+  //
+  // Both applets can be resident on the same chip simultaneously during
+  // migration — different package AIDs, different instance AIDs, no
+  // conflict.  If the lookup fails (no ChipProfile on the Card → Program
+  // → IssuerProfile chain), default to pa-v1 to preserve legacy
+  // behaviour.
+  const selectAid = await resolveSelectPaAid(sessionId);
+  // Lc byte = AID length in bytes (8 for pa-v1, 9 for pa-v3).
+  const aidBytes = Buffer.from(selectAid, 'hex');
+  const lc = aidBytes.length.toString(16).toUpperCase().padStart(2, '0');
   ws.send(JSON.stringify({
     type: 'apdu',
-    hex: '00A40400' + '08' + 'A00000006250414C',
+    hex: '00A40400' + lc + selectAid,
     phase: 'select_pa',
     progress: 0.05,
   }));
+}
+
+/**
+ * Resolve the PA applet AID to SELECT for this session.
+ *
+ * Chain: ProvisioningSession → Card → Program → IssuerProfile →
+ * ChipProfile.provisioningMode.
+ *
+ * Returns the AID as uppercase hex (no 0x prefix, no delimiters).  The
+ * caller prepends CLA/INS/P1/P2/Lc and appends Le=0x00 as needed.
+ */
+async function resolveSelectPaAid(sessionId: string): Promise<string> {
+  const session = await prisma.provisioningSession.findUnique({
+    where: { id: sessionId },
+    select: {
+      card: {
+        select: {
+          program: {
+            select: {
+              issuerProfile: {
+                select: {
+                  chipProfile: { select: { provisioningMode: true } },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  const mode = session?.card?.program?.issuerProfile?.chipProfile?.provisioningMode;
+  if (mode === 'PARAM_BUNDLE') {
+    // pa-v3 applet AID — package A000000062504103 || 0x4C.
+    return 'A0000000625041034C';
+  }
+  // Default = legacy pa-v1 applet AID.  Covers SAD_LEGACY, null
+  // ChipProfile (legacy programs), and any future enum value rca
+  // hasn't been taught about yet.
+  return 'A00000006250414C';
 }

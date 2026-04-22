@@ -4,7 +4,10 @@
   "private": true,
   "type": "module",
   "exports": {
-    "./services/data-prep.service": "./dist/services/data-prep.service.js"
+    "./services/data-prep.service": "./dist/services/data-prep.service.js",
+    "./services/data-prep.service.js": "./dist/services/data-prep.service.js",
+    "./services/attestation-issuer": "./dist/services/attestation-issuer.js",
+    "./services/attestation-issuer.js": "./dist/services/attestation-issuer.js"
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",

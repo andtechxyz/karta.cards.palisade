@@ -5,10 +5,11 @@ import { EventEmitter } from 'node:events';
 // Mock SessionManager before importing the handler
 // ---------------------------------------------------------------------------
 
-const { mockHandleMessage, mockBuildPlanForSession, mockPrismaUpdate } = vi.hoisted(() => ({
+const { mockHandleMessage, mockBuildPlanForSession, mockPrismaUpdate, mockPrismaFindUnique } = vi.hoisted(() => ({
   mockHandleMessage: vi.fn(),
   mockBuildPlanForSession: vi.fn(),
   mockPrismaUpdate: vi.fn(),
+  mockPrismaFindUnique: vi.fn(),
 }));
 
 vi.mock('../services/session-manager.js', () => ({
@@ -22,6 +23,7 @@ vi.mock('@palisade/db', () => ({
   prisma: {
     provisioningSession: {
       update: mockPrismaUpdate,
+      findUnique: mockPrismaFindUnique,
     },
   },
 }));
@@ -67,15 +69,50 @@ describe('handleRelayConnection', () => {
     ws = new MockWebSocket();
   });
 
-  it('sends SELECT PA APDU on connect', async () => {
+  it('sends SELECT PA APDU on connect (pa-v1 default when no ChipProfile)', async () => {
+    // Card has no ChipProfile → resolver falls back to pa-v1 AID.
+    mockPrismaFindUnique.mockResolvedValueOnce({ card: { program: { issuerProfile: null } } });
+
     await handleRelayConnection(ws as any, 'session_01');
 
     expect(ws.sent).toHaveLength(1);
     const initial = JSON.parse(ws.sent[0]);
     expect(initial.type).toBe('apdu');
     expect(initial.phase).toBe('select_pa');
-    expect(initial.hex).toContain('00A40400'); // SELECT command
-    expect(initial.hex).toContain('A00000006250414C'); // PA AID (Palisade default)
+    // 00A40400 || Lc=08 || A00000006250414C → 22 hex chars, no Le byte.
+    expect(initial.hex).toBe('00A4040008A00000006250414C');
+  });
+
+  it('sends SELECT pa-v1 APDU when ChipProfile.provisioningMode=SAD_LEGACY', async () => {
+    mockPrismaFindUnique.mockResolvedValueOnce({
+      card: {
+        program: {
+          issuerProfile: { chipProfile: { provisioningMode: 'SAD_LEGACY' } },
+        },
+      },
+    });
+
+    await handleRelayConnection(ws as any, 'session_01');
+
+    const initial = JSON.parse(ws.sent[0]);
+    expect(initial.hex).toBe('00A4040008A00000006250414C');
+  });
+
+  it('sends SELECT pa-v3 APDU when ChipProfile.provisioningMode=PARAM_BUNDLE', async () => {
+    mockPrismaFindUnique.mockResolvedValueOnce({
+      card: {
+        program: {
+          issuerProfile: { chipProfile: { provisioningMode: 'PARAM_BUNDLE' } },
+        },
+      },
+    });
+
+    await handleRelayConnection(ws as any, 'session_01');
+
+    const initial = JSON.parse(ws.sent[0]);
+    // 00A40400 || Lc=09 || A0000000625041034C → 9-byte AID.
+    expect(initial.hex).toBe('00A4040009A0000000625041034C');
+    expect(initial.phase).toBe('select_pa');
   });
 
   it('parses incoming JSON messages and passes to SessionManager', async () => {
@@ -179,7 +216,7 @@ describe('handleRelayConnection', () => {
         version: 1,
         steps: [
           { i: 0, apdu: '00A4040008A00000006250414C', phase: 'select_pa', progress: 0.05, expectSw: '9000' },
-          { i: 1, apdu: '80E000000101', phase: 'key_generation', progress: 0.25, expectSw: '9000' },
+          { i: 1, apdu: '80E00000010100', phase: 'key_generation', progress: 0.25, expectSw: '9000' },
         ],
       };
       mockBuildPlanForSession.mockResolvedValue(fakePlan);

@@ -17,6 +17,11 @@ vi.mock('@palisade/db', () => {
     },
     sadRecord: {
       findUnique: vi.fn(),
+      findFirst: vi.fn(),
+      update: vi.fn(),
+    },
+    paramRecord: {
+      findUnique: vi.fn(),
       update: vi.fn(),
     },
     card: {
@@ -163,7 +168,9 @@ describe('SessionManager', () => {
   // -------------------------------------------------------------------------
 
   describe('startSession', () => {
-    it('creates ProvisioningSession and returns sessionId on valid proxyCardId', async () => {
+    it('creates ProvisioningSession and returns sessionId on valid proxyCardId (legacy SAD path)', async () => {
+      // ParamRecord lookup misses → fall through to SadRecord
+      (prisma.paramRecord.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       (prisma.sadRecord.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(FAKE_SAD_RECORD);
       (prisma.provisioningSession.create as ReturnType<typeof vi.fn>).mockResolvedValue({
         id: 'session_01',
@@ -180,7 +187,48 @@ describe('SessionManager', () => {
       expect(prisma.provisioningSession.create).toHaveBeenCalledOnce();
     });
 
-    it('throws when no READY SAD record exists', async () => {
+    it('routes prototype proxyCardId (pxy_*) through the ParamRecord path + SadRecord FK placeholder', async () => {
+      // ParamRecord hit — prototype path
+      (prisma.paramRecord.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 'param_01',
+        cardId: 'card_01',
+        status: 'READY',
+      });
+      // Historical SadRecord used purely for FK placeholder — any status OK
+      (prisma.sadRecord.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 'sad_historical_01',
+      });
+      (prisma.provisioningSession.create as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 'session_p_01',
+        cardId: 'card_01',
+        sadRecordId: 'sad_historical_01',
+        phase: 'INIT',
+      });
+
+      const result = await mgr.startSession('pxy_proto_01');
+
+      expect(result.sessionId).toBe('session_p_01');
+      expect(result.proxyCardId).toBe('pxy_proto_01');
+      // SAD findUnique must NOT have been called — prototype dispatch
+      expect(prisma.sadRecord.findUnique).not.toHaveBeenCalled();
+      // Session insert must carry the historical sad id as FK
+      const call = (prisma.provisioningSession.create as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(call.data.sadRecordId).toBe('sad_historical_01');
+    });
+
+    it('throws when ParamRecord exists but is CONSUMED', async () => {
+      (prisma.paramRecord.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 'param_01',
+        cardId: 'card_01',
+        status: 'CONSUMED',
+      });
+      await expect(mgr.startSession('pxy_consumed_01')).rejects.toThrow(
+        /ParamRecord.*is CONSUMED, expected READY/,
+      );
+    });
+
+    it('throws when no READY SAD record exists (legacy path)', async () => {
+      (prisma.paramRecord.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       (prisma.sadRecord.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
 
       await expect(mgr.startSession('pxy_missing')).rejects.toThrow(
@@ -188,7 +236,8 @@ describe('SessionManager', () => {
       );
     });
 
-    it('throws when SAD record exists but status is not READY', async () => {
+    it('throws when SAD record exists but status is not READY (legacy path)', async () => {
+      (prisma.paramRecord.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       (prisma.sadRecord.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
         ...FAKE_SAD_RECORD,
         status: 'CONSUMED',
@@ -205,18 +254,52 @@ describe('SessionManager', () => {
   // -------------------------------------------------------------------------
 
   describe('handleMessage — pa_fci', () => {
-    it('returns GENERATE_KEYS directly (no SCP11 step) and advances phase to KEYGEN', async () => {
+    it('returns WIPE APDU first (idempotency guard) and advances phase to WIPING', async () => {
+      // Post-commit 0cc7c0a the classical path inserts WIPE between
+      // SELECT_PA and GENERATE_KEYS to close the re-perso-after-commit
+      // loop.  handlePaFci now returns the WIPE APDU and transitions
+      // to phase='WIPING'; GENERATE_KEYS is emitted by the follow-up
+      // handleWipeResponse when the chip ack lands.
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
-        makeSession('KEYGEN'),
+        makeSession('WIPING'),
       );
 
       const responses = await mgr.handleMessage('session_01', { type: 'pa_fci' });
 
       expect(responses).toHaveLength(1);
       expect(responses[0].type).toBe('apdu');
+      expect(responses[0].phase).toBe('wipe_applet');
+      // CLA=80 INS=EA P1=00 P2=00 Le=00 — the same APDU shape as the
+      // plan-builder's WIPE_APDU constant.
+      expect(responses[0].hex).toBe('80EA000000');
+      expect(prisma.provisioningSession.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'session_01' },
+          data: { phase: 'WIPING' },
+        }),
+      );
+    });
+  });
+
+  describe('handleMessage — response in WIPING phase', () => {
+    it('returns GENERATE_KEYS APDU after the chip acks WIPE with 9000', async () => {
+      (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSession('WIPING'),
+      );
+      (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSession('KEYGEN'),
+      );
+
+      const msg: WSMessage = { type: 'response', hex: '', sw: '9000' };
+      const responses = await mgr.handleMessage('session_01', msg);
+
+      expect(responses).toHaveLength(1);
+      expect(responses[0].type).toBe('apdu');
       expect(responses[0].phase).toBe('key_generation');
-      // 80 E0 00 00 01 01 — exactly the bytes the Palisade SSD e2e test uses.
-      expect(responses[0].hex).toBe('80E000000101');
+      // GENERATE_KEYS body: 01 (key-type marker) || session_01 (UTF-8).
+      //   80 E0 00 00 | 0B | 01 73 65 73 73 69 6F 6E 5F 30 31 | 41
+      //               Lc       'session_01' utf8           Le
+      expect(responses[0].hex).toBe('80E000000B0173657373696F6E5F303141');
       expect(prisma.provisioningSession.update).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { id: 'session_01' },
@@ -332,11 +415,18 @@ describe('SessionManager', () => {
   // -------------------------------------------------------------------------
 
   describe('handleMessage — response in AWAITING_FINAL with success byte', () => {
-    it('returns CONFIRM + complete, updates card to PROVISIONED', async () => {
-      // The implementation pre-fetches the session (with card + sadRecord
-      // relations) so the response payload is ready before the DB commit
-      // kicks off asynchronously.  AWAITING_FINAL branch on the first
-      // findUnique (phase check) + same enriched shape on the second.
+    it('returns CONFIRM APDU only and advances phase to CONFIRMING (no Card/SAD commit yet)', async () => {
+      // Two-phase finalize contract — see handleFinalStatus block comment.
+      // This phase must NOT commit Card=PROVISIONED / SadRecord=CONSUMED
+      // / send `complete` — those are gated on the chip's CONFIRM 9000
+      // ack and run from handleConfirmResponse.  Committing here is the
+      // race bug we regressed against: if the mobile UI sees `complete`
+      // before the CONFIRM APDU lands, the user lifts the card and the
+      // applet is left stuck in STATE_AWAITING_CONFIRM.
+      //
+      // handleFinalStatus still does ONE DB write: the synchronous
+      // phase=CONFIRMING update (with provenance + fidoCredData).  That
+      // write fails loud on DB outage instead of racing the callback.
       const enriched = {
         ...makeSession('AWAITING_FINAL'),
         cardId: 'card_01',
@@ -346,47 +436,118 @@ describe('SessionManager', () => {
       };
       (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(enriched);
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...makeSession('CONFIRMING'),
+        cardId: 'card_01',
+        sadRecordId: 'sad_01',
+      });
+
+      // 0x01 = success byte, followed by 32 bytes provenance hash +
+      // a zero-length FIDO trailer (len byte = 0x00).  The provenance
+      // extractor requires length > 33 to treat the provenance bytes as
+      // present, hence the trailing byte — matches the real APDU shape.
+      const statusData = Buffer.concat([
+        Buffer.from([0x01]),
+        Buffer.alloc(32, 0xCC),
+        Buffer.from([0x00]),
+      ]);
+      const msg: WSMessage = { type: 'response', hex: statusData.toString('hex'), sw: '9000' };
+      const responses = await mgr.handleMessage('session_01', msg);
+
+      expect(responses).toHaveLength(1);
+      expect(responses[0].type).toBe('apdu');
+      expect(responses[0].hex).toBe('80E8000000'); // CONFIRM APDU
+      expect(responses[0].phase).toBe('confirming');
+      expect(responses[0].progress).toBe(0.95);
+
+      // Phase advance to CONFIRMING happened synchronously with the
+      // captured provenance + fidoCredData payload.
+      expect(prisma.provisioningSession.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'session_01' },
+          data: expect.objectContaining({
+            phase: 'CONFIRMING',
+            provenance: 'cc'.repeat(32),
+          }),
+        }),
+      );
+
+      // CRITICAL: no Card/SAD commit yet — that's the whole point of the
+      // split.  If this ever flips the race regresses.
+      expect(prisma.card.update).not.toHaveBeenCalled();
+      expect(prisma.sadRecord.update).not.toHaveBeenCalled();
+      expect(prisma.paramRecord.update).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // handleMessage — response in CONFIRMING with 9000 (chip CONFIRM ack)
+  // -------------------------------------------------------------------------
+
+  describe('handleMessage — response in CONFIRMING with 9000', () => {
+    it('runs the atomic commit (session COMPLETE + Card PROVISIONED + SAD CONSUMED) and emits `complete`', async () => {
+      // The phase guard in handleCardResponse finds session.phase ===
+      // 'CONFIRMING' on the plain findUnique, then dispatches to
+      // handleConfirmResponse.  Inside that handler we $transaction a
+      // second update (with relations) to grab card + sadRecord for the
+      // callback + the `complete` payload.
+      (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSession('CONFIRMING'),
+      );
+      (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue({
         ...makeSession('COMPLETE'),
         cardId: 'card_01',
         sadRecordId: 'sad_01',
-        card: { cardRef: 'ref_01', chipSerial: 'CS001' },
+        card: { cardRef: 'ref_01', chipSerial: 'CS001', paramRecordId: null },
         sadRecord: { proxyCardId: 'pxy_abc123' },
       });
       (prisma.card.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
       (prisma.sadRecord.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
 
-      // 0x01 = success byte, followed by 32 bytes provenance hash
-      const statusData = Buffer.concat([
-        Buffer.from([0x01]),
-        Buffer.alloc(32, 0xCC), // provenance hash
-      ]);
-      const msg: WSMessage = { type: 'response', hex: statusData.toString('hex'), sw: '9000' };
+      const msg: WSMessage = { type: 'response', hex: '', sw: '9000' };
       const responses = await mgr.handleMessage('session_01', msg);
 
-      expect(responses).toHaveLength(2);
-      expect(responses[0].type).toBe('apdu');
-      expect(responses[0].hex).toBe('80E8000000'); // CONFIRM APDU
-      expect(responses[0].phase).toBe('confirming');
-      expect(responses[1].type).toBe('complete');
-      expect(responses[1].proxyCardId).toBe('pxy_abc123');
+      expect(responses).toHaveLength(1);
+      expect(responses[0].type).toBe('complete');
+      expect(responses[0].proxyCardId).toBe('pxy_abc123');
 
-      // The atomic commit runs asynchronously now — flush the microtask
-      // queue so the $transaction callback (mocked to run inline) has
-      // executed by the time we assert on card.update / sadRecord.update.
-      await new Promise((r) => setImmediate(r));
-
-      // Card status updated to PROVISIONED
       expect(prisma.card.update).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { id: 'card_01' },
           data: expect.objectContaining({ status: 'PROVISIONED' }),
         }),
       );
-
-      // SAD marked CONSUMED
       expect(prisma.sadRecord.update).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { id: 'sad_01' },
+          data: { status: 'CONSUMED' },
+        }),
+      );
+      // paramRecordId is null on this fixture (legacy / non-prototype
+      // card) so the extra ParamRecord update must NOT fire.
+      expect(prisma.paramRecord.update).not.toHaveBeenCalled();
+    });
+
+    it('also flips ParamRecord=CONSUMED when the card rode the prototype path', async () => {
+      (prisma.provisioningSession.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSession('CONFIRMING'),
+      );
+      (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue({
+        ...makeSession('COMPLETE'),
+        cardId: 'card_01',
+        sadRecordId: 'sad_01',
+        card: { cardRef: 'ref_01', chipSerial: 'CS001', paramRecordId: 'param_01' },
+        sadRecord: { proxyCardId: 'pxy_abc123' },
+      });
+      (prisma.card.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      (prisma.sadRecord.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
+      (prisma.paramRecord.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
+
+      const msg: WSMessage = { type: 'response', hex: '', sw: '9000' };
+      await mgr.handleMessage('session_01', msg);
+
+      expect(prisma.paramRecord.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'param_01' },
           data: { status: 'CONSUMED' },
         }),
       );
@@ -488,7 +649,8 @@ describe('SessionManager', () => {
 
       expect(plan.type).toBe('plan');
       expect(plan.version).toBe(1);
-      expect(plan.steps).toHaveLength(5);
+      // 6 steps now: SELECT_PA, WIPE, KEYGEN, TRANSFER_SAD, FINAL, CONFIRM.
+      expect(plan.steps).toHaveLength(6);
 
       // Decrypt was called with the session's ciphertext + sadKeyVersion=1.
       expect(mockDecryptSad).toHaveBeenCalledOnce();
@@ -500,7 +662,8 @@ describe('SessionManager', () => {
 
       // Step 2 (TRANSFER_SAD) must contain the real bankId/progId bytes
       // and the postProvisionUrl string — not the old placeholders.
-      const transfer = plan.steps[2].apdu.toUpperCase();
+      // TRANSFER_SAD is now at index 3 (was 2 pre-WIPE).
+      const transfer = plan.steps[3].apdu.toUpperCase();
       expect(transfer).toContain('AABBCCDD');    // bankId
       expect(transfer).toContain('11223344');    // progId
       const urlHex = Buffer.from('issuer.example.com', 'ascii').toString('hex').toUpperCase();
@@ -526,7 +689,8 @@ describe('SessionManager', () => {
       });
 
       const plan = await mgr.buildPlanForSession('session_01');
-      const transfer = plan.steps[2].apdu.toUpperCase();
+      // TRANSFER_SAD is now at index 3 (was 2 pre-WIPE).
+      const transfer = plan.steps[3].apdu.toUpperCase();
       // scheme sits between progId(4) and timestamp(4).  Look for the
       // exact metadata sequence: progId || scheme || ts ... ; we know
       // progId = 0x11223344 and scheme should now be 0x02.
@@ -548,12 +712,14 @@ describe('SessionManager', () => {
       const plan = await mgr.buildPlanForSession('session_01');
 
       // Plan shape is unchanged.
-      expect(plan.steps).toHaveLength(5);
+      // 6 steps now: SELECT_PA, WIPE, KEYGEN, TRANSFER_SAD, FINAL, CONFIRM.
+      expect(plan.steps).toHaveLength(6);
 
       // Minimal-SAD fallback produces the old placeholder bankId (0x00000001)
       // and progId (0x00000001), with scheme=0x01.  PA parses from the end
       // so we check explicit offsets after the SAD.  Minimal SAD = 13 bytes.
-      const transfer = plan.steps[2].apdu.toUpperCase();
+      // TRANSFER_SAD is now at index 3 (was 2 pre-WIPE).
+      const transfer = plan.steps[3].apdu.toUpperCase();
       const body = transfer.slice(10); // strip header
       const tail = body.slice(26); // strip 13-byte minimal SAD
       expect(tail.slice(0, 8)).toBe('00000001'); // bankId
@@ -586,7 +752,8 @@ describe('SessionManager', () => {
       });
 
       const plan = await mgr.buildPlanForSession('session_01');
-      expect(plan.steps).toHaveLength(5);
+      // 6 steps now: SELECT_PA, WIPE, KEYGEN, TRANSFER_SAD, FINAL, CONFIRM.
+      expect(plan.steps).toHaveLength(6);
       expect(mockDecryptSad).not.toHaveBeenCalled();
     });
   });
@@ -651,7 +818,7 @@ describe('SessionManager', () => {
   // -------------------------------------------------------------------------
 
   describe('handleMessage — plan-mode response routing', () => {
-    it('routes step 1 (keygen) response to iccPublicKey + attestation capture', async () => {
+    it('routes step 2 (keygen) response to iccPublicKey + attestation capture', async () => {
       const fakeIccPub = Buffer.alloc(65, 0x04);
       const fakeAttest = Buffer.alloc(72, 0xAA);
       const fakeCplc = Buffer.alloc(42, 0xBB);
@@ -660,13 +827,14 @@ describe('SessionManager', () => {
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
         makeSession('PLAN_SENT'),
       );
-      // Canonical 5-step plan: seed cursor at lastProcessed=0 so step 1
-      // is the expected next index.
-      _seedPlanStepStateForTests('session_01', 5, 0);
+      // Canonical 6-step plan (SELECT_PA, WIPE, KEYGEN, TRANSFER, FINAL,
+      // CONFIRM) — seed cursor at lastProcessed=1 (WIPE just acked) so
+      // step 2 (KEYGEN) is the expected next index.
+      _seedPlanStepStateForTests('session_01', 6, 1);
 
       const msg: WSMessage = {
         type: 'response',
-        i: 1,
+        i: 2,
         hex: responseData.toString('hex'),
         sw: '9000',
       };
@@ -694,9 +862,16 @@ describe('SessionManager', () => {
     it('persists the attestation bytes on the session row', async () => {
       // Distinctive attestation payload so we can verify it was saved
       // verbatim (byte-for-byte) rather than truncated or reshaped.
+      // DER ECDSA-P256 sig structure:
+      //   SEQUENCE(0x45=69) { INTEGER(0x21, leading-0 || 32×0x11),
+      //                       INTEGER(0x20, leading-0 || 31×0x22) }
+      // The trailing INTEGER needs 31 bytes of 0x22 so the SEQUENCE
+      // length (69) matches the real body length — earlier versions
+      // of this fixture had 30 bytes which was 1 short and only
+      // worked against the old fixed-trailer parser.
       const pub = Buffer.alloc(65, 0x04);
       const sig = Buffer.from(
-        '3045022100' + '11'.repeat(32) + '022000' + '22'.repeat(30),
+        '3045022100' + '11'.repeat(32) + '022000' + '22'.repeat(31),
         'hex',
       );
       const cplc = Buffer.alloc(42, 0xCC);
@@ -705,11 +880,11 @@ describe('SessionManager', () => {
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
         makeSession('PLAN_SENT'),
       );
-      _seedPlanStepStateForTests('session_01', 5, 0);
+      _seedPlanStepStateForTests('session_01', 6, 1);
 
       await mgr.handleMessage('session_01', {
         type: 'response',
-        i: 1,
+        i: 2,
         hex: full.toString('hex'),
         sw: '9000',
       });
@@ -719,7 +894,7 @@ describe('SessionManager', () => {
       expect(updateCall.data.attestation.equals(sig)).toBe(true);
     });
 
-    it('step 3 success transitions to AWAITING_CONFIRM and emits no response', async () => {
+    it('step 4 (final_status success) transitions to AWAITING_CONFIRM and emits no response', async () => {
       const statusData = Buffer.concat([
         Buffer.from([0x01]),       // success byte
         Buffer.alloc(32, 0xCC),    // provenance hash
@@ -728,11 +903,13 @@ describe('SessionManager', () => {
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
         makeSession('AWAITING_CONFIRM'),
       );
-      _seedPlanStepStateForTests('session_01', 5, 2);
+      // FINAL_STATUS moved from i=3 → i=4 with WIPE inserted.  Seed
+      // lastProcessed=3 so step 4 is next.
+      _seedPlanStepStateForTests('session_01', 6, 3);
 
       const msg: WSMessage = {
         type: 'response',
-        i: 3,
+        i: 4,
         hex: statusData.toString('hex'),
         sw: '9000',
       };
@@ -749,17 +926,17 @@ describe('SessionManager', () => {
       );
     });
 
-    it('step 3 failure (status byte != 0x01) sends error and marks session FAILED', async () => {
+    it('step 4 (final_status failure) sends error and marks session FAILED', async () => {
       const statusData = Buffer.from([0x00]); // failure byte
 
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
         makeSession('FAILED'),
       );
-      _seedPlanStepStateForTests('session_01', 5, 2);
+      _seedPlanStepStateForTests('session_01', 6, 3);
 
       const msg: WSMessage = {
         type: 'response',
-        i: 3,
+        i: 4,
         hex: statusData.toString('hex'),
         sw: '9000',
       };
@@ -778,7 +955,7 @@ describe('SessionManager', () => {
       );
     });
 
-    it('step 4 (confirm) commits: card PROVISIONED + SAD CONSUMED + complete message', async () => {
+    it('step 5 (confirm) commits: card PROVISIONED + SAD CONSUMED + complete message', async () => {
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue({
         ...makeSession('COMPLETE'),
         cardId: 'card_01',
@@ -788,9 +965,10 @@ describe('SessionManager', () => {
       });
       (prisma.card.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
       (prisma.sadRecord.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
-      _seedPlanStepStateForTests('session_01', 5, 3);
+      // CONFIRM moved from i=4 → i=5 with WIPE insertion.
+      _seedPlanStepStateForTests('session_01', 6, 4);
 
-      const msg: WSMessage = { type: 'response', i: 4, hex: '', sw: '9000' };
+      const msg: WSMessage = { type: 'response', i: 5, hex: '', sw: '9000' };
       const responses = await mgr.handleMessage('session_01', msg);
 
       expect(responses).toHaveLength(1);
@@ -812,7 +990,9 @@ describe('SessionManager', () => {
       (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
         makeSession('FAILED'),
       );
-      _seedPlanStepStateForTests('session_01', 5, 1);
+      // KEYGEN now lives at index 2 (was 1 pre-WIPE).  Simulate a chip
+      // fail at keygen → expect failureReason to cite step_2.
+      _seedPlanStepStateForTests('session_01', 6, 1);
 
       const msg: WSMessage = { type: 'response', i: 2, hex: '', sw: '6A82' };
       const responses = await mgr.handleMessage('session_01', msg);
@@ -831,20 +1011,114 @@ describe('SessionManager', () => {
       );
     });
 
-    it('step 0 (SELECT PA) and step 2 (TRANSFER_SAD) responses are logged but emit nothing', async () => {
+    it('step 0 (SELECT PA), step 1 (WIPE), step 3 (TRANSFER_SAD) responses are logged but emit nothing', async () => {
       // Fresh cursor at -1 for the first step 0; after processing the
-      // cursor advances to 0, then we need it at 1 to accept step 2.
-      _seedPlanStepStateForTests('session_01', 5, -1);
+      // cursor advances to 0, then we need to fast-forward for the
+      // subsequent assertions.
+      _seedPlanStepStateForTests('session_01', 6, -1);
       const select0: WSMessage = { type: 'response', i: 0, hex: '6F10A00000006250414C', sw: '9000' };
       const responses0 = await mgr.handleMessage('session_01', select0);
       expect(responses0).toHaveLength(0);
 
-      // Fast-forward the cursor so step 2 is the next expected index
-      // (skipping the step-1 keygen test dance in this specific case).
-      _seedPlanStepStateForTests('session_01', 5, 1);
-      const transfer2: WSMessage = { type: 'response', i: 2, hex: '00020021', sw: '9000' };
-      const responses2 = await mgr.handleMessage('session_01', transfer2);
-      expect(responses2).toHaveLength(0);
+      // WIPE step (new index 1) — chip returns 9000 with no data.
+      _seedPlanStepStateForTests('session_01', 6, 0);
+      const wipe1: WSMessage = { type: 'response', i: 1, hex: '', sw: '9000' };
+      const responses1 = await mgr.handleMessage('session_01', wipe1);
+      expect(responses1).toHaveLength(0);
+
+      // Fast-forward the cursor so step 3 (TRANSFER_SAD) is the next
+      // expected index (skipping the step-2 keygen test dance).
+      _seedPlanStepStateForTests('session_01', 6, 2);
+      const transfer3: WSMessage = { type: 'response', i: 3, hex: '00020021', sw: '9000' };
+      const responses3 = await mgr.handleMessage('session_01', transfer3);
+      expect(responses3).toHaveLength(0);
+    });
+
+    it('dispatches on semantic phase, not step index — attestation plan routes keygen to step 2', async () => {
+      // Patent C16/C23 plan shape (6 steps):
+      //   0: select_pa
+      //   1: get_attestation_chain   ← NEW
+      //   2: key_generation          ← keygen moved from index 1 → 2
+      //   3: provisioning
+      //   4: finalizing
+      //   5: confirming
+      //
+      // This test proves the session-manager dispatcher no longer
+      // hardcodes `case 1: handlePlanKeygen` — the phase list seeded
+      // into the cursor is the source of truth.
+      const attestationPhases = [
+        'select_pa',
+        'get_attestation_chain',
+        'key_generation',
+        'provisioning',
+        'finalizing',
+        'confirming',
+      ];
+
+      // Seed cursor at lastProcessed=1 so step 2 (key_generation) is the
+      // next expected index.  Must pass phases so phaseForPlanStep
+      // resolves 'key_generation' for i=2.
+      _seedPlanStepStateForTests('session_01', 6, 1, attestationPhases);
+
+      const pub = Buffer.alloc(65, 0x04);
+      const fakeSig = Buffer.alloc(72, 0xAA);
+      const cplc = Buffer.alloc(42, 0xBB);
+      const responseData = Buffer.concat([pub, fakeSig, cplc]);
+
+      (prisma.provisioningSession.update as ReturnType<typeof vi.fn>).mockResolvedValue(
+        makeSession('PLAN_SENT'),
+      );
+
+      const responses = await mgr.handleMessage('session_01', {
+        type: 'response',
+        i: 2, // <-- key_generation under the attestation plan shape
+        hex: responseData.toString('hex'),
+        sw: '9000',
+      });
+
+      expect(responses).toHaveLength(0);
+      // Keygen ran (iccPublicKey persisted) — proves phase dispatch
+      // routed step 2 to handlePlanKeygen, not handlePlanResponse's
+      // old `case 1:` hardcode which would have returned [] silently.
+      expect(prisma.provisioningSession.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            iccPublicKey: expect.any(Buffer),
+          }),
+        }),
+      );
+    });
+
+    it('routes get_attestation_chain step to the chain handler (no DB write, cardCert cached in memory)', async () => {
+      // Minimal cardCert blob (65 B card pubkey + 42 B CPLC + short DER sig).
+      // Contents don't matter for this test — we're only checking that
+      // the step is accepted by the dispatcher and produces no
+      // outbound WS messages.
+      const cardCert = Buffer.concat([
+        Buffer.alloc(65, 0x04),          // card_pubkey
+        Buffer.alloc(42, 0xCC),          // cplc
+        Buffer.from('3046022100' + '33'.repeat(32) + '0221' + '44'.repeat(33), 'hex'),
+      ]);
+
+      _seedPlanStepStateForTests(
+        'session_01',
+        6,
+        0,
+        ['select_pa', 'get_attestation_chain', 'key_generation', 'provisioning', 'finalizing', 'confirming'],
+      );
+
+      const responses = await mgr.handleMessage('session_01', {
+        type: 'response',
+        i: 1, // get_attestation_chain
+        hex: cardCert.toString('hex'),
+        sw: '9000',
+      });
+
+      expect(responses).toHaveLength(0);
+      // Chain step does NOT touch the DB — cert is cached in-memory
+      // and surfaced to the next keygen-step verify() call.  Any
+      // database call here would be spurious.
+      expect(prisma.provisioningSession.update).not.toHaveBeenCalled();
     });
   });
 

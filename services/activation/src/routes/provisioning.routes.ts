@@ -31,10 +31,20 @@ export function createProvisioningRouter(): Router {
       allowedIssuers: ['tap'],
     });
 
-    // Look up card
+    // Look up card.  Include paramRecord so we can dispatch to the
+    // prototype readiness gate instead of the SAD one when the card
+    // is on the PARAM_BUNDLE flow.
     const card = await prisma.card.findUnique({
       where: { id: payload.sub },
-      select: { id: true, cardRef: true, status: true, proxyCardId: true, cognitoSub: true },
+      select: {
+        id: true,
+        cardRef: true,
+        status: true,
+        proxyCardId: true,
+        cognitoSub: true,
+        paramRecordId: true,
+        paramRecord: { select: { id: true, status: true, proxyCardId: true } },
+      },
     });
     if (!card) {
       metrics().counter('activation.provision_start.fail', 1, { reason: 'card_not_found' });
@@ -47,17 +57,40 @@ export function createProvisioningRouter(): Router {
       });
       throw badRequest('invalid_status', `Card is ${card.status}, expected ACTIVATED`);
     }
-    // Guard: SAD must have been staged at register-time (or via the admin
-    // re-stage endpoint).  If proxyCardId is null, data-prep was unreachable
-    // when the card was first registered and SAD never landed — fail loudly
-    // with an actionable error instead of forwarding null to RCA and getting
-    // back a cryptic Zod validation 400.
-    if (!card.proxyCardId) {
-      metrics().counter('activation.provision_start.fail', 1, { reason: 'sad_not_staged' });
-      throw badRequest(
-        'sad_not_staged',
-        'No SAD staged for this card (proxyCardId is null) — data-prep was unreachable at registration. Ask an admin to re-stage SAD.',
-      );
+
+    // Determine which readiness gate applies.  Prototype cards
+    // (PARAM_BUNDLE flow) must have a READY ParamRecord; legacy cards
+    // must have a non-null Card.proxyCardId + a READY SadRecord.  A
+    // single proxyCardId is forwarded to rca either way so the wire
+    // contract stays stable — rca tells the two apart by looking up
+    // ParamRecord first, then SadRecord.  Truthy check, not !== null,
+    // so select()-omitted fields land on the legacy path (safer default).
+    const usingParamBundle = !!card.paramRecordId;
+    if (usingParamBundle) {
+      if (!card.paramRecord || card.paramRecord.status !== 'READY') {
+        metrics().counter('activation.provision_start.fail', 1, {
+          reason: 'param_not_ready',
+          status: card.paramRecord?.status ?? 'missing',
+        });
+        throw badRequest(
+          'param_not_ready',
+          `No READY ParamRecord for card ${card.cardRef} (current: ${card.paramRecord?.status ?? 'missing'}). Re-stage via admin reprovision and retry.`,
+        );
+      }
+    } else {
+      // Legacy guard: SAD must have been staged at register-time (or
+      // via the admin re-stage endpoint).  If proxyCardId is null,
+      // data-prep was unreachable when the card was first registered
+      // and SAD never landed — fail loudly with an actionable error
+      // instead of forwarding null to RCA and getting back a cryptic
+      // Zod validation 400.
+      if (!card.proxyCardId) {
+        metrics().counter('activation.provision_start.fail', 1, { reason: 'sad_not_staged' });
+        throw badRequest(
+          'sad_not_staged',
+          'No SAD staged for this card (proxyCardId is null) — data-prep was unreachable at registration. Ask an admin to re-stage SAD.',
+        );
+      }
     }
 
     // When PALISADE_RCA_URL is unset, run in mock mode so local dev + e2e
@@ -66,6 +99,16 @@ export function createProvisioningRouter(): Router {
     // PALISADE_RCA_URL in prod is a config error the operator must fix.
     let sessionId: string;
     let wsUrl: string;
+
+    // Pick the proxyCardId that gets forwarded to rca.  For prototype
+    // cards we use ParamRecord.proxyCardId (pxy_* namespace, set by
+    // data-prep.prepareParamBundle); for legacy cards we use
+    // Card.proxyCardId (proxy_* namespace, set at original SAD
+    // register).  rca.startSession does a ParamRecord lookup first
+    // then falls back to SadRecord, so both shapes work on the wire.
+    const outboundProxyCardId = usingParamBundle
+      ? card.paramRecord!.proxyCardId
+      : card.proxyCardId!;
 
     if (!config.PALISADE_RCA_URL) {
       const mockId = randomUUID();
@@ -77,7 +120,7 @@ export function createProvisioningRouter(): Router {
       // PROVISION_AUTH_KEYS["activation"] must be the same hex value.
       const path = '/api/provision/start';
       const bodyBytes = Buffer.from(
-        JSON.stringify({ proxyCardId: card.proxyCardId }),
+        JSON.stringify({ proxyCardId: outboundProxyCardId }),
         'utf8',
       );
       const authorization = signRequest({
@@ -110,22 +153,35 @@ export function createProvisioningRouter(): Router {
       wsUrl = rcaBody.wsUrl;
     }
 
-    // Look up the SadRecord by proxyCardId so we can satisfy the FK at
-    // insert time.  The previous code passed sadRecordId='' which violated
-    // ProvisioningSession_sadRecordId_fkey on every call.
+    // Look up a SadRecord to satisfy the ProvisioningSession.sadRecordId
+    // FK at insert time.  (Schema still has this as NOT NULL even
+    // though prototype cards don't consume the SAD bytes — proper fix
+    // is making sadRecordId nullable, deferred to a dedicated schema
+    // migration.  See TODO in packages/db/prisma/schema.prisma's
+    // ProvisioningSession model.)
     //
-    // Pick the most-recently-created READY record — there might be multiple
-    // historic ones from earlier register attempts; we want the live one.
+    // For legacy cards: require status=READY (unchanged — gates
+    // re-staging if the previous tap completed).
+    // For prototype cards: accept ANY SadRecord for the same card as
+    // the FK placeholder; actual readiness is ParamRecord-gated above.
+    // Falls back to the most-recent SadRecord regardless of status,
+    // because prototype cards typically have a historic CONSUMED one
+    // from register time and we just need a valid id to satisfy FK.
     const sadRecord = await prisma.sadRecord.findFirst({
-      where: { proxyCardId: card.proxyCardId, status: 'READY' },
+      where: usingParamBundle
+        ? { cardId: card.id }
+        : { proxyCardId: card.proxyCardId!, status: 'READY' },
       orderBy: { createdAt: 'desc' },
       select: { id: true },
     });
     if (!sadRecord) {
-      metrics().counter('activation.provision_start.fail', 1, { reason: 'sad_not_ready' });
+      const reason = usingParamBundle ? 'sad_fk_missing' : 'sad_not_ready';
+      metrics().counter('activation.provision_start.fail', 1, { reason });
       throw badRequest(
-        'sad_not_ready',
-        `No READY SAD record for proxyCardId ${card.proxyCardId} — re-stage via admin and retry.`,
+        reason,
+        usingParamBundle
+          ? `No SadRecord exists for card ${card.cardRef} — prototype cards still need a historic SadRecord for FK. Ask an admin to seed one.`
+          : `No READY SAD record for proxyCardId ${card.proxyCardId} — re-stage via admin and retry.`,
       );
     }
 
@@ -139,7 +195,11 @@ export function createProvisioningRouter(): Router {
         data: {
           cardId: card.id,
           sadRecordId: sadRecord.id,
-          proxyCardId: card.proxyCardId,
+          // Match the proxy we forwarded to rca so audit trails align
+          // and the completion callback can find the session by rca's
+          // proxyCardId.  Legacy cards use Card.proxyCardId (proxy_*);
+          // prototype cards use ParamRecord.proxyCardId (pxy_*).
+          proxyCardId: outboundProxyCardId,
           rcaSessionId: sessionId,
           phase: 'INIT',
         },

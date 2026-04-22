@@ -58,9 +58,11 @@ check_health() {
 
 log "phase 1: health checks"
 
-# Vera services.  Ports match the PORT defaults in services/*/src/env.ts.
+# Vera-repo services.  Ports match the PORT defaults in the Vera repo.
 check_health "vera-pay"       "http://localhost:3003/api/health"
 check_health "vera-vault"     "http://localhost:3004/api/health"
+# Vera-repo admin on :3005 (see Vera/services/admin).  Not to be confused
+# with palisade-admin (:3009) which is card-side.
 check_health "vera-admin"     "http://localhost:3005/api/health"
 
 # Palisade services.  Palisade admin is on 3009 (see its env.ts — 3005

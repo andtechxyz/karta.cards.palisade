@@ -16,11 +16,13 @@ export {
   cardFieldCryptoEnvShape,
   sdmKeyDerivationEnvShape,
   assertSdmEnv,
+  assertProdRequiredEnv,
   serviceAuthServerEnvShape,
   authKeysJson,
   hexKey,
   originList,
 } from './env.js';
+export type { ProdRequiredField } from './env.js';
 export { encrypt, decrypt } from './encryption.js';
 export type { EncryptedPayload } from './encryption.js';
 export { EnvKeyProvider } from './key-provider.js';

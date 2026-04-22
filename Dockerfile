@@ -31,6 +31,7 @@ COPY packages/service-auth/package.json         packages/service-auth/
 COPY packages/retention/package.json            packages/retention/
 COPY packages/cognito-auth/package.json         packages/cognito-auth/
 COPY packages/emv/package.json                  packages/emv/
+COPY packages/emv-ecdh/package.json             packages/emv-ecdh/
 COPY packages/provisioning-client/package.json  packages/provisioning-client/
 COPY packages/sdm-keys/package.json             packages/sdm-keys/
 COPY packages/admin-config/package.json         packages/admin-config/
@@ -56,7 +57,7 @@ COPY scripts/  scripts/
 RUN npx prisma generate --schema packages/db/prisma/schema.prisma
 
 # Compile all TypeScript (backend — project references)
-RUN npx tsc -b
+RUN npx tsc -b --force
 
 # Rewrite package exports from ./src/index.ts → ./dist/index.js so `node`
 # (not tsx) can resolve workspace packages at runtime.
@@ -107,6 +108,8 @@ COPY --from=builder /app/packages/cognito-auth/dist/         packages/cognito-au
 COPY --from=builder /app/packages/cognito-auth/package.json  packages/cognito-auth/
 COPY --from=builder /app/packages/emv/dist/                  packages/emv/dist/
 COPY --from=builder /app/packages/emv/package.json           packages/emv/
+COPY --from=builder /app/packages/emv-ecdh/dist/             packages/emv-ecdh/dist/
+COPY --from=builder /app/packages/emv-ecdh/package.json      packages/emv-ecdh/
 COPY --from=builder /app/packages/provisioning-client/dist/         packages/provisioning-client/dist/
 COPY --from=builder /app/packages/provisioning-client/package.json  packages/provisioning-client/
 COPY --from=builder /app/packages/sdm-keys/dist/             packages/sdm-keys/dist/

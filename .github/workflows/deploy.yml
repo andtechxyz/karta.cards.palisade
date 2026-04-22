@@ -32,6 +32,17 @@ on:
       - '.gitattributes'
       - '**/CODEOWNERS'
       - 'test-fixtures/**'
+  # Manual-trigger path for prototype branches (e.g. chip-computed-DGI
+  # rollout).  Lets operators deploy a named ref without merging to main.
+  # The `services` input narrows the matrix to just the services that need
+  # rebuilding — omit or set to '*' to deploy all services.
+  workflow_dispatch:
+    inputs:
+      services:
+        description: 'Comma-separated services to deploy (or "*" for all).  E.g. "rca,data-prep"'
+        required: false
+        default: '*'
+        type: string
 
 concurrency:
   # One deploy at a time per branch — rapid-fire pushes cancel the
@@ -65,8 +76,14 @@ jobs:
           cache: 'npm'
 
       - run: npm ci
+      # PCI DSS 4.0.1 §6.3.3 / CPL LSR 3: high-severity vulnerabilities in
+      # dependencies must block CI.  This step previously ran with
+      # `continue-on-error: true` which silently admitted CRITICAL+ vulns
+      # — removed 2026-04-21 per the PCI audit (see
+      # docs/compliance/PCI_DSS_4_0_1_AUDIT_2026-04-21.md §Req 5).
+      # Override for a specific CVE requires a documented exception in
+      # this workflow + a tracking issue.
       - run: npm audit --audit-level=high
-        continue-on-error: true
       - run: npx prisma generate --schema packages/db/prisma/schema.prisma
       - run: npx tsc -b
       - run: npx vitest run
@@ -82,22 +99,21 @@ jobs:
       fail-fast: false
       matrix:
         # Single-cluster AWS reality: we share Vera's AWS account + ECS
-        # cluster + RDS + ECR registry.  For fastest tap-test deploy
-        # Palisade pushes to the EXISTING vera-* ECR repos + updates
-        # the EXISTING vera-* ECS services.  Renaming to palisade-*
-        # is a later cleanup (creates new service copies + DNS move).
+        # cluster + RDS.  As of 2026-04-20 the ECR repos + ECS services
+        # were renamed from `vera-*` → `palisade-*` (blue/green swap;
+        # see ops_ecs_rename_tonight.md for the runbook).  Old vera-*
+        # services are kept at desired-count=0 for 24h rollback.
         #
-        # card-ops + admin deliberately NOT in this matrix for the
-        # first-tap-after-split deploy:
-        #   - card-ops has no vera-card-ops ECS service yet; needs
-        #     explicit provisioning
-        #   - admin lives on Vera and backends via dual-backend SPA;
-        #     Palisade-admin deploys separately post-tap-test
+        # admin now has palisade-admin in this cluster.  card-ops
+        # still has no ECS service of its own — it's invoked via
+        # admin's WS relay, not a standalone container.
         include:
           - service: tap
             port: 3001
           - service: activation
             port: 3002
+          - service: admin
+            port: 3003
           - service: data-prep
             port: 3006
           - service: rca
@@ -110,13 +126,36 @@ jobs:
 
     env:
       IMAGE_TAG: ${{ github.sha }}
-      # Reuse existing vera-* ECR repos (see header comment).
-      ECR_REPO: vera-${{ matrix.service }}
+      # Post-rename: push to palisade-* ECR repos + update palisade-* ECS.
+      ECR_REPO: palisade-${{ matrix.service }}
 
     steps:
+      # Early-skip for workflow_dispatch: if the operator narrowed the
+      # deploy with `inputs.services`, any matrix entry not in that list
+      # exits here.  `steps.filter.outputs.run` gates every subsequent
+      # step so we don't waste CI time checking out / building images
+      # for services that weren't asked for.  Push builds always run
+      # (the `if:` short-circuits on github.event_name != 'workflow_dispatch').
+      - name: Filter matrix by inputs.services
+        id: filter
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" != "workflow_dispatch" || "${{ inputs.services }}" == "*" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ ",${{ inputs.services }}," == *",${{ matrix.service }},"* ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping ${{ matrix.service }} — not in inputs.services=${{ inputs.services }}"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.filter.outputs.run == 'true'
 
       - name: Configure AWS credentials
+        if: steps.filter.outputs.run == 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -124,19 +163,23 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Log in to Amazon ECR
+        if: steps.filter.outputs.run == 'true'
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Set up Docker Buildx
+        if: steps.filter.outputs.run == 'true'
         # Required for build-push-action's cache backend (type=gha
         # isn't available on the default docker driver).
         uses: docker/setup-buildx-action@v3
 
       - name: Compute short SHA
+        if: steps.filter.outputs.run == 'true'
         id: sha
         run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push Docker image
+        if: steps.filter.outputs.run == 'true'
         id: build
         uses: docker/build-push-action@v6
         with:
@@ -155,9 +198,10 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
 
       - name: Update ECS task definition and deploy
+        if: steps.filter.outputs.run == 'true'
         run: |
-          # Reuse existing vera-* ECS services (single-cluster).
-          SERVICE_NAME=vera-${{ matrix.service }}
+          # Post-rename: services are palisade-* in the shared vera cluster.
+          SERVICE_NAME=palisade-${{ matrix.service }}
           FULL_IMAGE=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.sha.outputs.short }}
 
           # Fetch the current task definition

@@ -18,7 +18,7 @@
  * server-known before the NFC exchange begins:
  *
  *   - SELECT PA: constant (AID A00000006250414C)
- *   - GENERATE_KEYS: constant (80E000000101 — no session-ID payload)
+ *   - GENERATE_KEYS: constant (80E00000010100 — no session-ID payload, case-4)
  *   - TRANSFER_SAD: computed from PlanContext (chipProfile DGI/tag, the
  *     IssuerProfile's bankId/progId/scheme/postProvisionUrl, plus the
  *     plaintext SAD bytes decrypted from SadRecord.sadEncrypted).  Does
@@ -32,6 +32,8 @@
  * after step 1 and await a server `continue` message before executing
  * step 2.  Deferred; not needed yet.
  */
+
+import { wrapParamBundle, serializeWrappedBundle } from '@palisade/emv-ecdh';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -141,15 +143,57 @@ const GET_CHALLENGE_APDU = '80EC000010';
 /**
  * GENERATE_KEYS with a single-byte payload 0x01 ("ECC P-256 keypair").
  * Passing a session-ID payload appends bytes the PA discards (or worse —
- * returns 6D00).  Matches the exact bytes in Palisade's SSD e2e trace.
+ * returns 6D00).  Trailing 00 is Le for the 65-byte pubkey response;
+ * pa-v3 rejects case-3 form (no Le) with SW=6700 when
+ * setOutgoingAndSend tries to emit the pubkey.  pa-v1 typically got
+ * the Le added by its reader, but phones don't, so we send case-4
+ * explicitly.
  */
-const GENERATE_KEYS_APDU = '80E000000101';
+const GENERATE_KEYS_APDU = '80E00000010100';
 
 /** FINAL_STATUS — zero-data case-2-style query. */
 const FINAL_STATUS_APDU = '80E6000000';
 
 /** CONFIRM — zero-data commit. */
 const CONFIRM_APDU = '80E8000000';
+
+/**
+ * WIPE — resets the PA applet's state machine to STATE_IDLE and zeroes
+ * all per-session DGI buffers on the chip (`processWipe()` in the
+ * applet).  Accepts no state guard — safe to issue whether the chip is
+ * IDLE, AWAITING_CONFIRM, or COMMITTED.  Does NOT touch attestation
+ * material (privkey, cardCert, cplc) loaded at perso via
+ * STORE_ATTESTATION — those survive a WIPE so C16/C23 stays intact
+ * across re-perso cycles.
+ *
+ * Inserted as plan step 2 (right after SELECT_PA, before GENERATE_KEYS)
+ * so every provisioning plan is idempotent with respect to chip state.
+ * Without this, re-provisioning a previously-committed card returns
+ * SW_WRONG_STATE=0x6985 on the GENERATE_KEYS step, which is the exact
+ * failure mode observed after the CONFIRM race fix landed and a
+ * successful tap left the chip in STATE_COMMITTED — subsequent taps
+ * against the same chip (operator reset + retry) would hit 6985 until
+ * the operator wiped the applet manually.  This step closes that loop.
+ */
+const WIPE_APDU = '80EA000000';
+
+/**
+ * GET_ATTESTATION_CHAIN (patent C16/C23).  Returns the per-card cert
+ * blob loaded at perso (`card_pubkey[65] || cplc[42] || sig[DER]`).
+ * The PA applet's IssuerAttestation.getCardCert() emits the blob
+ * verbatim.  Le=00 = "send as much as available" — the chip tops out
+ * well below 256 B so short-form Le is safe.  Placed BEFORE
+ * GENERATE_KEYS so rca has the cardCert in hand when the keygen
+ * response's attestSig arrives, enabling the Root→Issuer→Card→session
+ * chain walk inside {@link AttestationVerifier.verify} to run
+ * synchronously against one captured buffer instead of a second RTT.
+ *
+ * Only emitted when {@link PlanOptions.includeAttestationChain}
+ * is set — off by default so legacy cards (pre-Drop 3 applet
+ * bytecode, which returns 6D00 INS-not-supported) still get a
+ * successful 5-step plan in permissive mode.
+ */
+const GET_ATTESTATION_CHAIN_APDU = '80EE000000';
 
 /**
  * Minimal "PALISADE" SAD blob — one DGI 0x0101 carrying TLV 0x50
@@ -214,6 +258,23 @@ export function schemeByteForIssuer(scheme: string): number {
  */
 export interface PlanOptions {
   includeChipChallenge?: boolean;
+  /**
+   * Patent C16/C23 — emit a `GET_ATTESTATION_CHAIN` (CLA=80, INS=EE)
+   * step between SELECT_PA and GENERATE_KEYS so rca receives the
+   * per-card cert blob (loaded at perso via STORE_ATTESTATION) before
+   * the keygen response's attestSig arrives.  The session-manager
+   * stashes the returned cardCert and hands it to
+   * {@link AttestationVerifier.verify} as the `cardCertOverride`
+   * argument on the keygen step.
+   *
+   * Caller is expected to set this from the attestation mode gate:
+   *   - `strict`      → on  (cardCert required; verify fails without it)
+   *   - `permissive`  → off (legacy cards without Drop 3 bytecode would
+   *                          return 6D00 and fail-fast the whole plan)
+   *
+   * Default: off.
+   */
+  includeAttestationChain?: boolean;
 }
 
 /**
@@ -253,6 +314,27 @@ export function buildProvisioningPlan(
 
   steps.push(
     { i: i++, apdu: SELECT_PA_APDU,     phase: 'select_pa',      progress: 0.05, expectSw: '9000' },
+    // Idempotency guard — reset applet state before keygen so a prior
+    // committed session doesn't block re-perso with SW_WRONG_STATE.
+    // WIPE preserves attestation material (per
+    // ProvisioningAgentV3.processWipe) so C16/C23 stays intact.
+    { i: i++, apdu: WIPE_APDU,          phase: 'wipe_applet',    progress: 0.08, expectSw: '9000' },
+  );
+
+  if (options.includeAttestationChain) {
+    // Patent C16/C23 — fetch the per-card cert blob before keygen so
+    // the subsequent attestSig (trailer on GENERATE_KEYS) can be
+    // verified synchronously against the Root→Issuer→Card chain.
+    // Indexed BEFORE key_generation so the session-manager's
+    // handlePlanAttestationChain can stash the cardCert before
+    // handlePlanKeygen runs the verify.
+    steps.push({
+      i: i++, apdu: GET_ATTESTATION_CHAIN_APDU, phase: 'get_attestation_chain',
+      progress: 0.15, expectSw: '9000',
+    });
+  }
+
+  steps.push(
     { i: i++, apdu: GENERATE_KEYS_APDU, phase: 'key_generation', progress: 0.25, expectSw: '9000' },
     { i: i++, apdu: transferSadApdu,    phase: 'provisioning',   progress: 0.55, expectSw: '9000' },
     { i: i++, apdu: FINAL_STATUS_APDU,  phase: 'finalizing',     progress: 0.80, expectSw: '9000' },
@@ -331,13 +413,156 @@ export function buildTransferSadApdu(ctx: PlanContext): Buffer {
     ]);
   }
 
-  // Extended-length APDU path — kicks in once real SAD bytes push the
-  // payload past 255.  Header becomes 80 E2 00 00 00 Lc-hi Lc-lo.
+  // Extended-length APDU path.  See buildParamBundleApdu for the
+  // rationale on the trailing Le=0x0000 (case-4 extended) — iOS CoreNFC
+  // rejects case-3 extended at the ISO-DEP transmit layer.  pa-v1 never
+  // hit this branch in production (SAD blobs stayed under 255 B), so
+  // the code was right-looking but untested via real NFC.
   const lcBuf = Buffer.alloc(2);
   lcBuf.writeUInt16BE(lc, 0);
   return Buffer.concat([
-    Buffer.from([0x80, 0xE2, 0x00, 0x00, 0x00]),
-    lcBuf,
-    transferData,
+    Buffer.from([0x80, 0xE2, 0x00, 0x00, 0x00]),  // 5 B header + ext marker
+    lcBuf,                                         // 2 B Lc-hi Lc-lo
+    transferData,                                  // N B body
+    Buffer.from([0x00, 0x00]),                     // 2 B Le = "max"
   ]);
+}
+
+// ---------------------------------------------------------------------------
+// TRANSFER_PARAMS assembly (chip-computed-DGI prototype)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the TRANSFER_PARAMS APDU for pa-v3.  Same CLA/INS (0x80 0xE2)
+ * as TRANSFER_SAD but with a wholly different body: an ECDH-wrapped
+ * ParamBundle instead of a pre-built DGI stream.
+ *
+ * Wire body:
+ *   server_ephemeral_pub_uncompressed (65 B)
+ *   || nonce (12 B)
+ *   || ciphertext (variable — ~400 B for a full MChip CVN 18 bundle)
+ *   || gcm_tag (16 B)
+ *
+ * Total body length is typically ~500 B, which forces extended-APDU
+ * encoding (Lc = 0x00 Lc-hi Lc-lo) for most real bundles.
+ *
+ * Inputs:
+ *   - plaintextBundle: the TLV ParamBundle bytes produced by
+ *     @palisade/emv's buildMChipParamBundle (server-side at
+ *     data-prep.prepareParamBundle time), decrypted from
+ *     ParamRecord.bundleEncrypted just before we get here.
+ *   - chipPubUncompressed: the 65-byte SEC1 pubkey returned in the
+ *     GENERATE_KEYS response immediately prior.
+ *   - sessionId: the ProvisioningSession.id — mixed into HKDF info
+ *     so the bundle is bound to a specific session.
+ *
+ * Caller is responsible for scrubbing `plaintextBundle` after this
+ * function returns — same pattern as `buildTransferSadApdu` scrubbing
+ * `ctx.sadPayload` in the rca handler.
+ */
+export function buildParamBundleApdu(input: {
+  plaintextBundle: Buffer;
+  chipPubUncompressed: Buffer;
+  sessionId: string;
+  /** Patent C4 chip-side nonce; see {@link buildParamBundleApduChunks}. */
+  chipNonce?: Buffer;
+}): Buffer {
+  const chunks = buildParamBundleApduChunks(input);
+  // Back-compat: single APDU callers still get a single Buffer.
+  // Multi-chunk callers (session-manager handleKeygenResponse) should
+  // call buildParamBundleApduChunks directly.
+  if (chunks.length !== 1) {
+    throw new Error(
+      `buildParamBundleApdu: wire body ${/* computed inside */''} bytes split into ${chunks.length} chunks; caller must use buildParamBundleApduChunks`,
+    );
+  }
+  return chunks[0];
+}
+
+/**
+ * Maximum body bytes per chained short APDU chunk.  Per ISO 7816-4 a
+ * short APDU body maxes at 255 B; leaving 15 B of headroom for future
+ * per-chunk metadata (chunk index, total count) if we ever need it —
+ * negligible wire overhead given a full 721 B body fits in 4 chunks
+ * either way (721 / 240 = 4 chunks vs 721 / 255 = 3 chunks).
+ */
+const TRANSFER_PARAMS_CHUNK_SIZE = 240;
+
+/**
+ * Build the TRANSFER_PARAMS APDU(s) for pa-v3.  Returns an ordered
+ * array that the caller emits one at a time over the WS.
+ *
+ * Framing decision is driven by wire body size:
+ *
+ *   - wire <= 255 B  → single short APDU, CLA=0x80
+ *   - wire  > 255 B  → N chained short APDUs, 240 B max body each,
+ *                      CLA=0x90 for all non-final chunks (bit 4 set
+ *                      = "more data follows"), CLA=0x80 for the last.
+ *
+ * Why not case-4 extended (Lc = 00 Lc-hi Lc-lo + Le = 00 00)?
+ * iOS CoreNFC + JCOP 5 JC 3.0.4 silicon reject that framing at the
+ * ISO-DEP transmit layer (observed SW=6700 across four consecutive
+ * real-card taps).  Chained short APDUs work on the same stack that
+ * carries pa-v1's TRANSFER_SAD, so this is the strictly-safer
+ * framing.  pa-v3's processTransferParams handles both (extended via
+ * receiveBytes loop, chained via chainOff accumulator) — we pick the
+ * chained form here because it's the one actually verified on-wire.
+ */
+export function buildParamBundleApduChunks(input: {
+  plaintextBundle: Buffer;
+  chipPubUncompressed: Buffer;
+  sessionId: string;
+  /**
+   * Patent C4 chip-side nonce, returned by the applet in the trailing
+   * 16 bytes of its GEN_KEYS response.  When present, woven into the
+   * HKDF info on both wrap and unwrap sides.  Omit only in legacy /
+   * non-C4 code paths — prod always plumbs this through.
+   */
+  chipNonce?: Buffer;
+}): Buffer[] {
+  const wrapped = wrapParamBundle({
+    chipPubUncompressed: input.chipPubUncompressed,
+    plaintext: input.plaintextBundle,
+    sessionId: input.sessionId,
+    chipNonce: input.chipNonce,
+  });
+  const wire = serializeWrappedBundle(wrapped);
+
+  // Single short APDU — use the ≤255 path.
+  if (wire.length <= 255) {
+    return [
+      Buffer.concat([
+        Buffer.from([0x80, 0xE2, 0x00, 0x00, wire.length]),
+        wire,
+      ]),
+    ];
+  }
+
+  // Chain the wire body into N chunks.  All chunks share INS/P1/P2;
+  // CLA is 0x90 (chain bit on) for all but the last, 0x80 (chain
+  // bit off) for the last.  Last chunk is CASE-4 (trailing Le) so the
+  // chip has an outgoing slot for the IV-mismatch diagnostic blob
+  // (32 B: chip_iv || wire_iv) — a harmless ~32-byte bump when
+  // everything's working, invaluable when they don't match.
+  const chunks: Buffer[] = [];
+  let off = 0;
+  while (off < wire.length) {
+    const remaining = wire.length - off;
+    const thisLen = Math.min(TRANSFER_PARAMS_CHUNK_SIZE, remaining);
+    const isLast = off + thisLen >= wire.length;
+    const cla = isLast ? 0x80 : 0x90;
+    const parts: Buffer[] = [
+      Buffer.from([cla, 0xE2, 0x00, 0x00, thisLen]),
+      wire.subarray(off, off + thisLen),
+    ];
+    if (isLast) {
+      // Le=0x20 (32 B — exactly what EcdhUnwrapper.DBG_IV_DIAG_LEN
+      // emits on IV mismatch).  Chip returns 0 bytes on success with
+      // this Le; returns 32 B + SW=6AE4 on mismatch.
+      parts.push(Buffer.from([0x20]));
+    }
+    chunks.push(Buffer.concat(parts));
+    off += thisLen;
+  }
+  return chunks;
 }

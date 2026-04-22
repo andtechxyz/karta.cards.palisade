@@ -22,9 +22,11 @@ import {
   encryptSadDev,
   decryptSadDev,
   SAD_KEY_VERSION_DEV_AES_ECB,
+  buildMChipParamBundle,
+  reduceSensitiveFields,
 } from '@palisade/emv';
-import type { CardData, IssuerProfileForSad } from '@palisade/emv';
-import { notFound } from '@palisade/core';
+import type { CardData, IssuerProfileForSad, McipMapperInput } from '@palisade/emv';
+import { notFound, badRequest } from '@palisade/core';
 
 import { EmvDerivationService } from './emv-derivation.js';
 import { getDataPrepConfig } from '../env.js';
@@ -164,6 +166,236 @@ export class DataPrepService {
     };
   }
 
+  /**
+   * Router: picks between the legacy SAD flow and the prototype
+   * ParamBundle flow based on the ChipProfile bound to the card's
+   * program.  Every existing ChipProfile has
+   * `provisioningMode = SAD_LEGACY` by default, so every existing
+   * card continues to call `prepareCard` as today.  New cards issued
+   * against a ChipProfile flipped to `PARAM_BUNDLE` route to
+   * `prepareParamBundle` instead.
+   *
+   * Callers (activation's `register.service.ts`) should call this
+   * rather than `prepareCard` directly — it makes the routing
+   * decision a schema-driven property instead of a hardcoded
+   * call-site choice.
+   */
+  async prepare(input: PrepareInput): Promise<PrepareResult> {
+    const issuerProfile = await prisma.issuerProfile.findUnique({
+      where: { programId: input.programId },
+      include: { chipProfile: true },
+    });
+    if (!issuerProfile) {
+      throw notFound('profile_not_found', `Unknown programId: ${input.programId}`);
+    }
+
+    const mode = issuerProfile.chipProfile.provisioningMode;
+    if (mode === 'PARAM_BUNDLE') {
+      return this.prepareParamBundle(input);
+    }
+    // Default: SAD_LEGACY and any future enum value we haven't taught
+    // rca about yet.
+    return this.prepareCard(input);
+  }
+
+  /**
+   * Prototype path — replaces SADBuilder's full-DGI image build with a
+   * compact TLV ParamBundle that the PA v3 applet decodes + assembles
+   * into DGIs on-chip.  See PROTOTYPE_PLAN.md §1-3 for architecture.
+   *
+   * Invariant: at steady state exactly one of (SadRecord, ParamRecord)
+   * exists per card.  prepareCard writes SadRecord + Card.proxyCardId;
+   * this method writes ParamRecord + Card.paramRecordId.  The Card row
+   * never carries both.
+   *
+   * Failure modes:
+   *   - IssuerProfile missing → notFound
+   *   - ChipProfile.provisioningMode != PARAM_BUNDLE → badRequest
+   *     (caller should have routed through `prepare()` — throwing here
+   *     catches direct misuse)
+   *   - Scheme not 'mchip_advance' → scheme-mchip throws (prototype is
+   *     MChip only; VSDC mapper lands in a follow-up)
+   *   - APC derivation / KMS encrypt failure → propagates
+   */
+  async prepareParamBundle(input: PrepareInput): Promise<PrepareResult> {
+    const config = getDataPrepConfig();
+
+    // 1. Load issuer profile + chip profile (same as prepareCard).
+    const issuerProfile = await prisma.issuerProfile.findUnique({
+      where: { programId: input.programId },
+      include: { chipProfile: true },
+    });
+    if (!issuerProfile) {
+      throw notFound('profile_not_found', `Unknown programId: ${input.programId}`);
+    }
+    if (issuerProfile.chipProfile.provisioningMode !== 'PARAM_BUNDLE') {
+      throw badRequest(
+        'wrong_provisioning_mode',
+        `ChipProfile ${issuerProfile.chipProfile.id} provisioningMode=` +
+          `${issuerProfile.chipProfile.provisioningMode}; expected PARAM_BUNDLE`,
+      );
+    }
+
+    // 2. APC derivations — same as prepareCard.  Master keys never
+    //    leave the HSM; APC returns per-card MK-AC/MK-SMI/MK-SMC
+    //    bytes we immediately fold into the ParamBundle and scrub.
+    const derived = await this.emv.deriveAllKeys(
+      issuerProfile.tmkKeyArn,
+      issuerProfile.imkAcKeyArn,
+      issuerProfile.imkSmiKeyArn,
+      issuerProfile.imkSmcKeyArn,
+      input.pan,
+      input.expiryYymm,
+      input.cardSequenceNumber ?? '01',
+    );
+
+    // 3. ICC RSA keypair — APC generates, returns PKCS#1 DER of the
+    //    private key + the matching server-signed ICC PK certificate
+    //    (9F46).  The chip receives both in the ParamBundle (tags
+    //    0x16 and 0x17).  It never generates its own ICC RSA — it
+    //    only stores + uses the APC-supplied keypair.
+    //
+    // TODO(phase-4-pt2): wire actual APC ICC RSA generation via
+    // EmvDerivationService.deriveIccRsa() (new method — port from
+    // palisade-data-prep's legacy icc_generation.py).  For now, use
+    // placeholder bytes so the test fixture is deterministic and the
+    // schema + DB write path exercises cleanly.  Prototype applet
+    // also accepts any 128-byte priv + any well-formed 9F46 cert
+    // (verification happens at POS interchange time, not at perso).
+    const iccRsaPriv = Buffer.alloc(128, 0xAA);
+    const iccPkCert = Buffer.alloc(112, 0xBB);
+
+    // 4. Assemble ParamBundle via @palisade/emv's scheme-mchip mapper.
+    //    Byte-for-byte parity with simulateMChipChipBuild (which the
+    //    pa-v3 applet's DgiBuilderMchip mirrors in Java) is enforced
+    //    by packages/emv/src/byte-parity.test.ts.
+    //
+    // Also prep the per-field envelopes under PARAMS_PER_COLUMN=1 —
+    // must happen BEFORE the finally scrub below, while the per-card
+    // MK plaintexts are still in memory.  Legacy mode (flag=0) leaves
+    // the four `*Encrypted` handles undefined so the write below
+    // passes null into those columns.
+    let bundle: Buffer;
+    let mkAcEnv: { encrypted: Buffer; keyVersion: number } | null = null;
+    let mkSmiEnv: { encrypted: Buffer; keyVersion: number } | null = null;
+    let mkSmcEnv: { encrypted: Buffer; keyVersion: number } | null = null;
+    let iccRsaEnv: { encrypted: Buffer; keyVersion: number } | null = null;
+    const perColumnMode = config.PARAMS_PER_COLUMN === '1';
+    try {
+      const mapperInput: McipMapperInput = {
+        profile: this.toSadProfile(issuerProfile),
+        card: {
+          pan: input.pan,
+          expiryDate: input.expiryYymm,
+          effectiveDate: this.computeEffectiveDate(input.expiryYymm),
+          serviceCode: input.serviceCode ?? '201',
+          cardSequenceNumber: input.cardSequenceNumber ?? '01',
+          icvv: derived.icvv,
+        },
+        mkAc: derived.mkAcKeyBytes,
+        mkSmi: derived.mkSmiKeyBytes,
+        mkSmc: derived.mkSmcKeyBytes,
+        iccRsaPriv,
+        iccPkCert,
+        bankId: issuerProfile.bankId ?? 0,
+        progId: issuerProfile.progId ?? 0,
+        postProvisionUrl: issuerProfile.postProvisionUrl ?? 'tap.karta.cards',
+      };
+      bundle = buildMChipParamBundle(mapperInput);
+
+      if (perColumnMode) {
+        // Patent C17/C22 — per-field envelope encryption.  Each of the
+        // four crypto-sensitive fields gets its own KMS envelope so
+        // CloudTrail sees a distinct Decrypt call per field at wrap
+        // time (useful for both audit + per-field key rotation).
+        // Parallel awaits cut ~3 KMS round-trips off the critical path.
+        [mkAcEnv, mkSmiEnv, mkSmcEnv, iccRsaEnv] = await Promise.all([
+          this.encryptSad(derived.mkAcKeyBytes, config.KMS_SAD_KEY_ARN),
+          this.encryptSad(derived.mkSmiKeyBytes, config.KMS_SAD_KEY_ARN),
+          this.encryptSad(derived.mkSmcKeyBytes, config.KMS_SAD_KEY_ARN),
+          this.encryptSad(iccRsaPriv, config.KMS_SAD_KEY_ARN),
+        ]);
+      }
+    } finally {
+      // Scrub per-card EMV master keys even if bundle assembly threw.
+      // @palisade/emv's mapper copies the bytes into the bundle buffer
+      // so once buildMChipParamBundle returns the derived buffers
+      // are safe to zero here.  PCI 3.5 / 3.6.2.
+      derived.mkAcKeyBytes.fill(0);
+      derived.mkSmiKeyBytes.fill(0);
+      derived.mkSmcKeyBytes.fill(0);
+      iccRsaPriv.fill(0);
+    }
+
+    // 5. Encrypt the rest-at-rest bundle.  Under PARAMS_PER_COLUMN=1
+    //    we first zero the four sensitive value slots in the TLV
+    //    blob — `reduced` is still wire-valid (same length, same tag/
+    //    length prefixes) but the AES-AC/SMI/SMC/ICC RSA priv slots
+    //    are all-zero.  rca splices the per-column plaintexts back
+    //    in at wrap time via spliceSensitiveFields.  Under legacy
+    //    mode (flag=0) this is a no-op copy and the full bundle
+    //    goes into bundleEncrypted as before.
+    const rested = perColumnMode
+      ? reduceSensitiveFields(bundle)
+      : bundle;
+    let encrypted: Buffer;
+    let keyVersion: number;
+    try {
+      ({ encrypted, keyVersion } = await this.encryptSad(rested, config.KMS_SAD_KEY_ARN));
+    } finally {
+      bundle.fill(0);
+      if (perColumnMode && rested !== bundle) rested.fill(0);
+    }
+
+    // 6. Write ParamRecord + link Card.paramRecordId.  Must be atomic
+    //    so a crash between the two writes doesn't leave a ParamRecord
+    //    orphan that would confuse the retention reaper.
+    //
+    // Per-column columns populated only under PARAMS_PER_COLUMN=1;
+    // rca autodetects via `mkAcEncrypted IS NOT NULL` and branches
+    // to the splice-after-decrypt path at wrap time.
+    const proxyCardId = `pxy_${randomBytes(12).toString('hex')}`;
+    const paramRecord = await prisma.$transaction(async (tx) => {
+      const pr = await tx.paramRecord.create({
+        data: {
+          cardId: input.cardId,
+          proxyCardId,
+          bundleEncrypted: encrypted,
+          bundleKeyVersion: keyVersion,
+          mkAcEncrypted: mkAcEnv?.encrypted ?? null,
+          mkAcKeyVersion: mkAcEnv?.keyVersion ?? null,
+          mkSmiEncrypted: mkSmiEnv?.encrypted ?? null,
+          mkSmiKeyVersion: mkSmiEnv?.keyVersion ?? null,
+          mkSmcEncrypted: mkSmcEnv?.encrypted ?? null,
+          mkSmcKeyVersion: mkSmcEnv?.keyVersion ?? null,
+          iccRsaPrivEncrypted: iccRsaEnv?.encrypted ?? null,
+          iccRsaPrivKeyVersion: iccRsaEnv?.keyVersion ?? null,
+          schemeByte: 0x01, // MChip
+          cvnByte: 0x12,    // CVN 18
+          chipSerial: input.chipSerial ?? null,
+          status: 'READY',
+          expiresAt: new Date(Date.now() + config.SAD_TTL_DAYS * 86400_000),
+        },
+      });
+      await tx.card.update({
+        where: { id: input.cardId },
+        data: { paramRecordId: pr.id },
+      });
+      return pr;
+    });
+
+    metrics().counter('data-prep.param_bundle.ok', 1, {
+      scheme: 'mchip',
+      cvn: '18',
+    });
+
+    return {
+      proxyCardId,
+      sadRecordId: paramRecord.id, // reused field name; caller semantics identical
+      status: 'READY',
+    };
+  }
+
   // -----------------------------------------------------------------------
   // Internal helpers
   // -----------------------------------------------------------------------
@@ -277,7 +509,12 @@ export class DataPrepService {
     sadBytes: Buffer,
     kmsKeyArn: string,
   ): Promise<{ encrypted: Buffer; keyVersion: number }> {
-    if (kmsKeyArn) {
+    // Treat literal "none" and whitespace-only the same as empty — operators
+    // often populate Secrets Manager with "none" as the dev sentinel (AWS
+    // Secrets Manager rejects zero-length strings).  Anything that would
+    // reach AWS KMS as the KeyId 'none' fails with "Invalid keyId 'none'".
+    const normalised = kmsKeyArn.trim().toLowerCase();
+    if (kmsKeyArn && normalised !== 'none' && normalised !== 'dev') {
       // Production: KMS encrypt via shared singleton (keeps TLS keep-alive).
       const resp = await kmsClient().send(
         new EncryptCommand({ KeyId: kmsKeyArn, Plaintext: sadBytes }),
@@ -319,13 +556,19 @@ export class DataPrepService {
     // latency (KMS Decrypt round-trip = 150-400 ms cold), so operators
     // need a p95 dashboard to spot drift.  Tag on `mode` so dev AES-ECB
     // and prod KMS paths are visible separately.
+    // Match the "none" / "dev" sentinel handling from encryptSad so a
+    // rca task booting against `KMS_SAD_KEY_ARN=none` doesn't drop into
+    // the KMS branch and send 'none' as the KeyId.
+    const arnNormalised = kmsKeyArn.trim().toLowerCase();
+    const hasKmsArn =
+      !!kmsKeyArn && arnNormalised !== 'none' && arnNormalised !== 'dev';
     const mode =
       sadKeyVersion === SAD_KEY_VERSION_DEV_AES_ECB ? 'dev'
-      : sadKeyVersion === 0 && kmsKeyArn ? 'kms'
+      : sadKeyVersion === 0 && hasKmsArn ? 'kms'
       : 'unknown';
     const startedAt = Date.now();
     try {
-      if (sadKeyVersion === 0 && kmsKeyArn) {
+      if (sadKeyVersion === 0 && hasKmsArn) {
         // Production: KMS decrypt — CiphertextBlob is self-describing.
         // Use the module-level KMSClient singleton; constructing a fresh
         // client on every call adds ~10-20 ms of TLS + DNS warm-up on the
@@ -350,7 +593,7 @@ export class DataPrepService {
       }
 
       throw new Error(
-        `decryptSad: unsupported sadKeyVersion=${sadKeyVersion} (kmsKeyArn=${kmsKeyArn ? 'set' : 'empty'})`,
+        `decryptSad: unsupported sadKeyVersion=${sadKeyVersion} (kmsKeyArn=${hasKmsArn ? 'set' : 'empty'})`,
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message.toLowerCase() : '';

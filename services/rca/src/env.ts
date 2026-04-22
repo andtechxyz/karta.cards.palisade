@@ -1,7 +1,20 @@
-import { defineEnv, baseEnvShape, authKeysJson } from '@palisade/core';
+import {
+  defineEnv,
+  baseEnvShape,
+  authKeysJson,
+  assertProdRequiredEnv,
+} from '@palisade/core';
 import { z } from 'zod';
 
-const { get: getRcaConfig, reset: _resetRcaConfig } = defineEnv({
+// Dev fallback constants kept at module scope so zod's `.default(...)` and
+// the prod-required assertion below always agree on what "the dev value" is.
+// If someone changes either side in isolation the prod check silently stops
+// firing, so the single source of truth lives here.
+const DATA_PREP_DEV_URL = 'http://localhost:3006';
+const ACTIVATION_CALLBACK_DEV_URL = 'http://localhost:3002';
+const CALLBACK_HMAC_DEV_SECRET = '0'.repeat(64);
+
+const { get: _getRcaConfigRaw, reset: _resetRcaConfigRaw } = defineEnv({
   ...baseEnvShape,
 
   PORT: z.coerce.number().default(3007),
@@ -9,14 +22,21 @@ const { get: getRcaConfig, reset: _resetRcaConfig } = defineEnv({
   // HMAC auth — who can call us
   PROVISION_AUTH_KEYS: authKeysJson,
 
-  // Data-prep service URL (internal ALB)
-  DATA_PREP_SERVICE_URL: z.string().url().default('http://localhost:3006'),
+  // Data-prep service URL (internal ALB).  Localhost default is for
+  // `pnpm dev`; production MUST override via task def with the internal
+  // ALB DNS (e.g. http://data-prep.palisade.internal:3006).  Enforced
+  // by assertProdRequiredEnv below.
+  DATA_PREP_SERVICE_URL: z.string().url().default(DATA_PREP_DEV_URL),
 
-  // Callback URL for notifying activation service on completion
-  ACTIVATION_CALLBACK_URL: z.string().url().default('http://localhost:3002'),
+  // Callback URL for notifying activation service on completion.  Same
+  // prod-override rules as DATA_PREP_SERVICE_URL.
+  ACTIVATION_CALLBACK_URL: z.string().url().default(ACTIVATION_CALLBACK_DEV_URL),
 
-  // HMAC secret for signing callbacks
-  CALLBACK_HMAC_SECRET: z.string().min(1).default('0'.repeat(64)),
+  // HMAC secret for signing callbacks.  Default is 64 zero chars — a
+  // key an attacker could generate offline, so callback integrity is
+  // effectively off in dev.  Prod MUST provide a real 32-byte hex
+  // secret from Secrets Manager (palisade/CALLBACK_HMAC_SECRET).
+  CALLBACK_HMAC_SECRET: z.string().min(1).default(CALLBACK_HMAC_DEV_SECRET),
 
   // WebSocket reconnect timeout
   WS_TIMEOUT_SECONDS: z.coerce.number().default(30),
@@ -53,15 +73,48 @@ const { get: getRcaConfig, reset: _resetRcaConfig } = defineEnv({
   RCA_ALLOW_MINIMAL_SAD: z.enum(['0', '1']).default('0'),
 
   // --- Attestation mode (patent claim C16/C23) ----------------------------
-  // strict     — require non-empty attestation cert chain from the PA that
-  //              validates to a pinned vendor root (NXP JCOP 5 or Infineon
-  //              Secora).  Refuse to ship TRANSFER_SAD if verification
-  //              fails.  Required for PCI/patent compliance.
-  // permissive — stub mode: accept everything, log a warning banner.  Used
-  //              until karta-se applet v1 ships real attestation output.
-  // Default is `permissive` for backward compatibility during rollout; a
-  // karta-se v1 deployment should flip this to `strict` via ECS task def.
+  // strict     — verify the Root → Issuer → Card → iccPubkey chain on
+  //              every GENERATE_KEYS response.  Root pubkey comes from
+  //              KARTA_ATTESTATION_ROOT_PUBKEY, the issuer cert blob from
+  //              KARTA_ATTESTATION_ISSUER_CERT.  Refuse to ship
+  //              TRANSFER_PARAMS / TRANSFER_SAD if any link fails.
+  //              Required for PCI/patent compliance.
+  // permissive — accept everything; log a warning banner.  Used during
+  //              rollout while re-personalising the live fleet with
+  //              issuer-signed attestation certs.
+  // Default is `permissive`; flip to `strict` via ECS task def once
+  // every card in the fleet carries an issuer cert.
   PALISADE_ATTESTATION_MODE: z.enum(['strict', 'permissive']).default('permissive'),
+
+  // --- Attestation PKI inputs (Option A: compact binary certs, no X.509) ---
+  // KARTA_ATTESTATION_ROOT_PUBKEY: 65-byte SEC1 uncompressed P-256 point
+  // (0x04 || X || Y) of the Karta Root CA.  Verifier pins this; rotation
+  // means updating the secret + re-signing the issuer cert.
+  //
+  // KARTA_ATTESTATION_ISSUER_CERT: issuer_pubkey(65) || issuer_id(4) ||
+  // sig(DER ECDSA-SHA256 over the first 69 bytes, signed by Root CA).
+  // Verifier re-verifies this blob on every request — no boot-time caching.
+  //
+  // Both vars are optional in permissive mode so dev / e2e stays unblocked.
+  // Strict mode requires both present and shape-correct (see
+  // assertAttestationConfigForMode in attestation-verifier.ts).
+  KARTA_ATTESTATION_ROOT_PUBKEY: z.string().default(''),
+  KARTA_ATTESTATION_ISSUER_CERT: z.string().default(''),
+
+  // --- ParamBundle prototype flag (patent C17/C22) -----------------------
+  // Master kill-switch for the chip-computed-DGI prototype path.
+  //   '0' (default): every provisioning session uses the legacy TRANSFER_SAD
+  //                  flow, regardless of Card.paramRecordId.  Prototype code
+  //                  is physically deployed but unreachable — safe to ship
+  //                  to prod without risk to existing fleet.
+  //   '1':           sessions whose Card has a non-null paramRecordId route
+  //                  through the TRANSFER_PARAMS path (ECDH-wrapped
+  //                  parameter bundle sent to pa-v3 applet).  Legacy cards
+  //                  (paramRecordId = null) keep using TRANSFER_SAD
+  //                  unconditionally — both paths coexist at runtime.
+  // Flip to '1' only on the ECS task def servicing prototype cards; keep at
+  // '0' (default) on the main production fleet until graduation.
+  RCA_ENABLE_PARAM_BUNDLE: z.enum(['0', '1']).default('0'),
 
   // --- WS upgrade auth token (patent C3 / PCI 8.3.6) ---------------------
   // HMAC-SHA256 key for the short-lived token appended to wsUrl.  Signer
@@ -75,4 +128,86 @@ const { get: getRcaConfig, reset: _resetRcaConfig } = defineEnv({
   WS_TOKEN_SECRET: z.string().regex(/^[0-9a-fA-F]{64}$/, 'WS_TOKEN_SECRET must be 64 hex chars (32 bytes)'),
 });
 
-export { getRcaConfig, _resetRcaConfig };
+// Single-flight guard — assertProdRequiredEnv emits one warning line per
+// fallback-active field in dev.  Firing it every time getRcaConfig() is
+// called would bury those warnings under thousands of lines of spam
+// (getRcaConfig is called per-request in some paths).  We run the check
+// exactly once per process and cache the resolved config.
+let _prodEnvChecked = false;
+
+/**
+ * Resolve the rca config and — on first call — run the production
+ * required-env check.  In prod, missing/unsafe values throw here with a
+ * single message listing every offending field at once.  In dev/test,
+ * a single warning per fallback-active field is printed to stderr.
+ */
+export function getRcaConfig() {
+  const cfg = _getRcaConfigRaw();
+  if (!_prodEnvChecked) {
+    assertProdRequiredEnv(cfg.NODE_ENV, [
+      {
+        name: 'KMS_SAD_KEY_ARN',
+        value: cfg.KMS_SAD_KEY_ARN,
+        devFallback: '',
+        // 'none'/'dev' are sentinel values that mean "no KMS key, use
+        // the AES-128-ECB stub" (Secrets Manager rejects zero-length
+        // strings so the operator has to store SOMETHING — see
+        // commit cde5f8d).  Prod must have a real ARN, not a sentinel.
+        fallbackSentinels: ['none', 'dev'],
+        description:
+          'AWS Payment Cryptography key ARN for SAD blob decryption. ' +
+          'Without it rca can only read AES-128-ECB dev ciphertexts — ' +
+          'prod SadRecords encrypted under KMS will fail to decrypt.',
+      },
+      {
+        name: 'RCA_PUBLIC_WS_BASE',
+        value: cfg.RCA_PUBLIC_WS_BASE,
+        // Declared `.optional()` — no zod default — so undefined IS the fallback.
+        devFallback: undefined,
+        description:
+          'Publicly-reachable WebSocket origin handed back to the mobile ' +
+          'app in /api/provision/start.  Falling back to the inbound ' +
+          'request host breaks behind ALB/CloudFront (phone gets the ' +
+          'internal DNS name).  Must be https://palisade.karta.cards in prod.',
+      },
+      {
+        name: 'CALLBACK_HMAC_SECRET',
+        value: cfg.CALLBACK_HMAC_SECRET,
+        devFallback: CALLBACK_HMAC_DEV_SECRET,
+        description:
+          'HMAC-SHA256 key for signing provisioning-complete callbacks ' +
+          'to the activation service.  Default is 64 zero chars — any ' +
+          'attacker who can reach the activation endpoint can forge ' +
+          'completions.  Pull from Secrets Manager (palisade/CALLBACK_HMAC_SECRET).',
+      },
+      {
+        name: 'DATA_PREP_SERVICE_URL',
+        value: cfg.DATA_PREP_SERVICE_URL,
+        devFallback: DATA_PREP_DEV_URL,
+        description:
+          'Internal ALB DNS for the data-prep service.  Leaving it at ' +
+          'localhost in a Fargate task means rca tries to reach data-prep ' +
+          'on its own loopback — no such service listens there.',
+        rejectLocalhostInProd: true,
+      },
+      {
+        name: 'ACTIVATION_CALLBACK_URL',
+        value: cfg.ACTIVATION_CALLBACK_URL,
+        devFallback: ACTIVATION_CALLBACK_DEV_URL,
+        description:
+          'Internal ALB DNS for the activation service, used when rca ' +
+          'notifies activation that a card just finished provisioning. ' +
+          'Localhost default would silently drop the completion callback.',
+        rejectLocalhostInProd: true,
+      },
+    ]);
+    _prodEnvChecked = true;
+  }
+  return cfg;
+}
+
+/** Reset the cached config — test hook, clears the prod-check single-flight too. */
+export function _resetRcaConfig(): void {
+  _resetRcaConfigRaw();
+  _prodEnvChecked = false;
+}

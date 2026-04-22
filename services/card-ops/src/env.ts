@@ -60,6 +60,43 @@ const { get: _getCardOpsConfigRaw, reset: _resetCardOpsConfig } = defineEnv({
   // activation.  PCI 8.3.6 / H-8.  Activation signs with the same key.
   // 64 hex chars (32 bytes).
   WS_TOKEN_SECRET: z.string().regex(/^[0-9a-fA-F]{64}$/, 'WS_TOKEN_SECRET must be 64 hex chars (32 bytes)'),
+
+  // --- Patent C16/C23: Issuer CA KMS key ARN for per-card attestation
+  // material minting during install-pa perso.  Direct-imports
+  // issueCardCert + makeKmsIssuerSigner from @palisade/data-prep so
+  // card-ops owns the kms:Sign call (simpler than an HTTP round trip
+  // and keeps the attestation private scalar from ever touching the
+  // wire between services).
+  //
+  // Empty default keeps dev installs working — install-pa sees the
+  // empty ARN, skips the 3 STORE_ATTESTATION APDUs, and completes
+  // normally.  The card will then fail strict-mode verification at
+  // tap time with a clear 'cardCert missing' warning, which is the
+  // signal to set the ARN and re-run install-pa.
+  KMS_ATTESTATION_ISSUER_ARN: z.string().default(''),
+  // AWS region for KMS.  Separate from the base AWS_REGION so card-ops
+  // could hypothetically sign against a key in a different region than
+  // its PC region.  In practice they share ap-southeast-2.
+  AWS_REGION: z.string().default('ap-southeast-2'),
+
+  // Prototype toggle — which PA CAP file to install by default when the
+  // install_pa operation does not receive an explicit capKey in the
+  // session params.
+  //
+  //   'pa'    → legacy pa.cap (INS_TRANSFER_SAD, server-computed DGIs).
+  //             This is the production default and what every existing
+  //             card in the field runs.
+  //   'pa-v3' → prototype pa-v3.cap (INS_TRANSFER_PARAMS, chip-computed
+  //             DGIs via ECDH-wrapped ParamBundle).  Dual-mode applet —
+  //             still accepts legacy SAD for cards whose server
+  //             provisioning path hasn't migrated yet.
+  //
+  // Per-session override: POST /api/sessions body may include
+  //   { opType: 'install_pa', params: { capKey: 'pa-v3' } }
+  // which beats this default.  The env var is the "my whole fleet is
+  // ready to migrate" switch; the params field is "this one card is a
+  // prototype trial".
+  CARD_OPS_DEFAULT_PA_CAP: z.enum(['pa', 'pa-v3']).default('pa'),
 });
 
 // Wrap the raw config getter with a production guard that refuses to boot

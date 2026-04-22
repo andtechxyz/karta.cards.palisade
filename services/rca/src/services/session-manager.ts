@@ -13,7 +13,7 @@
  */
 
 import { prisma } from '@palisade/db';
-import { APDUBuilder } from '@palisade/emv';
+import { APDUBuilder, ParamTag, spliceSensitiveFields } from '@palisade/emv';
 import { badRequest, redactSid } from '@palisade/core';
 import { DataPrepService } from '@palisade/data-prep/services/data-prep.service';
 
@@ -23,12 +23,34 @@ import {
   buildProvisioningPlan,
   buildMinimalSadPayload,
   buildTransferSadApdu,
+  buildParamBundleApduChunks,
   schemeByteForIssuer,
   type Plan,
   type PlanContext,
   type PlanStep,
 } from './plan-builder.js';
-import { AttestationVerifier } from './attestation-verifier.js';
+import {
+  AttestationVerifier,
+  ICC_PUBKEY_LEN,
+  type AttestationMode,
+  type AttestationVerifierConfig,
+} from './attestation-verifier.js';
+
+/**
+ * Build the AttestationVerifier strict-mode config from the rca env.
+ * Returns undefined in permissive mode (verify() accepts undefined
+ * there).  Hex-decode happens on every call — inexpensive for the
+ * handful of attestation verifies per tap and avoids a module-scope
+ * cache that would need test invalidation.
+ */
+function attestationConfigFor(mode: AttestationMode): AttestationVerifierConfig | undefined {
+  if (mode !== 'strict') return undefined;
+  const cfg = getRcaConfig();
+  return {
+    rootPubkey: Buffer.from(cfg.KARTA_ATTESTATION_ROOT_PUBKEY, 'hex'),
+    issuerCert: Buffer.from(cfg.KARTA_ATTESTATION_ISSUER_CERT, 'hex'),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -196,10 +218,175 @@ function pruneSadCache(): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// TRANSFER_PARAMS chunk queue — for chained short APDUs
+// ---------------------------------------------------------------------------
+//
+// When pa-v3's TRANSFER_PARAMS body exceeds 255 B (the real case for any
+// ParamBundle), rca splits the wire into ≤240-byte chunks with the ISO
+// 7816-4 chaining bit (CLA bit 0x10) set on everything but the last.
+// iOS CoreNFC / JCOP 5 JC 3.0.4 reject extended APDUs on this silicon
+// — tested SW=6700 across four consecutive taps despite correct case-4
+// framing — and short APDUs are the only path that got pa-v1's
+// TRANSFER_SAD over the wire too.  The applet-side accumulator (see
+// pa-v3 ProvisioningAgentV3 processTransferParams chainOff) reads
+// chunks into wireBuf and only runs unwrap on the final (non-chained)
+// chunk.
+//
+// Cache entry: ordered array of pre-built APDU buffers ready to emit,
+// plus an index of the next one.  Both produced at handleKeygenResponse
+// time; consumed chunk-by-chunk in handleSadResponse as the chip acks
+// each one with 9000.
+
+interface ParamChunkQueue {
+  /** Ordered APDU bytes, chain-bit-on on all but the last. */
+  chunks: Buffer[];
+  /** Index of the chunk that was just sent (awaiting its ack). */
+  sentIdx: number;
+  expiresAt: number;
+}
+const paramChunkCache = new Map<string, ParamChunkQueue>();
+
+function putParamChunks(sessionId: string, chunks: Buffer[], ttlMs: number): void {
+  paramChunkCache.set(sessionId, {
+    chunks,
+    sentIdx: 0,
+    expiresAt: Date.now() + Math.min(Math.max(ttlMs, 10_000), SAD_CACHE_MAX_TTL_MS),
+  });
+}
+
+/**
+ * Mark the currently-in-flight chunk as acked and return info about
+ * what's next.  Returns `{ done: true }` when the chip just acked the
+ * last chunk — caller should proceed to FINAL_STATUS.
+ */
+function advanceParamChunk(sessionId: string): { done: boolean; next: Buffer | null } {
+  const q = paramChunkCache.get(sessionId);
+  if (!q) return { done: true, next: null };
+  q.sentIdx += 1;
+  if (q.sentIdx >= q.chunks.length) {
+    paramChunkCache.delete(sessionId);
+    // Drain paired nonce material — chip has accepted the bundle, the
+    // nonce has now served its C4 replay-binding purpose and must not
+    // be reused if the session somehow cycles.
+    clearChipNonce(sessionId);
+    return { done: true, next: null };
+  }
+  return { done: false, next: q.chunks[q.sentIdx] };
+}
+
 /** Test hook: clear the module-level SAD cache between runs. */
 export function _resetSadCacheForTests(): void {
   for (const [, entry] of sadCache) entry.payload.fill(0);
   sadCache.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Chip-nonce cache — patent C4 (chip-side replay binding)
+// ---------------------------------------------------------------------------
+//
+// The applet emits a fresh 16-byte nonce in the trailing bytes of its
+// GENERATE_KEYS response and appends the same nonce to its own
+// sessionId[] buffer before the HKDF-expand that derives the
+// TRANSFER_PARAMS AES/IV/HMAC triple.  For the wrap side to produce
+// bytes the chip will accept, we need to remember the nonce between
+// handleKeygenResponse (when we first see it) and the moment we call
+// buildParamBundleApduChunks (minutes later at most — typically <2 s
+// of wall-clock).  Short-lived Map keyed by sessionId matches the
+// existing paramChunkCache pattern; no DB column needed.
+//
+// Entries expire on: successful chunk queue drain (paired delete in
+// handleSadResponse), session FAILED transition, WS disconnect TTL,
+// or the reaper-sad-sessions sweep.  Missing entry at wrap time is
+// treated as "card is running an older applet that doesn't emit a
+// nonce" — we fall back to the legacy HKDF info (sessionId only) so
+// permissive deploys during rollout don't break mid-tap.
+
+interface ChipNonceEntry {
+  nonce: Buffer;
+  expiresAt: number;
+}
+const chipNonceCache = new Map<string, ChipNonceEntry>();
+
+function putChipNonce(sessionId: string, nonce: Buffer, ttlMs: number): void {
+  chipNonceCache.set(sessionId, {
+    nonce,
+    expiresAt:
+      Date.now() + Math.min(Math.max(ttlMs, 10_000), SAD_CACHE_MAX_TTL_MS),
+  });
+}
+
+function getChipNonce(sessionId: string): Buffer | undefined {
+  const e = chipNonceCache.get(sessionId);
+  if (!e) return undefined;
+  if (Date.now() > e.expiresAt) {
+    chipNonceCache.delete(sessionId);
+    return undefined;
+  }
+  return e.nonce;
+}
+
+function clearChipNonce(sessionId: string): void {
+  const e = chipNonceCache.get(sessionId);
+  if (e) e.nonce.fill(0);
+  chipNonceCache.delete(sessionId);
+}
+
+/** Test hook: clear the chip-nonce cache between runs. */
+export function _resetChipNonceCacheForTests(): void {
+  for (const [, e] of chipNonceCache) e.nonce.fill(0);
+  chipNonceCache.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Card cert cache — patent C16/C23 cross-plan-step carry
+//
+// When includeAttestationChain is on, the GET_ATTESTATION_CHAIN step
+// runs BEFORE GENERATE_KEYS and returns the per-card cert blob (65 B
+// card pubkey + 42 B CPLC + ~72 B DER sig).  The verifier runs at
+// keygen-response time and needs that cardCert plus the attestSig
+// trailer off GEN_KEYS together.  We stash cardCert here between
+// steps — in-memory only, never persisted, cleared on terminal /
+// sweep just like the chip nonce cache.
+//
+// TTL is bounded the same way as chipNonceCache: [10 s, SAD_CACHE_
+// MAX_TTL_MS].  A plan that stalls between steps beyond that window
+// is going to hit the session WS timeout anyway; missing cardCert at
+// verify time surfaces as a normal strict-mode attestation failure
+// with warning 'cardCert not supplied'.
+// ---------------------------------------------------------------------------
+
+interface CardCertEntry {
+  cardCert: Buffer;
+  expiresAt: number;
+}
+const cardCertCache = new Map<string, CardCertEntry>();
+
+function putCardCert(sessionId: string, cardCert: Buffer, ttlMs: number): void {
+  cardCertCache.set(sessionId, {
+    cardCert,
+    expiresAt:
+      Date.now() + Math.min(Math.max(ttlMs, 10_000), SAD_CACHE_MAX_TTL_MS),
+  });
+}
+
+function getCardCert(sessionId: string): Buffer | undefined {
+  const e = cardCertCache.get(sessionId);
+  if (!e) return undefined;
+  if (Date.now() > e.expiresAt) {
+    cardCertCache.delete(sessionId);
+    return undefined;
+  }
+  return e.cardCert;
+}
+
+function clearCardCert(sessionId: string): void {
+  cardCertCache.delete(sessionId);
+}
+
+/** Test hook: clear the card-cert cache between runs. */
+export function _resetCardCertCacheForTests(): void {
+  cardCertCache.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +419,17 @@ interface PlanStepState {
   lastProcessed: number;
   /** Epoch-ms expiry for sweep — aligns with the session WS timeout. */
   expiresAt: number;
+  /**
+   * Ordered phase names — `phases[i]` is the `phase` field of
+   * `plan.steps[i]`.  Populated at initPlanStepState time so the
+   * inbound-response dispatcher in handlePlanResponse can switch on
+   * semantic phase (`key_generation`, `get_attestation_chain`, …)
+   * instead of a hardcoded index.  Fixes the latent bug where
+   * `includeAttestationChain` or `includeChipChallenge` shift the
+   * keygen step from index 1 to index 2 / 3 respectively and the
+   * original `case 1:` dispatch would mis-route.
+   */
+  phases: string[];
 }
 const planStepState = new Map<string, PlanStepState>();
 const PLAN_STEP_STATE_TTL_MS = 120_000;
@@ -241,12 +439,29 @@ const PLAN_STEP_STATE_TTL_MS = 120_000;
  * by buildPlanForSession() once the plan is built but before it's sent
  * on the wire.
  */
-function initPlanStepState(sessionId: string, stepCount: number): void {
+function initPlanStepState(
+  sessionId: string,
+  phases: string[],
+): void {
   planStepState.set(sessionId, {
-    expectedSteps: stepCount,
+    expectedSteps: phases.length,
     lastProcessed: -1,
     expiresAt: Date.now() + PLAN_STEP_STATE_TTL_MS,
+    phases: [...phases],
   });
+}
+
+/**
+ * Resolve the phase name for a given step index on a session.  Returns
+ * `null` if the session's plan state is gone (sweep / restart / never
+ * armed) — callers treat that as "unknown phase" and reject the
+ * response before dispatching.
+ */
+function phaseForPlanStep(sessionId: string, i: number): string | null {
+  const state = planStepState.get(sessionId);
+  if (!state) return null;
+  if (i < 0 || i >= state.phases.length) return null;
+  return state.phases[i] ?? null;
 }
 
 /**
@@ -287,6 +502,11 @@ function advancePlanStep(
 /** Release the step cursor on terminal / sweep. */
 function clearPlanStepState(sessionId: string): void {
   planStepState.delete(sessionId);
+  // Keep the three session-scoped caches in lockstep.  Anywhere we
+  // terminate / fail a session also scrubs the in-memory attestation
+  // cardCert + chip nonce + SAD pre-decrypt.  Easier to change one
+  // helper than audit four callsites every time.
+  clearCardCert(sessionId);
 }
 
 /** Best-effort sweep of expired plan-step cursors (called from startSession). */
@@ -313,11 +533,38 @@ export function _seedPlanStepStateForTests(
   sessionId: string,
   expectedSteps: number,
   lastProcessed: number = -1,
+  /**
+   * Optional phase names — when omitted the seeder synthesizes the
+   * canonical 5-step classical sequence so existing tests (which
+   * predate phase-based dispatch) keep working unchanged.  New tests
+   * exercising `includeAttestationChain` / `includeChipChallenge`
+   * pass their expected phase order explicitly.
+   */
+  phases?: string[],
 ): void {
+  // Canonical 6-step sequence with WIPE inserted between select_pa and
+  // key_generation (see plan-builder.ts).  Tests that want the older
+  // pre-WIPE shape for regression coverage pass an explicit `phases`
+  // array.
+  const defaultPhases = [
+    'select_pa',
+    'wipe_applet',
+    'key_generation',
+    'provisioning',
+    'finalizing',
+    'confirming',
+  ];
+  const resolvedPhases =
+    phases ??
+    defaultPhases.slice(0, expectedSteps).concat(
+      // Pad if the caller requested more steps than the canonical 6.
+      Array(Math.max(0, expectedSteps - defaultPhases.length)).fill('unknown'),
+    );
   planStepState.set(sessionId, {
     expectedSteps,
     lastProcessed,
     expiresAt: Date.now() + PLAN_STEP_STATE_TTL_MS,
+    phases: resolvedPhases,
   });
 }
 
@@ -337,59 +584,116 @@ export class SessionManager {
     pruneSadCache();
     prunePlanStepState();
 
-    // Find the SAD record
-    const sadRecord = await prisma.sadRecord.findUnique({
+    // The proxyCardId on the wire can be either namespace:
+    //   - pxy_xxx  : ParamRecord.proxyCardId (prototype, PARAM_BUNDLE)
+    //   - proxy_xxx: SadRecord.proxyCardId   (legacy, TRANSFER_SAD)
+    // Try ParamRecord first so hybrid cards (both rows linked to the
+    // same card) get the prototype path.  Both tables have @unique
+    // constraints on proxyCardId, so at most one hit in each.
+    const paramRecord = await prisma.paramRecord.findUnique({
       where: { proxyCardId },
+      select: { id: true, cardId: true, status: true },
     });
-    if (!sadRecord || sadRecord.status !== 'READY') {
-      throw new Error(`No READY SAD record for proxyCardId: ${proxyCardId}`);
+
+    let cardId: string;
+    let sadRecordId: string;
+
+    if (paramRecord) {
+      if (paramRecord.status !== 'READY') {
+        throw new Error(
+          `ParamRecord for proxyCardId ${proxyCardId} is ${paramRecord.status}, expected READY`,
+        );
+      }
+      cardId = paramRecord.cardId;
+      // ProvisioningSession.sadRecordId is still NOT NULL in the
+      // schema; use any historic SadRecord for this card as the FK
+      // placeholder.  Prototype flow doesn't consume the SAD bytes —
+      // wrap happens from ParamRecord.bundleEncrypted (+ the per-
+      // column envelopes once PARAMS_PER_COLUMN=1) via
+      // buildTransferParamsApduChunks.  See schema.prisma TODO for
+      // the proper sadRecordId-nullable migration.
+      const placeholder = await prisma.sadRecord.findFirst({
+        where: { cardId: paramRecord.cardId },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true },
+      });
+      if (!placeholder) {
+        throw new Error(
+          `[rca] prototype session for ${proxyCardId} has no SadRecord for FK placeholder — card was never SAD-registered`,
+        );
+      }
+      sadRecordId = placeholder.id;
+    } else {
+      const sadRecord = await prisma.sadRecord.findUnique({
+        where: { proxyCardId },
+      });
+      if (!sadRecord || sadRecord.status !== 'READY') {
+        throw new Error(`No READY SAD record for proxyCardId: ${proxyCardId}`);
+      }
+      cardId = sadRecord.cardId;
+      sadRecordId = sadRecord.id;
+
+      // Legacy-only: prefetch + decrypt the SAD blob so the plaintext
+      // is ready by the time the mobile hits SAD_TRANSFER.  Prototype
+      // flow skips this — decryption there happens later inside
+      // buildTransferParamsApduChunks against ParamRecord data.
+      const config = getRcaConfig();
+      const encryptedBuf = Buffer.isBuffer(sadRecord.sadEncrypted)
+        ? sadRecord.sadEncrypted
+        : Buffer.from(sadRecord.sadEncrypted);
+      const ttlMs = (config.WS_TIMEOUT_SECONDS ?? 60) * 1000;
+      const sessionIdForCache = ''; // set below after session.create
+      void sessionIdForCache; // appease no-unused-vars; captured via closure on `session.id`
+      const prefetch = DataPrepService.decryptSad(
+        encryptedBuf,
+        config.KMS_SAD_KEY_ARN ?? '',
+        sadRecord.sadKeyVersion,
+      );
+      // Chain the cache-store to session creation below so we can key
+      // the cache by the real session id rather than a stub.
+      (this as unknown as { __prefetchSad?: { p: Promise<Buffer>; ttlMs: number } }).__prefetchSad = {
+        p: prefetch,
+        ttlMs,
+      };
     }
 
-    // Create provisioning session
     const session = await prisma.provisioningSession.create({
       data: {
-        cardId: sadRecord.cardId,
-        sadRecordId: sadRecord.id,
+        cardId,
+        sadRecordId,
         phase: 'INIT',
       },
     });
 
-    console.log(`[rca] session created: ${session.id} for card ${sadRecord.cardId}`);
-    metrics().counter('rca.session.started', 1);
+    console.log(
+      `[rca] session created: ${session.id} for card ${cardId} (path=${paramRecord ? 'param' : 'sad'})`,
+    );
+    metrics().counter('rca.session.started', 1, {
+      path: paramRecord ? 'param' : 'sad',
+    });
 
-    // Fire-and-forget KMS decrypt so the plaintext is ready by the time
-    // the mobile app finishes TLS + WS open + attestation.  On failure
-    // we log and move on — the synchronous path in buildPlanContext
-    // will retry the decrypt with a proper error surface.  Saves
-    // 150-400ms off the critical SAD_TRANSFER window (patent C5 keeps
-    // the MK derivation pipeline asynchronous; this extends the same
-    // async pattern to the plaintext SAD fetch).
-    const config = getRcaConfig();
-    const encryptedBuf = Buffer.isBuffer(sadRecord.sadEncrypted)
-      ? sadRecord.sadEncrypted
-      : Buffer.from(sadRecord.sadEncrypted);
-    const ttlMs = (config.WS_TIMEOUT_SECONDS ?? 60) * 1000;
-    const sessionId = session.id;
-    // Don't await — we want the decrypt running concurrently with the
-    // response write + the mobile's WS handshake.  Errors are swallowed
-    // here but replayed inline on cache miss.
-    DataPrepService.decryptSad(
-      encryptedBuf,
-      config.KMS_SAD_KEY_ARN ?? '',
-      sadRecord.sadKeyVersion,
-    )
-      .then((payload) => storeSadInCache(sessionId, payload, ttlMs))
-      .catch((err) => {
-        console.warn(
-          `[rca] SAD pre-decrypt failed for ${redactSid(sessionId)}: ${err instanceof Error ? err.message : err} — will retry inline`,
-        );
-      });
+    // Wire up the legacy prefetch-into-cache once we have the real
+    // session id.  Errors are swallowed here but replayed inline on
+    // cache miss inside buildPlanContext.
+    const stash = (this as unknown as {
+      __prefetchSad?: { p: Promise<Buffer>; ttlMs: number };
+    }).__prefetchSad;
+    if (stash) {
+      delete (this as unknown as { __prefetchSad?: unknown }).__prefetchSad;
+      stash.p
+        .then((payload) => storeSadInCache(session.id, payload, stash.ttlMs))
+        .catch((err) => {
+          console.warn(
+            `[rca] SAD pre-decrypt failed for ${redactSid(session.id)}: ${err instanceof Error ? err.message : err} — will retry inline`,
+          );
+        });
+    }
 
     return {
       sessionId: session.id,
       proxyCardId,
-      cardId: sadRecord.cardId,
-      sadRecordId: sadRecord.id,
+      cardId,
+      sadRecordId,
       phase: 'INIT',
     };
   }
@@ -483,12 +787,26 @@ export class SessionManager {
       session.sadRecord,
       sessionId,
     );
-    const plan = buildProvisioningPlan(ctx);
+    // Patent C16/C23 gate: strict mode MUST include GET_ATTESTATION_CHAIN
+    // because the verifier needs the cardCert to chain-walk the
+    // attestSig trailer.  Permissive mode leaves it off — legacy cards
+    // (pre-Drop-3 applet bytecode) return 6D00 on INS=0xEE and would
+    // fail-fast the whole plan.  Once every card in the fleet has been
+    // re-personalised with STORE_ATTESTATION material AND bumped to
+    // Drop 3 bytecode, permissive mode goes away and the gate collapses
+    // to "always on".
+    const attestationMode = getRcaConfig().PALISADE_ATTESTATION_MODE;
+    const plan = buildProvisioningPlan(ctx, {
+      includeAttestationChain: attestationMode === 'strict',
+    });
     // Patent C5: arm the per-session step cursor BEFORE the plan goes on
     // the wire.  Any inbound plan-mode response must then match the
     // cursor (step index must strictly increment by 1 starting at 0) —
-    // the server rejects anything else at handlePlanResponse.
-    initPlanStepState(sessionId, plan.steps.length);
+    // the server rejects anything else at handlePlanResponse.  Pass
+    // the phase list so the inbound dispatcher can switch on
+    // semantic phase rather than a hardcoded index (which would
+    // mis-route when optional steps shift the key_generation index).
+    initPlanStepState(sessionId, plan.steps.map((s) => s.phase));
     return plan;
   }
 
@@ -622,16 +940,91 @@ export class SessionManager {
    * app the cardholder is logged into).
    */
   private async handlePaFci(sessionId: string): Promise<WSMessage[]> {
+    // Insert a WIPE step before GENERATE_KEYS so re-provisioning a
+    // previously-committed chip succeeds.  Without this, a chip left
+    // in STATE_COMMITTED by a prior successful tap returns
+    // SW_WRONG_STATE=0x6985 on GENERATE_KEYS (ProvisioningAgentV3.java:
+    // 373).  WIPE is state-agnostic (no guards), unauthenticated
+    // (CLA=80, no SCP03 required), and preserves attestation material
+    // loaded via STORE_ATTESTATION — only personalisation buffers
+    // (dgi0101/0102/8201/9201, sessionId, state) get zeroed.
+    //
+    // Mirrors the plan-builder WIPE step added in 0cc7c0a.  Classical
+    // and plan mode now have matching idempotency semantics.
+    await prisma.provisioningSession.update({
+      where: { id: sessionId },
+      data: { phase: 'WIPING' },
+    });
+
+    return [{
+      type: 'apdu',
+      hex: '80EA000000',
+      phase: 'wipe_applet',
+      progress: 0.08,
+    }];
+  }
+
+  /**
+   * WIPING-phase handler — chip returned 9000 to our WIPE APDU,
+   * meaning processWipe() ran and the applet is now in STATE_IDLE.
+   * Transition to KEYGEN and emit the GENERATE_KEYS APDU (body
+   * previously emitted directly from handlePaFci).
+   */
+  private async handleWipeResponse(sessionId: string): Promise<WSMessage[]> {
     await prisma.provisioningSession.update({
       where: { id: sessionId },
       data: { phase: 'KEYGEN' },
     });
+    console.log(
+      `[rca] wipe applied (classical): session=${redactSid(sessionId)} — ` +
+        `applet STATE_IDLE, attestation material preserved`,
+    );
+    return this.emitKeygenApdu(sessionId);
+  }
 
-    // GENERATE_KEYS = 80 E0 00 00 01 01 — single-byte payload `01`
-    // means "ECC P-256 keypair please".  No session ID — passing one
-    // appends 16 bytes the PA discards (or worse).  Matches the exact
-    // hex in the Palisade SSD e2e trace.
-    const keygenHex = APDUBuilder.generateKeys();
+  /**
+   * Build the GENERATE_KEYS APDU for classical mode.  Extracted from
+   * the old inline block in handlePaFci so both handlePaFci and
+   * handleWipeResponse can share the construction (the former kept
+   * it direct, the latter calls it post-WIPE).
+   */
+  private emitKeygenApdu(sessionId: string): WSMessage[] {
+    // GENERATE_KEYS for pa-v3.  Body layout:
+    //
+    //   byte 0          0x01 = "ECC P-256 keypair please"
+    //   bytes 1..N      sessionId (UTF-8), up to 63 B
+    //
+    // The session ID MUST match the HKDF `info` string that
+    // wrapParamBundle uses at TRANSFER_PARAMS wrap time — pa-v3's
+    // EcdhUnwrapper re-derives the AES/HMAC session keys using the
+    // sessionId bytes stored here; mismatch → HMAC verify fail →
+    // SW=6A80 (SW_PARAM_BUNDLE_GCM_FAILED).  Legacy pa-v1 ignored this
+    // field entirely, which is why the original GENERATE_KEYS APDU
+    // shipped no body beyond the keyType marker.
+    //
+    // Trailing Le = 0x41 (65 — exact pubkey response size) rather than
+    // 0x00 (max 256).  Debug variant hunting iOS ISO-DEP quirks; chip
+    // accepts both equally.  Revert to 0x00 once pa-v3 e2e lands.
+    const sessionIdBytes = Buffer.from(sessionId, 'utf8');
+    if (sessionIdBytes.length > 63) {
+      throw new Error(
+        `[rca] sessionId too long for GENERATE_KEYS body: ${sessionIdBytes.length} B > 63 B max`,
+      );
+    }
+    const keygenBody = Buffer.concat([
+      Buffer.from([0x01]),
+      sessionIdBytes,
+    ]);
+    const keygenApduBuf = Buffer.concat([
+      Buffer.from([0x80, 0xE0, 0x00, 0x00, keygenBody.length]),
+      keygenBody,
+      Buffer.from([0x41]),
+    ]);
+    const keygenHex = keygenApduBuf.toString('hex').toUpperCase();
+
+    // Temporary prototype-debug log so we can confirm on the wire what
+    // bytes rca is handing to the mobile.  Remove once pa-v3 e2e lands.
+    console.log(`[rca][debug] classical keygen APDU → session=${sessionId} hex=${keygenHex} (len=${keygenApduBuf.length}B)`);
 
     return [{
       type: 'apdu',
@@ -712,12 +1105,23 @@ export class SessionManager {
     if (!session) return [];
 
     switch (session.phase) {
+      case 'WIPING':
+        // Chip returned 9000 to WIPE — transition to KEYGEN and send
+        // GENERATE_KEYS.  See handlePaFci / handleWipeResponse for the
+        // rationale (idempotency guard for re-perso'd chips).
+        return this.handleWipeResponse(sessionId);
       case 'KEYGEN':
         return this.handleKeygenResponse(sessionId, normalizedMsg);
       case 'SAD_TRANSFER':
         return this.handleSadResponse(sessionId);
       case 'AWAITING_FINAL':
         return this.handleFinalStatus(sessionId, normalizedMsg);
+      case 'CONFIRMING':
+        // Chip's CONFIRM 9000 just landed — commit the session + flip
+        // Card.status=PROVISIONED + emit `complete` to the mobile.
+        // SW != 9000 already rejected upstream (line ~910), so
+        // arriving here means the applet latched to STATE_COMMITTED.
+        return this.handleConfirmResponse(sessionId);
       default:
         return [];
     }
@@ -761,8 +1165,25 @@ export class SessionManager {
     // and accepts.  See services/rca/src/services/attestation-verifier.ts.
     const extracted = AttestationVerifier.extract(respData);
     const { iccPubkey, attestation } = extracted;
+
+    // Patent C4 chip-side nonce binding: pa-v3 writes the 16-byte nonce
+    // immediately after the 65-byte iccPubkey in the GEN_KEYS response.
+    // Cache it by sessionId for the TRANSFER_PARAMS wrap (minutes later
+    // at most).  Older applets that don't emit a nonce produce a shorter
+    // response, in which case this subarray is empty and we fall back
+    // to the legacy HKDF info shape (sessionId alone) at wrap time.
+    const CHIP_NONCE_LEN = 16;
+    if (
+      respData.length >= ICC_PUBKEY_LEN + CHIP_NONCE_LEN &&
+      respData.length !== ICC_PUBKEY_LEN  // legacy pubkey-only response shape
+    ) {
+      const nonce = Buffer.from(
+        respData.subarray(ICC_PUBKEY_LEN, ICC_PUBKEY_LEN + CHIP_NONCE_LEN),
+      );
+      putChipNonce(sessionId, nonce, getRcaConfig().WS_TIMEOUT_SECONDS * 1000);
+    }
     const mode = getRcaConfig().PALISADE_ATTESTATION_MODE;
-    const verifyResult = AttestationVerifier.verify(extracted, mode);
+    const verifyResult = AttestationVerifier.verify(extracted, mode, attestationConfigFor(mode));
     metrics().counter('rca.attestation.verify', 1, {
       mode,
       result: verifyResult.ok ? 'ok' : 'fail',
@@ -794,35 +1215,207 @@ export class SessionManager {
       },
     });
 
-    const ctx = await this.buildPlanContext(
-      session.card?.program?.issuerProfile ?? null,
-      session.sadRecord,
-      sessionId,
-    );
+    // Dispatch: ParamBundle prototype path vs legacy SAD path.
+    //
+    // Null-check FIRST — legacy cards have Card.paramRecordId = null
+    // and always fall through to buildTransferSadApdu (unchanged).
+    //
+    // Env flag gates the prototype route.  Even if a card has a
+    // ParamRecord, RCA_ENABLE_PARAM_BUNDLE = '0' (default) forces the
+    // legacy path.  Belt-and-suspenders: two guards must both flip to
+    // '1' / non-null before a single byte of prototype code executes
+    // on a provisioning session.
+    const paramRecordId = session.card?.paramRecordId ?? null;
+    const paramBundleEnabled = getRcaConfig().RCA_ENABLE_PARAM_BUNDLE === '1';
+    const useParamBundle = paramRecordId !== null && paramBundleEnabled;
+
     let transferApdu: Buffer;
-    try {
-      transferApdu = buildTransferSadApdu(ctx);
-    } finally {
-      // PCI 3.5 — S-2 from the post-fix audit: plaintext SAD contains
-      // per-card EMV master keys, PAN, expiry, etc.  After the wire APDU
-      // is built, the plaintext bytes serve no purpose — scrub the Buffer
-      // so a later core dump / memory scrape doesn't leak it.  The
-      // Buffer is the only reference the caller holds; scrub in place.
-      ctx.sadPayload.fill(0);
+    let wirePhase: string;
+    if (useParamBundle) {
+      // PARAM_BUNDLE path — can span multiple chained short APDUs.
+      // Build all chunks up front, queue the rest for handleSadResponse
+      // to drain, and emit the first chunk now.
+      const chunks = await this.buildTransferParamsApduChunks(
+        paramRecordId!,
+        iccPubkey,
+        sessionId,
+      );
+      if (chunks.length === 0) {
+        throw new Error(`[rca] TRANSFER_PARAMS produced 0 chunks for session ${sessionId}`);
+      }
+      const ttlMs = (getRcaConfig().WS_TIMEOUT_SECONDS ?? 60) * 1000;
+      putParamChunks(sessionId, chunks, ttlMs);
+      transferApdu = chunks[0];
+      wirePhase = chunks.length > 1
+        ? 'provisioning_param_bundle_chain_1_of_' + chunks.length
+        : 'provisioning_param_bundle';
+    } else {
+      const ctx = await this.buildPlanContext(
+        session.card?.program?.issuerProfile ?? null,
+        session.sadRecord,
+        sessionId,
+      );
+      try {
+        transferApdu = buildTransferSadApdu(ctx);
+      } finally {
+        // PCI 3.5 — S-2 from the post-fix audit: plaintext SAD contains
+        // per-card EMV master keys, PAN, expiry, etc.  After the wire APDU
+        // is built, the plaintext bytes serve no purpose — scrub the Buffer
+        // so a later core dump / memory scrape doesn't leak it.  The
+        // Buffer is the only reference the caller holds; scrub in place.
+        ctx.sadPayload.fill(0);
+      }
+      wirePhase = 'provisioning';
     }
 
     return [{
       type: 'apdu',
       hex: transferApdu.toString('hex').toUpperCase(),
-      phase: 'provisioning',
+      phase: wirePhase,
       progress: 0.55,
     }];
   }
 
   /**
-   * Phase 3: SAD transfer complete → send FINAL_STATUS.
+   * Build the TRANSFER_PARAMS APDU for a card on the ParamBundle
+   * prototype flow.  Loads the ParamRecord, decrypts the at-rest
+   * bundle (envelope-encrypted via KMS or dev-AES, same pattern as
+   * SadRecord), ECDH-wraps against the chip's pubkey, returns the
+   * wire-ready APDU.
+   *
+   * Scrubs the plaintext ParamBundle after wrap — the wrapped bytes
+   * are the only thing that persists on the wire.  Also marks the
+   * ParamRecord CONSUMED on the way out so a second provisioning
+   * attempt against the same record is rejected upfront.
+   */
+  private async buildTransferParamsApduChunks(
+    paramRecordId: string,
+    chipPubUncompressed: Buffer,
+    sessionId: string,
+  ): Promise<Buffer[]> {
+    const pr = await prisma.paramRecord.findUnique({
+      where: { id: paramRecordId },
+    });
+    if (!pr || pr.status !== 'READY') {
+      throw badRequest(
+        'param_record_not_ready',
+        `ParamRecord ${paramRecordId} is ${pr?.status ?? 'missing'}, expected READY`,
+      );
+    }
+
+    const config = getRcaConfig();
+    const kmsArn = config.KMS_SAD_KEY_ARN ?? '';
+
+    // Decrypt the at-rest bundle first.  Under legacy mode this is
+    // the full ParamBundle; under C17/C22 per-column mode it's the
+    // "reduced" bundle with the four crypto-sensitive TLVs zeroed
+    // out (see data-prep.prepareParamBundle::reduceSensitiveFields).
+    const restedBundle = await DataPrepService.decryptSad(
+      Buffer.isBuffer(pr.bundleEncrypted)
+        ? pr.bundleEncrypted
+        : Buffer.from(pr.bundleEncrypted),
+      kmsArn,
+      pr.bundleKeyVersion,
+    );
+
+    // Patent C17/C22 per-column dispatch.  Auto-detect by presence of
+    // the envelope columns — this row was written by a data-prep with
+    // PARAMS_PER_COLUMN=1.  The legacy path (all four columns NULL)
+    // uses `restedBundle` verbatim as plaintextBundle.
+    let plaintextBundle: Buffer;
+    const perColumn = pr.mkAcEncrypted != null;
+    if (perColumn) {
+      // Decrypt the four per-field envelopes in parallel.  Each is a
+      // small KMS round-trip (tens of bytes of ciphertext each); all
+      // four are independent so parallel cuts the critical path.
+      const [mkAc, mkSmi, mkSmc, rsaPriv] = await Promise.all([
+        DataPrepService.decryptSad(
+          Buffer.from(pr.mkAcEncrypted!),
+          kmsArn,
+          pr.mkAcKeyVersion ?? 0,
+        ),
+        DataPrepService.decryptSad(
+          Buffer.from(pr.mkSmiEncrypted!),
+          kmsArn,
+          pr.mkSmiKeyVersion ?? 0,
+        ),
+        DataPrepService.decryptSad(
+          Buffer.from(pr.mkSmcEncrypted!),
+          kmsArn,
+          pr.mkSmcKeyVersion ?? 0,
+        ),
+        DataPrepService.decryptSad(
+          Buffer.from(pr.iccRsaPrivEncrypted!),
+          kmsArn,
+          pr.iccRsaPrivKeyVersion ?? 0,
+        ),
+      ]);
+      try {
+        const tagMap = new Map<number, Buffer>([
+          [ParamTag.MK_AC, mkAc],
+          [ParamTag.MK_SMI, mkSmi],
+          [ParamTag.MK_SMC, mkSmc],
+          [ParamTag.ICC_RSA_PRIV, rsaPriv],
+        ]);
+        plaintextBundle = spliceSensitiveFields(restedBundle, tagMap);
+      } finally {
+        // Scrub each per-field buffer the moment the splice is done.
+        // Total plaintext-in-RAM window per field now bounded by the
+        // ~microsecond splice copy, not the ~50 ms whole-bundle wrap.
+        mkAc.fill(0);
+        mkSmi.fill(0);
+        mkSmc.fill(0);
+        rsaPriv.fill(0);
+        restedBundle.fill(0);
+      }
+    } else {
+      plaintextBundle = restedBundle;
+    }
+
+    // Patent C4: feed the chip-side nonce (captured in
+    // handleKeygenResponse) into the wrap's HKDF info so the AES/IV/HMAC
+    // triple binds to the specific GEN_KEYS session.  getChipNonce
+    // returns undefined for older applets; wrapParamBundle then falls
+    // back to legacy info shape (sessionId alone).
+    const chipNonce = getChipNonce(sessionId);
+
+    let chunks: Buffer[];
+    try {
+      chunks = buildParamBundleApduChunks({
+        plaintextBundle,
+        chipPubUncompressed,
+        sessionId,
+        chipNonce,
+      });
+    } finally {
+      plaintextBundle.fill(0);
+    }
+    return chunks;
+  }
+
+  /**
+   * Phase 3: SAD / ParamBundle transfer complete → send FINAL_STATUS.
+   *
+   * For the PARAM_BUNDLE path with a multi-chunk TRANSFER_PARAMS, each
+   * chip ack lands here.  We peek the chunk queue: if there are more
+   * chunks to send, emit the next one and stay in the SAD_TRANSFER
+   * phase; only the last chunk's ack triggers the real transition to
+   * AWAITING_FINAL and the FINAL_STATUS APDU.  Single-APDU flows
+   * (legacy SAD, or PARAM_BUNDLE bodies that fit in 255 B) skip this
+   * entirely and go straight to FINAL_STATUS.
    */
   private async handleSadResponse(sessionId: string): Promise<WSMessage[]> {
+    const advance = advanceParamChunk(sessionId);
+    if (!advance.done && advance.next) {
+      // Still more chained chunks to ship; stay in SAD_TRANSFER.
+      return [{
+        type: 'apdu',
+        hex: advance.next.toString('hex').toUpperCase(),
+        phase: 'provisioning_param_bundle_chain',
+        progress: 0.55,
+      }];
+    }
+
     await prisma.provisioningSession.update({
       where: { id: sessionId },
       data: { phase: 'AWAITING_FINAL' },
@@ -865,26 +1458,25 @@ export class SessionManager {
       fidoCredData = credId.toString('base64url');
     }
 
-    // Latency optimization — the DB commit ($transaction) is not on the
-    // chip's critical path: CONFIRM (step 4) is what latches the chip
-    // state.  Previously we ran the $transaction BEFORE returning the
-    // CONFIRM APDU, charging 30-50ms of Postgres RTT against the tap
-    // window.  Now we:
-    //   1. Pre-fetch the card/sadRecord fields the response message
-    //      needs (cardRef, proxyCardId, chipSerial).
-    //   2. Return CONFIRM + complete so the phone can finalize the
-    //      chip immediately.
-    //   3. Run the atomic commit asynchronously; on failure, log
-    //      loudly and let the retention sweeper / admin surface the
-    //      inconsistency.
+    // Two-phase finalize — split the previous single-$transaction into
+    // (a) AWAITING_FINAL → CONFIRMING (captures provenance + FIDO data)
+    // (b) CONFIRMING → COMPLETE (flips Card.status=PROVISIONED +
+    //     SadRecord.status=CONSUMED, fires callback, emits `complete`
+    //     to the mobile client)
     //
-    // Crash semantics are unchanged from before this rewrite: if the
-    // server dies between sending CONFIRM and committing, the chip is
-    // physically PROVISIONED but the DB still reads ACTIVATED — the
-    // same failure mode the pre-rewrite code had between committing
-    // and sending CONFIRM (just flipped on which side of the WS
-    // response boundary the crash lands).  In both cases recovery is
-    // an admin-driven reprovision_card.
+    // Phase (b) only runs from handleConfirmResponse AFTER the chip's
+    // CONFIRM 9000 lands — previously we kicked an async $transaction
+    // + emitted `complete` in the same message as the CONFIRM APDU,
+    // which raced the mobile client's UI flip against the CONFIRM
+    // actually reaching the card.  The failure mode: user lifts card
+    // as soon as the UI says "provisioned" → CONFIRM APDU dies with
+    // "Tag not connected" → applet stuck in STATE_AWAITING_CONFIRM →
+    // server row already says PROVISIONED.
+    //
+    // Split-phase cost: ~one extra WS round-trip on the success path
+    // (mobile already does the SEND-CONFIRM / RECV-9000 dance, we just
+    // hold `complete` until the 9000 arrives).  No extra chip or DB
+    // work.  Correct ordering is worth the ~20 ms.
     const preFetched = await prisma.provisioningSession.findUnique({
       where: { id: sessionId },
       include: { card: true, sadRecord: true },
@@ -897,24 +1489,44 @@ export class SessionManager {
       return [{ type: 'error', code: 'session_missing', message: 'Session vanished between FINAL_STATUS and commit' }];
     }
 
-    // Kick off the atomic commit in the background.  Patent C5 / PCI
-    // 10.5 semantics preserved — the $transaction still groups the
-    // three writes so an individual write failure rolls the others
-    // back; only the *completion* is no longer on the WS wait path.
-    //
-    // The promise intentionally isn't awaited.  A parent catch is
-    // attached so we don't produce an unhandled rejection on DB
-    // outage; the callback fires from inside the same then-chain so
-    // it sees the committed state on success.
-    const commitPromise = prisma.$transaction(async (tx) => {
+    // Phase (a): capture what we got from FINAL_STATUS + advance the
+    // state machine to CONFIRMING.  No Card / SadRecord writes yet —
+    // those are phase (b), conditional on the chip's CONFIRM ack.
+    // Synchronous so a DB outage surfaces as an immediate error to
+    // the mobile (rather than a silent race that leaves the session
+    // in an inconsistent phase).
+    await prisma.provisioningSession.update({
+      where: { id: sessionId },
+      data: {
+        phase: 'CONFIRMING',
+        provenance: provHash,
+        fidoCredData,
+      },
+    });
+
+    return [
+      { type: 'apdu', hex: APDUBuilder.confirm(), phase: 'confirming', progress: 0.95 },
+      // NOTE: no `{type:'complete'}` here.  It fires from
+      // handleConfirmResponse once the chip acks 9000.  Mobile UI
+      // should stay in a "finalizing" state between these two
+      // messages (~20-30 ms typical).
+    ];
+  }
+
+  /**
+   * CONFIRMING phase handler — runs when the chip's 9000 response to
+   * the CONFIRM APDU lands.  SW != 9000 is caught by handleCardResponse
+   * before this runs, so by the time we're here the chip is latched
+   * to STATE_COMMITTED.  Commits the Card.status=PROVISIONED flip +
+   * SadRecord/ParamRecord CONSUMED + session.COMPLETE in a single
+   * atomic transaction, fires the activation callback, then emits
+   * `complete` to the mobile client.
+   */
+  private async handleConfirmResponse(sessionId: string): Promise<WSMessage[]> {
+    const committed = await prisma.$transaction(async (tx) => {
       const s = await tx.provisioningSession.update({
         where: { id: sessionId },
-        data: {
-          phase: 'COMPLETE',
-          completedAt: new Date(),
-          provenance: provHash,
-          fidoCredData,
-        },
+        data: { phase: 'COMPLETE', completedAt: new Date() },
         include: { card: true, sadRecord: true },
       });
       await tx.card.update({
@@ -925,30 +1537,34 @@ export class SessionManager {
         where: { id: s.sadRecordId },
         data: { status: 'CONSUMED' },
       });
+      // Mirror the SadRecord CONSUMED transition onto ParamRecord
+      // when the card rode the prototype path.  Belt-and-suspenders:
+      // the retention reaper would sweep READY-and-expired ParamRecords
+      // eventually, but an explicit CONSUMED matches the state-
+      // machine semantics callers expect.
+      if (s.card.paramRecordId) {
+        await tx.paramRecord.update({
+          where: { id: s.card.paramRecordId },
+          data: { status: 'CONSUMED' },
+        });
+      }
       return s;
     });
-    commitPromise
-      .then((s) => {
-        console.log(
-          `[rca] provisioning complete: session=${redactSid(sessionId)}, card=${redactSid(s.cardId)}`,
-        );
-        metrics().counter('rca.provisioning.complete', 1, { mode: 'classical' });
-        // Fire callback to activation service — best-effort, callback
-        // retries live on activation's idempotency path.
-        this.fireCallback(s.card.cardRef, s.card.chipSerial ?? '').catch((err) =>
-          console.error('[rca] callback failed:', err),
-        );
-      })
-      .catch((err) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(
-          `[rca] COMMIT FAILED session=${redactSid(sessionId)}: ${msg} — chip is provisioned but DB state is not; operator must reconcile via admin UI`,
-        );
-      });
+
+    console.log(
+      `[rca] provisioning complete: session=${redactSid(sessionId)}, card=${redactSid(committed.cardId)}`,
+    );
+    metrics().counter('rca.provisioning.complete', 1, { mode: 'classical' });
+
+    // Fire callback to activation — best-effort, idempotent on the
+    // activation side so a retry from here (or the retention reaper)
+    // is safe.
+    this.fireCallback(committed.card.cardRef, committed.card.chipSerial ?? '').catch((err) =>
+      console.error('[rca] callback failed:', err),
+    );
 
     return [
-      { type: 'apdu', hex: APDUBuilder.confirm(), phase: 'confirming', progress: 0.95 },
-      { type: 'complete', proxyCardId: preFetched.sadRecord.proxyCardId },
+      { type: 'complete', proxyCardId: committed.sadRecord.proxyCardId },
     ];
   }
 
@@ -1065,14 +1681,51 @@ export class SessionManager {
       }];
     }
 
-    switch (i) {
-      case 0: return []; // SELECT PA — phone parsed FCI locally; nothing to do server-side
-      case 1: return this.handlePlanKeygen(sessionId, data);
-      case 2: return []; // TRANSFER_SAD — PA returns STATUS bytes; no server action
-      case 3: return this.handlePlanFinalStatus(sessionId, data);
-      case 4: return this.handlePlanConfirm(sessionId);
+    // Phase-based dispatch.  Optional plan steps (GET_ATTESTATION_CHAIN,
+    // chip-challenge pair) shift the canonical key_generation /
+    // provisioning / finalizing / confirming indices around — switching
+    // on the phase name resolves that without a per-option index table.
+    const phase = phaseForPlanStep(sessionId, i);
+    if (phase === null) {
+      console.warn(
+        `[rca] plan step ${i} has no phase mapping in session ${sessionId} ` +
+          `(advancePlanStep accepted it, so this is a state desync)`,
+      );
+      return [];
+    }
+    switch (phase) {
+      case 'select_pa':
+        return []; // Phone parsed FCI locally; nothing server-side.
+      case 'wipe_applet':
+        // Idempotency guard — see plan-builder.ts:WIPE_APDU.  Chip
+        // returns SW=9000 with no data.  We just accept the step-cursor
+        // advance and continue.  Logging the wipe is useful for audit:
+        // every successful plan includes a reset of chip state before
+        // fresh key generation.
+        console.log(
+          `[rca][plan] wipe applied: session=${redactSid(sessionId)} — ` +
+            `applet now STATE_IDLE (attestation material preserved)`,
+        );
+        return [];
+      case 'chip_challenge_select':
+      case 'chip_challenge_fetch':
+        // Audit-trail only today; PA applet doesn't consume the nonce
+        // yet.  The step-cursor advance was enough — no server action.
+        return [];
+      case 'get_attestation_chain':
+        return this.handlePlanAttestationChain(sessionId, data);
+      case 'key_generation':
+        return this.handlePlanKeygen(sessionId, data);
+      case 'provisioning':
+        return []; // PA returns STATUS bytes; no server action.
+      case 'finalizing':
+        return this.handlePlanFinalStatus(sessionId, data);
+      case 'confirming':
+        return this.handlePlanConfirm(sessionId);
       default:
-        console.warn(`[rca] unexpected plan step index ${i} in session ${sessionId}`);
+        console.warn(
+          `[rca] unknown plan phase '${phase}' at step ${i} in session ${sessionId}`,
+        );
         return [];
     }
   }
@@ -1092,15 +1745,67 @@ export class SessionManager {
    * execution on the real verdict once the mobile client supports the
    * protocol checkpoint mechanism (plan field {checkpointAfter: 1}).
    */
+  /**
+   * Step: GET_ATTESTATION_CHAIN response — stash the card cert blob
+   * for the subsequent keygen-step verify.
+   *
+   * Wire body (from IssuerAttestation.getCardCert on the applet):
+   *   card_pubkey(65) || cplc(42) || sig(DER ECDSA-SHA256)  — signed
+   *   by the Issuer CA over (card_pubkey || cplc).
+   *
+   * Parsing is lenient here: we accept anything the applet sent and
+   * pass it verbatim to AttestationVerifier.verify (which will
+   * parseCardCert + chain-walk).  A card running pre-Drop-3 bytecode
+   * would have returned 6D00 and the pre-switch fail-fast would
+   * have aborted the plan before we got here — so reaching this
+   * handler implies the chip's IssuerAttestation.getCardCert path
+   * returned 9000.
+   */
+  private async handlePlanAttestationChain(
+    sessionId: string,
+    data: Buffer,
+  ): Promise<WSMessage[]> {
+    if (data.length === 0) {
+      // Shouldn't happen on SW=9000, but treat as "no material loaded"
+      // — strict mode will catch it at verify time with a clearer
+      // 'cardCert missing' warning than anything we could emit here.
+      console.warn(
+        `[rca][plan] GET_ATTESTATION_CHAIN returned 9000 but zero bytes ` +
+          `for session ${redactSid(sessionId)}; verify will fail strict`,
+      );
+      return [];
+    }
+    putCardCert(sessionId, data, PLAN_STEP_STATE_TTL_MS);
+    // Echo a compact log line so operators can audit "did we actually
+    // receive a cert" without chasing per-phase logs across services.
+    console.log(
+      `[rca][plan] attestation chain received: session=${redactSid(sessionId)} ` +
+        `cardCertLen=${data.length}`,
+    );
+    return [];
+  }
+
   private async handlePlanKeygen(sessionId: string, data: Buffer): Promise<WSMessage[]> {
     const extracted = AttestationVerifier.extract(data);
     const { iccPubkey, attestation } = extracted;
     // Patent C23 checkpoint: verify attestation before phone executes the
     // next step of the plan.  In strict mode, a failing verdict aborts the
-    // session so TRANSFER_SAD never runs.  In permissive mode, we log a
-    // warning and continue — this is the legacy path until karta-se v1.
+    // session so TRANSFER_PARAMS / TRANSFER_SAD never runs.  In permissive
+    // mode, we log a warning and continue — rollout path until the live
+    // fleet has been re-personalised with issuer-signed attestation certs.
     const mode = getRcaConfig().PALISADE_ATTESTATION_MODE;
-    const verifyResult = AttestationVerifier.verify(extracted, mode);
+    // Pull the stashed cardCert off the per-session cache — written by
+    // handlePlanAttestationChain when includeAttestationChain is on.
+    // In permissive mode it's undefined (the step wasn't in the plan);
+    // verify() then falls back to extract.cardCert which is the legacy
+    // pre-split wire shape.
+    const cardCertOverride = getCardCert(sessionId);
+    const verifyResult = AttestationVerifier.verify(
+      extracted,
+      mode,
+      attestationConfigFor(mode),
+      cardCertOverride,
+    );
     metrics().counter('rca.attestation.verify', 1, {
       mode,
       result: verifyResult.ok ? 'ok' : 'fail',
