@@ -5,9 +5,13 @@
 # resources are prefixed `palisade-*`.  Secrets live in a separate
 # `palisade/*` namespace in Secrets Manager.
 #
-# Required GitHub Secrets (same IAM user as Vera is fine):
-#   AWS_ACCESS_KEY_ID      — IAM access key with permissions for ECR push and ECS deploy
-#   AWS_SECRET_ACCESS_KEY  — Corresponding IAM secret key
+# AWS auth: GitHub OIDC → assume IAM role gha-oidc-deploy.  No
+# long-lived access keys in repo secrets (Stage H.4 / PCI DSS 8.3).
+# The role's trust policy restricts assumption to:
+#   repo:andtechxyz/karta.cards.palisade:*
+#   repo:andtechxyz/karta.cards.vera:*
+# Both repos share the same role + policy; rotation = update one IAM
+# resource instead of two repo secrets.
 #
 # Cost-optimisations applied:
 #   - `paths-ignore` skips the workflow for docs / config / applet-only
@@ -177,12 +181,18 @@ jobs:
       - uses: actions/checkout@v4
         if: steps.filter.outputs.run == 'true'
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (OIDC)
         if: steps.filter.outputs.run == 'true'
+        # Stage H.4 — short-lived creds via GitHub OIDC.  No long-lived
+        # access key in repo secrets.  PCI DSS 8.3/8.5: privileged
+        # access uses ephemeral, role-bound credentials per CI run.
+        # Trust policy on gha-oidc-deploy restricts assumption to
+        # repo:andtechxyz/karta.cards.{palisade,vera}:* — see
+        # docs/runbooks/gha-oidc.md (or scripts/aws-setup.sh's H.4 block).
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: arn:aws:iam::600743178530:role/gha-oidc-deploy
+          role-session-name: gha-palisade-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Log in to Amazon ECR
